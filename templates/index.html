@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DocProcessor</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/css/style.css') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>DocProcessor 🚀</h1>
+            <p>PDF OCR & Audio Transcription</p>
+        </header>
+
+        <main>
+            <div class="form-grid">
+                <section class="processor-section">
+                    <form id="pdf-form" class="upload-form" enctype="multipart/form-data">
+                        <fieldset>
+                            <legend><h2>📄 PDF OCR</h2></legend>
+                            <div class="file-input-wrapper">
+                                <input type="file" name="file" id="pdf-file-input" accept=".pdf" required>
+                                <label for="pdf-file-input" class="file-input-label">Choose PDF...</label>
+                                <span id="pdf-file-name" class="file-name">No file chosen</span>
+                            </div>
+                            <button type="submit">Process PDF</button>
+                        </fieldset>
+                    </form>
+                </section>
+
+                <section class="processor-section">
+                    <form id="audio-form" class="upload-form" enctype="multipart/form-data">
+                        <fieldset>
+                            <legend><h2>🎤 Transcribe Audio</h2></legend>
+                            <div class="file-input-wrapper">
+                                 <input type="file" name="file" id="audio-file-input" accept="audio/*" required>
+                                 <label for="audio-file-input" class="file-input-label">Choose Audio...</label>
+                                 <span id="audio-file-name" class="file-name">No file chosen</span>
+                            </div>
+                            <div class="form-control">
+                                <label for="model-size-select">Model Size</label>
+                                <select name="model_size" id="model-size-select">
+                                    <option value="tiny">Tiny (Fastest, lower accuracy)</option>
+                                    <option value="base" selected>Base (Good balance)</option>
+                                    <option value="small">Small (Better accuracy)</option>
+                                    <option value="medium">Medium (High accuracy)</option>
+                                    <option value="large-v3">Large v3 (Best accuracy, slow)</option>
+                                    <option value="distil-large-v2">Distilled Large v2 (Fast & Accurate)</option>
+                                </select>
+                            </div>
+                            <button type="submit">Transcribe</button>
+                        </fieldset>
+                    </form>
+                </section>
+            </div>
+
+            <section id="job-history">
+                <h2>History</h2>
+                <div class="table-wrapper">
+                    <table id="job-table">
+                        <thead>
+                            <tr>
+                                <th>File</th>
+                                <th>Type</th>
+                                <th>Submitted</th>
+                                <th>Status</th>
+                                <th class="action-col">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="job-list-body">
+                            </tbody>
+                    </table>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="{{ url_for('static', path='/js/script.js') }}"></script>
+</body>
+</html>

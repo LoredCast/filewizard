@@ -1,0 +1,22 @@
+# requirements.txt
+
+# Web framework
+fastapi
+uvicorn[standard]
+python-multipart
+jinja2
+
+# PDF OCR
+ocrmypdf
+PyPDF2
+
+# Audio Transcription
+faster-whisper
+# The following are core dependencies for faster-whisper,
+# but it's good to list them explicitly.
+# ctranslate2
+# transformers
+# torch # Note: torch is a dependency of transformers
+
+# Utilities
+werkzeug

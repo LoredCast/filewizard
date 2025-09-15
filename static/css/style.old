@@ -1,0 +1,345 @@
+/* static/css/style.css */
+
+:root {
+    /* Core */
+    --bg-color: #000000;              /* true black for AMOLED */
+    --surface: #070707;               /* slightly off-black surfaces */
+    --card-bg: #0b0b0b;               /* card backgrounds */
+    --muted-surface: #0f0f10;         /* for subtle panels */
+    --text-color: #e6eef6;             /* primary text - very light */
+    --muted-text: #9aa4ad;             /* secondary text */
+    --mono-text: #d6e6f0;              /* for code/monospace previews */
+
+    /* Accent / interactive */
+    --primary-color: #00b4ff;         /* bright cyan-blue accent */
+    --primary-hover: #00d0ff;
+    --primary-pressed: #0090cc;
+    --success-color: #26c281;         /* success accent */
+    --error-color: #ff6b6b;           /* error accent */
+
+    /* Borders / dividers (kept very subtle or transparent to favor AMOLED) */
+    --border-color: rgba(255,255,255,0.06);
+    --divider-color: rgba(255,255,255,0.04);
+
+    --focus-glow: 0 0 20px rgba(0,180,255,0.14);
+
+    --font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+/* Page */
+html, body {
+    height: 100%;
+}
+
+body {
+    font-family: var(--font-family);
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    margin: 0;
+    padding: 2rem 1rem;
+    line-height: 1.6;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* Container / card */
+.container {
+    width: 100%;
+    max-width: 800px;
+    background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)) , var(--card-bg);
+    border-radius: 12px;
+    padding: 2rem;
+    border: 1px solid var(--border-color);
+    box-shadow: none; /* minimal shadow on true black backgrounds */
+    transition: background-color .15s ease, border-color .15s ease;
+}
+
+/* Header */
+header {
+    text-align: center;
+    margin-bottom: 2rem;
+    border-bottom: 1px solid var(--divider-color);
+    padding-bottom: 1.5rem;
+}
+
+header h1 {
+    margin: 0;
+    font-size: 2.25rem;
+    font-weight: 700;
+    color: var(--text-color);
+}
+
+header p {
+    color: var(--muted-text);
+    font-size: 1.1rem;
+}
+
+/* Sections */
+.processor-section {
+    margin-bottom: 2rem;
+}
+
+.upload-form fieldset {
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin: 0;
+    background: transparent;
+}
+
+.upload-form legend {
+    padding: 0 0.5rem;
+    font-weight: 500;
+    color: var(--primary-color);
+}
+
+.upload-form legend h2 {
+    margin: 0;
+    font-size: 1.5rem;
+}
+
+.upload-form p {
+    margin-top: 0.5rem;
+    margin-bottom: 1.5rem;
+    color: var(--muted-text);
+}
+
+/* File input */
+.file-input-wrapper {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+}
+
+input[type="file"] {
+    opacity: 0;
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    cursor: pointer;
+    inset: 0;
+}
+
+.file-input-label {
+    background-color: rgba(255,255,255,0.02);
+    color: var(--muted-text);
+    padding: 0.75rem 1.25rem;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background-color 0.12s ease, transform 0.06s ease;
+    font-weight: 500;
+    border: 1px solid rgba(255,255,255,0.03);
+    backdrop-filter: blur(4px);
+}
+
+.file-input-label:hover {
+    background-color: rgba(255,255,255,0.03);
+    transform: translateY(-1px);
+}
+
+.file-name {
+    font-style: italic;
+    color: var(--muted-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Primary submit button */
+button[type="submit"] {
+    display: block;
+    width: 100%;
+    background: linear-gradient(180deg, var(--primary-color), var(--primary-pressed));
+    color: #00161b;
+    border: none;
+    padding: 0.85rem 1rem;
+    font-size: 1.1rem;
+    font-weight: 600;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: transform 0.08s ease, box-shadow 0.12s ease;
+    box-shadow: var(--focus-glow);
+}
+
+button[type="submit"]:hover {
+    background: linear-gradient(180deg, var(--primary-hover), var(--primary-color));
+    transform: translateY(-2px);
+}
+
+button[type="submit"]:active {
+    transform: translateY(0);
+}
+
+/* Divider */
+.divider {
+    border: none;
+    border-top: 1px solid var(--divider-color);
+    margin: 3rem 0;
+}
+
+/* --- NEW STYLES for Job History --- */
+#job-history h2 {
+    text-align: center;
+    color: var(--muted-text);
+    margin-bottom: 1.5rem;
+}
+
+.job-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.job-card {
+    padding: 1.5rem;
+    border-radius: 8px;
+    background: var(--muted-surface);
+    border: 1px solid var(--border-color);
+    transition: all 0.2s ease-in-out;
+}
+
+.job-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+}
+
+.job-card-header h3 {
+    margin: 0;
+    font-size: 1.1rem;
+    word-break: break-all;
+}
+
+.job-status-badge {
+    padding: 0.25rem 0.75rem;
+    border-radius: 12px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+/* --- Job Status Variations --- */
+.job-card[data-status="pending"],
+.job-card[data-status="processing"] {
+    border-left: 4px solid var(--primary-color);
+}
+.job-status-badge.status-pending,
+.job-status-badge.status-processing {
+    background-color: rgba(0,180,255,0.1);
+    color: var(--primary-hover);
+}
+
+.job-card[data-status="completed"] {
+    border-left: 4px solid var(--success-color);
+}
+.job-status-badge.status-completed {
+    background-color: rgba(38,194,129,0.1);
+    color: var(--success-color);
+}
+
+.job-card[data-status="failed"] {
+    border-left: 4px solid var(--error-color);
+}
+.job-status-badge.status-failed {
+    background-color: rgba(255,107,107,0.1);
+    color: var(--error-color);
+}
+/* --- End Status Variations --- */
+
+.job-card-body {
+    padding-top: 1rem;
+    border-top: 1px solid var(--divider-color);
+}
+
+.job-card .processing-indicator {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    color: var(--muted-text);
+}
+
+.job-card .error-message {
+    background-color: rgba(255,107,107,0.05);
+    padding: 0.75rem;
+    border-radius: 4px;
+    color: var(--error-color);
+    font-family: ui-monospace, monospace;
+    font-size: 0.9rem;
+}
+
+/* --- (Copied from old .result-area) --- */
+.download-button {
+    display: inline-block;
+    background: linear-gradient(180deg, var(--success-color), #1f9b63);
+    color: #00160b;
+    padding: 0.75rem 1.5rem;
+    text-decoration: none;
+    border-radius: 6px;
+    font-weight: 600;
+    margin-bottom: 1.5rem;
+    transition: transform 0.08s ease;
+}
+.download-button:hover { transform: translateY(-2px); }
+
+.text-preview {
+    background-color: rgba(255,255,255,0.01);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 1rem;
+    max-height: 300px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", "Courier New", monospace;
+    font-size: 0.9rem;
+    color: var(--mono-text);
+}
+/* --- End Copied Styles --- */
+
+
+/* Spinner animation (no longer in an overlay) */
+.spinner {
+    border: 3px solid rgba(255,255,255,0.06);
+    border-top: 3px solid var(--primary-color);
+    border-radius: 50%;
+    width: 24px;
+    height: 24px;
+    animation: spin 1s linear infinite;
+}
+
+/* focus states for keyboard users */
+:focus {
+    outline: none;
+}
+
+button:focus, a:focus, .file-input-label:focus, input:focus, textarea:focus {
+    box-shadow: var(--focus-glow);
+    border-color: rgba(0,180,255,0.24);
+    transform: none;
+}
+
+/* small responsive tweaks */
+@media (max-width: 480px) {
+    body { padding: 1.25rem; }
+    header h1 { font-size: 1.6rem; }
+    .container { padding: 1.25rem; border-radius: 10px; }
+}
+
+/* animation keyframes */
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+/* Text selection (nice accent on black) */
+::selection {
+    background: rgba(0,180,255,0.18);
+    color: var(--text-color);
+}

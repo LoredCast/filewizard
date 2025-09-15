@@ -1,0 +1,436 @@
+/* static/css/style.css */
+
+:root {
+    /* Core */
+    --bg-color: #000000;
+    --surface: #111111;
+    --card-bg: #0b0b0b;
+    --text-color: #e6eef6;
+    --muted-text: #9aa4ad;
+
+    /* Accent / interactive */
+    --primary-color: #00b4ff;
+    --primary-hover: #00d0ff;
+    --success-color: #26c281;
+    --error-color: #ff6b6b;
+    --cancel-color: #f39c12; /* Orange for cancelled */
+
+    /* Borders / dividers */
+    --border-color: rgba(255, 255, 255, 0.1);
+    --divider-color: rgba(255, 255, 255, 0.06);
+
+    --font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+/* Page */
+html {
+    box-sizing: border-box;
+}
+*, *:before, *:after {
+    box-sizing: inherit;
+}
+
+body {
+    font-family: var(--font-family);
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    margin: 0;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* Container */
+.container {
+    width: 100%;
+    max-width: 960px;
+    margin: 0 auto;
+    background: var(--card-bg);
+    border-radius: 10px;
+    padding: 1.5rem;
+    border: 1px solid var(--border-color);
+}
+@media (max-width: 768px) {
+    .container {
+        padding: 1rem;
+        border: none;
+        border-radius: 0;
+    }
+}
+
+
+/* Header */
+header {
+    text-align: center;
+    margin-bottom: 1.5rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--divider-color);
+}
+
+header h1 {
+    margin: 0 0 0.25rem 0;
+    font-size: 1.75rem;
+    font-weight: 700;
+}
+
+header p {
+    margin: 0;
+    color: var(--muted-text);
+    font-size: 1rem;
+}
+
+/* Form Layout */
+.form-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+}
+@media (min-width: 768px) {
+    .form-grid {
+        grid-template-columns: 1fr 1fr;
+    }
+}
+
+.upload-form fieldset {
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 1rem;
+    margin: 0;
+    background: transparent;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+}
+
+.upload-form legend {
+    padding: 0 0.5rem;
+    font-weight: 500;
+    color: var(--primary-color);
+}
+
+.upload-form legend h2 {
+    margin: 0;
+    font-size: 1.25rem;
+}
+
+/* File input */
+.file-input-wrapper {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-top: 1rem;
+    margin-bottom: 1rem;
+}
+
+input[type="file"] {
+    opacity: 0;
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    cursor: pointer;
+    text-overflow: ellipsis;
+    inset: 0;
+}
+
+.file-input-label {
+    background-color: rgba(255,255,255,0.05);
+    color: var(--muted-text);
+    padding: 0.5rem 1rem;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+    font-weight: 500;
+    text-overflow: ellipsis;
+
+    border: 1px solid rgba(255,255,255,0.1);
+    white-space: nowrap;
+}
+.file-input-label:hover {
+    background-color: rgba(255,255,255,0.1);
+}
+
+.file-name {
+    font-size: 0.9rem;
+    font-style: italic;
+    color: var(--muted-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    max-width: 10em;
+}
+
+/* --- STYLES FOR DROPDOWN MENU --- */
+.form-control {
+    margin-bottom: 1rem;
+}
+
+.form-control label {
+    display: block;
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--muted-text);
+    margin-bottom: 0.4rem;
+}
+
+.form-control select {
+    width: 100%;
+    background-color: rgba(255,255,255,0.05);
+    color: var(--text-color);
+    padding: 0.5rem 0.8rem;
+    border-radius: 5px;
+    border: 1px solid var(--border-color);
+    font-family: inherit;
+    font-size: 0.95rem;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%239aa4ad' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M2 5l6 6 6-6'/%3e%3c/svg%3e");
+    background-repeat: no-repeat;
+    background-position: right 0.7rem center;
+    background-size: 1em;
+    cursor: pointer;
+    transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+}
+
+.form-control select:focus {
+    outline: none;
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 2px rgba(0, 180, 255, 0.2);
+}
+/* ---------------------------------- */
+
+/* Submit button */
+button[type="submit"] {
+    display: block;
+    width: 100%;
+    background: var(--primary-color);
+    color: #00161b;
+    border: none;
+    padding: 0.65rem 1rem;
+    font-size: 1rem;
+    font-weight: 600;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+    margin-top: auto; /* Pushes button to the bottom */
+}
+button[type="submit"]:hover {
+    background: var(--primary-hover);
+}
+button[type="submit"]:disabled {
+    background-color: var(--muted-text);
+    cursor: not-allowed;
+}
+
+/* History Section */
+#job-history h2 {
+    text-align: center;
+    color: var(--muted-text);
+    font-size: 1.25rem;
+    margin-bottom: 1rem;
+    border-top: 1px solid var(--divider-color);
+    padding-top: 2rem;
+}
+
+.table-wrapper {
+    overflow-x: auto;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background-color: var(--surface);
+}
+
+#job-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+}
+
+#job-table th,
+#job-table td {
+    padding: 0.75rem;
+    text-align: left;
+    vertical-align: middle;
+    border-bottom: 1px solid var(--divider-color);
+}
+#job-table tbody tr:last-child td {
+    border-bottom: none;
+}
+
+#job-table th {
+    color: var(--muted-text);
+    font-weight: 500;
+    text-transform: uppercase;
+    font-size: 0.75rem;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+}
+
+#job-table td[data-label="File"] {
+    max-width: 250px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.action-col {
+    text-align: center;
+    width: 100px;
+}
+#job-table td.action-col {
+    text-align: center;
+}
+
+/* Status Badge */
+.job-status-badge {
+    padding: 0.2rem 0.6rem;
+    border-radius: 12px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: capitalize;
+    display: inline-block;
+    white-space: nowrap;
+}
+.status-pending, .status-processing {
+    background-color: rgba(0,180,255,0.15);
+    color: var(--primary-hover);
+}
+.status-completed {
+    background-color: rgba(38,194,129,0.15);
+    color: var(--success-color);
+}
+.status-failed {
+    background-color: rgba(255,107,107,0.15);
+    color: var(--error-color);
+}
+.status-cancelled {
+    background-color: rgba(243, 156, 18, 0.15);
+    color: var(--cancel-color);
+}
+.error-text {
+    color: var(--error-color);
+    cursor: help;
+}
+
+/* Progress Bar */
+.progress-bar-container {
+    height: 6px;
+    width: 100%;
+    background-color: rgba(255,255,255,0.1);
+    border-radius: 3px;
+    margin-top: 6px;
+    overflow: hidden;
+}
+.progress-bar {
+    height: 100%;
+    background-color: var(--primary-color);
+    border-radius: 3px;
+    transition: width 0.5s ease-in-out;
+}
+
+.progress-bar.indeterminate {
+    width: 100%;
+    background: linear-gradient(
+        90deg, 
+        rgba(0,180,255,0.4) 25%, 
+        rgba(0,180,255,1) 50%, 
+        rgba(0,180,255,0.4) 75%
+    );
+    background-size: 200% 100%;
+    animation: indeterminate-scroll 2s linear infinite;
+}
+
+@keyframes indeterminate-scroll {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+
+/* Action items */
+.download-button {
+    background-color: var(--success-color);
+    color: #00160b;
+    padding: 0.3rem 0.8rem;
+    text-decoration: none;
+    border-radius: 5px;
+    font-weight: 600;
+    font-size: 0.85rem;
+    display: inline-block;
+    transition: transform 0.1s ease;
+    border: none;
+}
+.download-button:hover { transform: scale(1.05); }
+
+.cancel-button {
+    background-color: var(--error-color);
+    color: #1a0000;
+    padding: 0.3rem 0.8rem;
+    border-radius: 5px;
+    font-weight: 600;
+    font-size: 0.85rem;
+    display: inline-block;
+    transition: transform 0.1s ease;
+    border: none;
+    cursor: pointer;
+}
+.cancel-button:hover { background-color: #ff8f8f; }
+
+
+.spinner-small {
+    border: 3px solid rgba(255,255,255,0.1);
+    border-top: 3px solid var(--primary-color);
+    border-radius: 50%;
+    width: 20px;
+    height: 20px;
+    animation: spin 1s linear infinite;
+    margin: 0 auto;
+}
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+@media (max-width: 768px) {
+    .table-wrapper {
+        border: none;
+        background-color: transparent;
+    }
+    #job-table thead {
+        display: none;
+    }
+    #job-table, #job-table tbody, #job-table tr, #job-table td {
+        display: block;
+        width: 100%;
+    }
+    #job-table tr {
+        margin-bottom: 1rem;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background-color: var(--surface);
+    }
+    #job-table td {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0.75rem 1rem;
+        border-bottom: 1px solid var(--divider-color);
+        white-space: normal;
+    }
+    #job-table tr td:last-child {
+        border-bottom: none;
+    }
+    #job-table td::before {
+        content: attr(data-label);
+        font-weight: 500;
+        color: var(--muted-text);
+        padding-right: 1rem;
+        flex-shrink: 0;
+    }
+    .cell-value {
+        text-align: right;
+        min-width: 0;
+        word-break: break-all;
+    }
+}

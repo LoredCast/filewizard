@@ -1,0 +1,8 @@
+__pycache__
+uploads
+processed
+venv
+core
+huey.*
+*.db
+

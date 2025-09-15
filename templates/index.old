@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document Processor AI</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/css/style.css') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Document Processor AI 🚀</h1>
+            <p>High-speed OCR for PDFs and Transcription for Audio</p>
+        </header>
+
+        <main>
+            <section class="processor-section">
+                <form id="pdf-form" class="upload-form" enctype="multipart/form-data">
+                    <fieldset>
+                        <legend><h2>📄 PDF OCR Processor</h2></legend>
+                        <p>Upload a PDF to create a searchable version and extract its text.</p>
+                        <div class="file-input-wrapper">
+                            <input type="file" name="file" id="pdf-file-input" accept=".pdf" required>
+                            <label for="pdf-file-input" class="file-input-label">Choose PDF...</label>
+                            <span id="pdf-file-name" class="file-name">No file selected</span>
+                        </div>
+                        <button type="submit">Process PDF</button>
+                    </fieldset>
+                </form>
+            </section>
+
+            <hr class="divider">
+
+            <section class="processor-section">
+                <form id="audio-form" class="upload-form" enctype="multipart/form-data">
+                    <fieldset>
+                        <legend><h2>🎤 Audio Transcription</h2></legend>
+                        <p>Upload an audio file (MP3, WAV, M4A) to generate a text transcript.</p>
+                        <div class="file-input-wrapper">
+                             <input type="file" name="file" id="audio-file-input" accept="audio/*" required>
+                             <label for="audio-file-input" class="file-input-label">Choose Audio...</label>
+                             <span id="audio-file-name" class="file-name">No file selected</span>
+                        </div>
+                        <button type="submit">Transcribe Audio</button>
+                    </fieldset>
+                </form>
+            </section>
+            
+            <hr class="divider">
+
+            <section id="job-history">
+                <h2>Processing History</h2>
+                <div id="job-list">
+                    </div>
+            </section>
+        </main>
+    </div>
+    <script src="{{ url_for('static', path='/js/script.js') }}"></script>
+</body>
+</html>

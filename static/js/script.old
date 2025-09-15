@@ -1,0 +1,214 @@
+// static/js/script.js
+
+document.addEventListener('DOMContentLoaded', () => {
+    // --- Global Elements ---
+    const jobListContainer = document.getElementById('job-list');
+
+    // --- PDF Form ---
+    const pdfForm = document.getElementById('pdf-form');
+    const pdfFileInput = document.getElementById('pdf-file-input');
+    const pdfFileName = document.getElementById('pdf-file-name');
+
+    // --- Audio Form ---
+    const audioForm = document.getElementById('audio-form');
+    const audioFileInput = document.getElementById('audio-file-input');
+    const audioFileName = document.getElementById('audio-file-name');
+    
+    // --- State Management ---
+    let activePolls = new Map(); // Use a Map to store interval IDs for polling
+
+    // --- Event Listeners ---
+    pdfFileInput.addEventListener('change', () => updateFileName(pdfFileInput, pdfFileName));
+    audioFileInput.addEventListener('change', () => updateFileName(audioFileInput, audioFileName));
+
+    pdfForm.addEventListener('submit', (e) => handleFormSubmit(e, '/ocr-pdf', pdfForm, pdfFileInput, pdfFileName));
+    audioForm.addEventListener('submit', (e) => handleFormSubmit(e, '/transcribe-audio', audioForm, audioFileInput, audioFileName));
+
+    /**
+     * Updates the file name display.
+     */
+    function updateFileName(input, nameDisplay) {
+        nameDisplay.textContent = input.files.length > 0 ? input.files[0].name : 'No file selected';
+    }
+
+    /**
+     * Generic handler for submitting a file processing form.
+     */
+    async function handleFormSubmit(event, endpoint, form, fileInput, fileNameDisplay) {
+        event.preventDefault();
+        if (!fileInput.files[0]) {
+            alert('Please select a file to upload.');
+            return;
+        }
+
+        const formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+        
+        // Disable the submit button
+        const submitButton = form.querySelector('button[type="submit"]');
+        submitButton.disabled = true;
+
+        try {
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                body: formData,
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.detail || `HTTP error! Status: ${response.status}`);
+            }
+
+            const result = await response.json(); // Expects { job_id: "...", status: "pending" }
+            
+            // Create a preliminary job object to render immediately
+            const preliminaryJob = {
+                id: result.job_id,
+                status: 'pending',
+                original_filename: fileInput.files[0].name,
+                task_type: endpoint.includes('ocr') ? 'ocr' : 'transcription',
+                created_at: new Date().toISOString()
+            };
+            
+            renderJobCard(preliminaryJob); // Render in pending state
+            startPolling(result.job_id);   // Start polling for updates
+
+        } catch (error) {
+            console.error('Error submitting job:', error);
+            // In a real app, you'd show this error in a more user-friendly way
+            alert(`Submission failed: ${error.message}`);
+        } finally {
+            // Reset form and re-enable button
+            form.reset();
+            fileNameDisplay.textContent = 'No file selected';
+            submitButton.disabled = false;
+        }
+    }
+
+    /**
+     * Fetches all existing jobs on page load and renders them.
+     */
+    async function loadInitialJobs() {
+        try {
+            const response = await fetch('/jobs');
+            if (!response.ok) throw new Error('Failed to fetch jobs.');
+            
+            const jobs = await response.json();
+            jobListContainer.innerHTML = ''; // Clear any existing content
+            
+            for (const job of jobs) {
+                renderJobCard(job);
+                // If a job is still processing from a previous session, resume polling
+                if (job.status === 'pending' || job.status === 'processing') {
+                    startPolling(job.id);
+                }
+            }
+        } catch (error) {
+            console.error("Couldn't load job history:", error);
+            jobListContainer.innerHTML = '<p>Could not load job history.</p>';
+        }
+    }
+
+    /**
+     * Starts polling for a specific job's status.
+     */
+    function startPolling(jobId) {
+        if (activePolls.has(jobId)) return; // Already polling this job
+
+        const intervalId = setInterval(async () => {
+            try {
+                const response = await fetch(`/job/${jobId}`);
+                if (!response.ok) {
+                    // Stop polling if job not found (e.g., cleaned up)
+                    if (response.status === 404) stopPolling(jobId);
+                    return;
+                }
+                
+                const job = await response.json();
+                renderJobCard(job); // Re-render the card with new data
+
+                if (job.status === 'completed' || job.status === 'failed') {
+                    stopPolling(jobId);
+                }
+            } catch (error) {
+                console.error(`Error polling for job ${jobId}:`, error);
+                stopPolling(jobId); // Stop on network error
+            }
+        }, 3000); // Poll every 3 seconds
+
+        activePolls.set(jobId, intervalId);
+    }
+
+    /**
+     * Stops polling for a specific job.
+     */
+    function stopPolling(jobId) {
+        if (activePolls.has(jobId)) {
+            clearInterval(activePolls.get(jobId));
+            activePolls.delete(jobId);
+        }
+    }
+
+    /**
+     * Creates or updates a job card in the UI.
+     */
+    function renderJobCard(job) {
+        let card = document.getElementById(`job-${job.id}`);
+        // Create card if it doesn't exist
+        if (!card) {
+            card = document.createElement('div');
+            card.id = `job-${job.id}`;
+            card.className = 'job-card';
+            // Prepend new jobs to the top of the list
+            jobListContainer.prepend(card);
+        }
+
+        // Update status for styling
+        card.dataset.status = job.status;
+
+        const taskName = job.task_type === 'ocr' ? 'PDF OCR' : 'Audio Transcription';
+        const formattedDate = new Date(job.created_at).toLocaleString();
+
+        let bodyHtml = '';
+        switch(job.status) {
+            case 'pending':
+            case 'processing':
+                bodyHtml = `
+                    <div class="processing-indicator">
+                        <div class="spinner"></div>
+                        <span>Status: ${job.status}...</span>
+                    </div>`;
+                break;
+            case 'completed':
+                const downloadFilename = job.processed_filepath.split(/[\\/]/).pop();
+                const downloadUrl = `/download/${downloadFilename}`;
+                const downloadButton = `<a href="${downloadUrl}" class="download-button" download>Download Result</a>`;
+                const previewHtml = job.task_type === 'ocr' && job.result_preview
+                    ? `<h4>Extracted Text Preview:</h4><pre class="text-preview">${job.result_preview}</pre>`
+                    : '';
+                bodyHtml = `<div>${downloadButton}${previewHtml}</div>`;
+                break;
+            case 'failed':
+                bodyHtml = `
+                    <h4>Processing Failed</h4>
+                    <p class="error-message">${job.error_message || 'An unknown error occurred.'}</p>`;
+                break;
+        }
+
+        card.innerHTML = `
+            <div class="job-card-header">
+                <h3>${job.original_filename}</h3>
+                <span class="job-status-badge status-${job.status}">${job.status}</span>
+            </div>
+            <p style="color: var(--muted-text); margin: -0.5rem 0 1rem 0; font-size: 0.9rem;">
+                ${taskName} &bull; Submitted: ${formattedDate}
+            </p>
+            <div class="job-card-body">
+                ${bodyHtml}
+            </div>
+        `;
+    }
+
+    // --- Initial Execution ---
+    loadInitialJobs();
+});
