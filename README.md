@@ -48,8 +48,9 @@ cd filewizard
 Startup Docker, initially the settings.yml file is applied, you can edit it.
 For You can edit the .env file for further configuration.
 
+Note: Building this image will take some time installing all deps ((mostly texlive)).1
 ```bash
-docker compose up -d
+docker compose up --build
 ```
 
 ### Manually
