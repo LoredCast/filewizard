@@ -29,10 +29,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     texlive \
     jpegoptim \
-    texlive-latex-extra \
+    texlive-latex-recommended \
     texlive-fonts-recommended \
     libxml2 \
     texlive-xetex \
+    texlive-science \
+    libxml2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 
