@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pngquant \
     pandoc \
     resvg \
+    sox \
     libvips-tools \
     build-essential \
     pkg-config \
@@ -53,4 +54,4 @@ COPY . .
 EXPOSE 8000
 RUN chmod +x run.sh
 # Command to run when container starts
-CMD ["./run.sh"]
+CMD ["./run.sh", "&"]

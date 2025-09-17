@@ -4,14 +4,16 @@ services:
   web:
     build: .
     env_file:
-      - .env 
+      - .env
+
+    #user: "1000:1000"
     ports:
-      - "8000:8000"
+      - "6969:8000"
     volumes:
       # Mount local directories and files into the container for persistence
-      - ./uploads:/app/uploads
-      - ./processed:/app/processed
-      - ./settings.yml:/app/settings.yml
-      - ./jobs.db:/app/jobs.db
-      - ./huey.db:/app/huey.db
+      - ./uploads_data:/app/uploads
+      - ./processed_data:/app/processed
 
+volumes:
+  uploads_data: {}
+  processed_data: {}
