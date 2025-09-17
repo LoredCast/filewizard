@@ -27,7 +27,7 @@
                         <fieldset>
                             <legend><h2>File Conversion</h2></legend>
                             <div class="file-input-wrapper">
-                                 <input type="file" name="file" id="conversion-file-input" required>
+                                 <input type="file" name="file" id="conversion-file-input" required multiple>
                                  <label for="conversion-file-input" class="file-input-label">Choose File...</label>
                                  <span id="conversion-file-name" class="file-name">No file chosen</span>
                             </div>
@@ -45,7 +45,7 @@
                         <fieldset>
                             <legend><h2>PDF OCR</h2></legend>
                             <div class="file-input-wrapper">
-                                <input type="file" name="file" id="pdf-file-input" accept=".pdf" required>
+                                <input type="file" name="file" id="pdf-file-input" accept=".pdf" required multiple>
                                 <label for="pdf-file-input" class="file-input-label">Choose PDF...</label>
                                 <span id="pdf-file-name" class="file-name">No file chosen</span>
                             </div>
@@ -59,7 +59,7 @@
                         <fieldset>
                             <legend><h2>Transcribe Audio</h2></legend>
                             <div class="file-input-wrapper">
-                                 <input type="file" name="file" id="audio-file-input" accept="audio/*" required>
+                                 <input type="file" name="file" id="audio-file-input" accept="audio/*" required multiple>
                                  <label for="audio-file-input" class="file-input-label">Choose Audio...</label>
                                  <span id="audio-file-name" class="file-name">No file chosen</span>
                             </div>
@@ -87,6 +87,7 @@
                         <thead>
                             <tr>
                                 <th>File</th>
+                                <th>File Size</th>
                                 <th>Task</th>
                                 <th>Submitted</th>
                                 <th>Status</th>
@@ -100,7 +101,37 @@
             </section>
         </main>
     </div>
-    
+
+    <div id="drag-overlay" class="drag-overlay">
+        <div class="drag-overlay-content">
+             <p>Drop files anywhere to begin</p>
+        </div>
+    </div>
+    <div id="action-dialog" class="dialog-overlay">
+        <div class="dialog-box">
+            <h2>Choose Action</h2>
+            <p><span id="dialog-file-count"></span> file(s) dropped. What would you like to do?</p>
+            
+            <div id="dialog-initial-actions" class="dialog-actions">
+                <button id="dialog-action-convert">Convert</button>
+                <button id="dialog-action-ocr">OCR</button>
+                <button id="dialog-action-transcribe">Transcribe</button>
+            </div>
+            
+            <div id="dialog-convert-view" style="display: none;">
+                <div class="form-control" style="text-align: left; margin-bottom: 1rem;">
+                    <label for="dialog-output-format-select">Convert To</label>
+                    <select id="dialog-output-format-select" required></select>
+                </div>
+                <div class="dialog-actions">
+                    <button id="dialog-start-conversion">Start Conversion</button>
+                    <button id="dialog-back" class="dialog-secondary-action">Back</button>
+                </div>
+            </div>
+
+            <button id="dialog-action-cancel" class="dialog-cancel">Cancel</button>
+        </div>
+    </div>
     <script>
         window.APP_CONFIG = {
             conversionTools: {{ conversion_tools | tojson }}

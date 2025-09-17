@@ -1,5 +1,3 @@
-/* static/css/style.css */
-
 :root {
     /* Core */
     --bg-color: #000000;
@@ -449,6 +447,110 @@ button[type="submit"]:disabled {
 
 }
 
+/* --- START: Drag and Drop and Dialog Styles --- */
+.drag-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    display: none; /* Hidden by default */
+    justify-content: center;
+    align-items: center;
+    background-color: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(5px);
+}
+body.dragging .drag-overlay {
+    display: flex; /* Shown when body has .dragging class */
+}
+.drag-overlay-content {
+    border: 3px dashed var(--primary-color);
+    border-radius: 12px;
+    padding: 2rem 4rem;
+    text-align: center;
+    background-color: rgba(0, 0, 0, 0.2);
+}
+.drag-overlay-content p {
+    margin: 0;
+    font-size: 1.5rem;
+    font-weight: 500;
+    color: var(--primary-color);
+}
+
+.dialog-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    display: none; /* Hidden by default */
+    justify-content: center;
+    align-items: center;
+    background-color: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(5px);
+}
+.dialog-overlay.visible {
+    display: flex; /* Show when .visible class is added */
+}
+
+.dialog-box {
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 1.5rem;
+    width: 100%;
+    max-width: 450px;
+    text-align: center;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+}
+.dialog-box h2 {
+    margin-top: 0;
+    font-size: 1.5rem;
+}
+.dialog-box p {
+    color: var(--muted-text);
+    margin-bottom: 1.5rem;
+}
+
+.dialog-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+}
+.dialog-actions button {
+    display: block;
+    width: 100%;
+    background: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--text-color);
+    padding: 0.65rem 1rem;
+    font-size: 1rem;
+    font-weight: 600;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+.dialog-actions button:hover {
+    background: var(--primary-hover);
+    border-color: var(--primary-hover);
+}
+.dialog-secondary-action {
+    background-color: transparent !important;
+    border: 1px solid var(--border-color) !important;
+}
+.dialog-secondary-action:hover {
+    background-color: rgba(255, 255, 255, 0.05) !important;
+}
+.dialog-cancel {
+    background: none;
+    border: none;
+    color: var(--muted-text);
+    cursor: pointer;
+    font-size: 0.9rem;
+    padding: 0.5rem;
+}
+.dialog-cancel:hover {
+    color: var(--text-color);
+}
+/* --- END: Drag and Drop and Dialog Styles --- */
+
 /* Spinner */
 .spinner-small {
     border: 3px solid rgba(255,255,255,0.1);
@@ -467,7 +569,6 @@ button[type="submit"]:disabled {
 
 /* Mobile responsive table */
 @media (max-width: 768px) {
-    /* ... (no changes in this section) ... */
     .table-wrapper {
         border: none;
         background-color: transparent;
@@ -513,17 +614,17 @@ button[type="submit"]:disabled {
 
     .cell-value {
         min-width: 0;
-    max-width: 20em;
-    text-wrap: nowrap;
-    overflow: scroll;
-}
+        max-width: 20em;
+        text-wrap: nowrap;
+        overflow: scroll;
+    }
 
 
-#job-table td[data-label="File"],
-#job-table td[data-label="Task"] {
-    overflow: scroll;
-    text-overflow: ellipsis;
-    text-wrap: nowrap;
-    max-width: 100em;
-}
+    #job-table td[data-label="File"],
+    #job-table td[data-label="Task"] {
+        overflow: scroll;
+        text-overflow: ellipsis;
+        text-wrap: nowrap;
+        max-width: 100em;
+    }
 }

@@ -1,179 +1,242 @@
-# settings.yml
-
-# General application settings
 app_settings:
-  max_file_size_mb: 2000 # Maximum upload size in Megabytes
-
-# Settings for Optical Character Recognition (OCR) tasks
+  max_file_size_mb: '2000'
+  allowed_all_extensions:
+  - .pdf
+  - .ps
+  - .eps
+  - .png
+  - .jpg
+  - .jpeg
+  - .tiff
+  - .tif
+  - .gif
+  - .bmp
+  - .webp
+  - .svg
+  - .jxl
+  - .avif
+  - .ppm
+  - .mp3
+  - .m4a
+  - .ogg
+  - .flac
+  - .opus
+  - .wav
+  - .aac
+  - .mp4
+  - .mkv
+  - .mov
+  - .webm
+  - .avi
+  - .flv
+  - .md
+  - .txt
+  - .html
+  - .docx
+  - .odt
+  - .rst
+  - .epub
+  - .mobi
+  - .azw3
+  - .pptx
+  - .xlsx
 ocr_settings:
   ocrmypdf:
     deskew: true
     clean: true
     optimize: 1
     force_ocr: true
-
-# Settings for audio transcription tasks
 transcription_settings:
   whisper:
-    compute_type: "int8"
+    compute_type: int8
     allowed_models:
-      - "tiny"
-      - "base"
-      - "small"
-      - "medium"
-      - "large-v3"
-      - "distil-large-v2"
-
-# --- Conversion Tool Definitions ---
-# Each tool's command is a single string. The backend uses shlex to parse it,
-# so you can use quotes for arguments with spaces.
-# Use placeholders like: {input}, {output}, {output_dir}, {output_ext}, etc.
+    - tiny
+    - base
+    - small
+    - medium
+    - large-v3
+    - distil-large-v2
 conversion_tools:
   libreoffice:
-    name: "LibreOffice"
-    command_template: 'libreoffice --headless --convert-to {output_ext} --outdir {output_dir} {input}'
+    name: LibreOffice
+    command_template: libreoffice --headless --convert-to {filter} --outdir {output_dir}
+      {input}
+    timeout: 300
+    filters:
+      pdf: pdf
+      docx: docx
+      odt: odt
+      html: html
+      rtf: rtf
+      txt: txt:Text
+      xml: xml
+      epub: epub
+      xlsx: xlsx
+      ods: ods
+      csv: csv:Text
+      pptx: pptx
+      odp: odp
+      svg: svg
     formats:
-      pdf: "PDF"
-      docx: "Word Document"
-      odt: "OpenDocument Text"
-      html: "HTML"
-      rtf: "Rich Text Format"
-      txt: "Plain Text"
-      xml: "Word 2003 XML"
-      epub: "EPUB"
-      xlsx: "Excel Spreadsheet"
-      ods: "OpenDocument Spreadsheet"
-      csv: "CSV"
-      pptx: "PowerPoint Presentation"
-      odp: "OpenDocument Presentation"
-      svg: "SVG"
+      pdf: PDF
+      docx: Word Document
+      odt: OpenDocument Text
+      html: HTML
+      rtf: Rich Text Format
+      txt: Plain Text
+      xml: Word 2003 XML
+      epub: EPUB
+      xlsx: Excel Spreadsheet
+      ods: OpenDocument Spreadsheet
+      csv: CSV
+      pptx: PowerPoint Presentation
+      odp: OpenDocument Presentation
+      svg: SVG
   pandoc:
-    name: "Pandoc"
-    command_template: 'pandoc --standalone {input} -o {output}'
+    name: Pandoc
+    command_template: pandoc --standalone {input} -o {output} --to={output_ext} --pdf-engine=xelatex
+    timeout: 300
     formats:
-      docx: "Word Document"
-      odt: "OpenDocument Text"
-      pdf: "PDF"
-      rtf: "Rich Text Format"
-      txt: "Plain Text"
-      tex: "LaTeX"
-      man: "Groff Man Page"
-      epub: "EPUB v3 Book"
-      epub2: "EPUB v2 Book"
-      html: "HTML"
-      html5: "HTML5"
-      pptx: "PowerPoint Presentation"
-      beamer: "Beamer PDF Slides"
-      slidy: "Slidy HTML Slides"
-      md: "Markdown"
-      rst: "reStructuredText"
-      jira: "Jira Wiki Markup"
-      mediawiki: "MediaWiki Markup"
+      docx: Word Document
+      odt: OpenDocument Text
+      pdf: PDF
+      rtf: Rich Text Format
+      txt: Plain Text
+      tex: LaTeX
+      man: Groff Man Page
+      epub: EPUB v3 Book
+      epub2: EPUB v2 Book
+      html: HTML
+      html5: HTML5
+      pptx: PowerPoint Presentation
+      beamer: Beamer PDF Slides
+      slidy: Slidy HTML Slides
+      md: Markdown
+      rst: reStructuredText
+      jira: Jira Wiki Markup
+      mediawiki: MediaWiki Markup
   ghostscript_pdf:
-    name: "Ghostscript (PDF)"
-    command_template: 'gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dQUIET -dBATCH {preset} -sOutputFile={output} {input}'
+    name: Ghostscript (PDF)
+    command_template: gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dQUIET
+      -dBATCH {preset} -sOutputFile={output} {input}
+    timeout: 60
     formats:
-      screen: "PDF (Optimized for Screen)"
-      ebook: "PDF (Optimized for Ebooks)"
-      printer: "PDF (Optimized for Print)"
-      archive: "PDF/A (for Archiving)"
+      screen: PDF (Optimized for Screen)
+      ebook: PDF (Optimized for Ebooks)
+      printer: PDF (Optimized for Print)
+      archive: PDF/A (for Archiving)
   ghostscript_image:
-    name: "Ghostscript (Image)"
-    command_template: 'gs -dNOPAUSE -dBATCH -sDEVICE={device} -r{dpi} -sOutputFile={output} {input}'
+    name: Ghostscript (Image)
+    command_template: gs -dNOPAUSE -dBATCH -sDEVICE={device} -r{dpi} -sOutputFile={output}
+      {input}
+    timeout: 60
     formats:
-      jpeg_72: "JPEG Image (72 DPI)"
-      jpeg_300: "JPEG Image (300 DPI)"
-      png16m_150: "PNG Image (150 DPI)"
-      png16m_300: "PNG Image (300 DPI)"
-      tiff24nc_300: "TIFF Image (300 DPI)"
-      tiff24nc_600: "TIFF Image (600 DPI)"
+      jpeg_72: JPEG Image (72 DPI)
+      jpeg_300: JPEG Image (300 DPI)
+      png16m_150: PNG Image (150 DPI)
+      png16m_300: PNG Image (300 DPI)
+      tiff24nc_300: TIFF Image (300 DPI)
+      tiff24nc_600: TIFF Image (600 DPI)
   calibre:
-    name: "Calibre (ebook-convert)"
-    command_template: 'ebook-convert {input} {output}'
+    name: Calibre (ebook-convert)
+    command_template: ebook-convert {input} {output}
+    timeout: 600
     formats:
-      epub: "EPUB"
-      mobi: "MOBI"
-      azw3: "Amazon Kindle"
-      pdf: "PDF"
-      docx: "Word Document"
+      epub: EPUB
+      mobi: MOBI
+      azw3: Amazon Kindle
+      pdf: PDF
+      docx: Word Document
   ffmpeg:
-    name: "FFmpeg"
-    command_template: 'ffmpeg -i {input} -y -preset medium {output}'
+    name: FFmpeg
+    command_template: ffmpeg -i {input} -y -preset medium {output}
+    timeout: 600
     formats:
-      mp4: "MP4 Video"
-      mkv: "MKV Video"
-      mov: "MOV Video"
-      webm: "WebM Video"
-      mp3: "MP3 Audio"
-      wav: "WAV Audio"
-      flac: "FLAC Audio"
-      gif: "Animated GIF"
+      mp4: MP4 Video
+      mkv: MKV Video
+      mov: MOV Video
+      webm: WebM Video
+      mp3: MP3 Audio
+      wav: WAV Audio
+      flac: FLAC Audio
+      gif: Animated GIF
   vips:
-    name: "VIPS"
-    command_template: 'vips copy {input} {output}[Q=90]'
+    name: VIPS
+    command_template: vips copy {input} {output}[Q=90]
+    timeout: 60
     formats:
-      jpg: "JPEG Image (Q90)"
-      png: "PNG Image"
-      webp: "WebP Image (Q90)"
-      tiff: "TIFF Image"
-      avif: "AVIF Image"
+      jpg: JPEG Image (Q90)
+      png: PNG Image
+      webp: WebP Image (Q90)
+      tiff: TIFF Image
+      avif: AVIF Image
   graphicsmagick:
-    name: "GraphicsMagick"
-    command_template: 'gm convert {input} -quality 90 {output}'
+    name: GraphicsMagick
+    command_template: gm convert {input} -quality 90 {output}
+    timeout: 60
     formats:
-      jpg: "JPEG Image (Q90)"
-      png: "PNG Image"
-      webp: "WebP Image"
-      tiff: "TIFF Image"
-      pdf: "PDF from Images"
+      jpg: JPEG Image (Q90)
+      png: PNG Image
+      webp: WebP Image
+      tiff: TIFF Image
+      pdf: PDF from Images
   inkscape:
-    name: "Inkscape"
-    command_template: 'inkscape {input} --export-filename={output}'
+    name: Inkscape
+    command_template: inkscape {input} --export-filename={output}
+    timeout: 30
     formats:
-      svg: "SVG (Plain)"
-      png: "PNG Image (96 DPI)"
-      pdf: "PDF Document"
+      svg: SVG (Plain)
+      png: PNG Image (96 DPI)
+      pdf: PDF Document
   libjxl:
-    name: "libjxl (cjxl)"
-    command_template: 'cjxl {input} {output} -q 90'
+    name: libjxl (cjxl)
+    command_template: cjxl {input} {output} -q 90
+    timeout: 30
     formats:
-      jxl: "JPEG XL (Q90)"
+      jxl: JPEG XL (Q90)
   resvg:
-    name: "resvg"
-    command_template: 'resvg {input} {output}'
+    name: resvg
+    command_template: resvg {input} {output}
+    timeout: 30
     formats:
-      png: "PNG from SVG"
+      png: PNG from SVG
   potrace:
-    name: "Potrace"
-    command_template: 'potrace {input} --svg -o {output}'
+    name: Potrace
+    command_template: potrace {input} --svg -o {output}
+    timeout: 30
     formats:
-      svg: "SVG from Bitmap"
+      svg: SVG from Bitmap
   markitdown:
-    name: "Markitdown"
-    command_template: 'markitdown {input} -o {output}'
+    name: Markitdown
+    command_template: markitdown {input} -o {output}
+    timeout: 300
     formats:
-      md: "Markdown from Everything!"
+      md: Markdown from Everything!
   pngquant:
-    name: "pngquant"
-    command_template: 'pngquant --quality={quality} --speed {speed} --force --output {output} {input}'
+    name: pngquant
+    command_template: pngquant --quality={quality} --speed {speed} --force --output
+      {output} {input}
+    timeout: 300
     formats:
-      png_hq: "PNG (High Quality Compression)"
-      png_mq: "PNG (Medium Quality Compression)"
-      png_fast: "PNG (Fast Compression)"
+      png_hq: PNG (High Quality Compression)
+      png_mq: PNG (Medium Quality Compression)
+      png_fast: PNG (Fast Compression)
   sox:
-    name: "SoX Audio Converter"
-    command_template: 'sox {input} -r {samplerate} -b {bitdepth} {output}'
+    name: SoX Audio Converter
+    command_template: sox {input} -r {samplerate} -b {bitdepth} {output}
+    timeout: 600
     formats:
-      wav_48k_24b: "WAV (48kHz, 24-bit)"
-      wav_44k_16b: "WAV (CD, 44.1kHz, 16-bit)"
-      flac_48k_24b: "FLAC (48kHz, 24-bit)"
-      flac_44k_16b: "FLAC (CD, 44.1kHz, 16-bit)"
-      ogg_32k: "Ogg Vorbis (32kHz)"
-      ogg_16k: "Ogg Vorbis (16kHz, Voice)"
+      wav_48k_24b: WAV (48kHz, 24-bit)
+      wav_44k_16b: WAV (CD, 44.1kHz, 16-bit)
+      flac_48k_24b: FLAC (48kHz, 24-bit)
+      flac_44k_16b: FLAC (CD, 44.1kHz, 16-bit)
+      ogg_32k_16b: Ogg Vorbis (32kHz)
+      ogg_16k_16b: Ogg Vorbis (16kHz, Voice)
   mozjpeg:
-    name: "MozJPEG"
-    command_template: 'cjpeg -quality {quality} -outfile {output} {input}'
+    name: MozJPEG
+    command_template: cjpeg -quality {quality} -outfile {output} {input}
+    timeout: 30
     formats:
-      jpg_q85: "JPEG (High Quality)"
-      jpg_q75: "JPEG (Web Quality)"
-      jpg_q60: "JPEG (Aggressive Compression)"
+      jpg_q85: JPEG (High Quality)
+      jpg_q75: JPEG (Web Quality)
+      jpg_q60: JPEG (Aggressive Compression)
