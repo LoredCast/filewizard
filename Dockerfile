@@ -19,13 +19,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     inkscape \
     calibre \
     pngquant \
+    pandoc \
+    resvg \
     libvips-tools \
     build-essential \
     pkg-config \
     git \
+    jpeg-xl-progs \
+    potrace \
     curl \
     texlive \
     texlive-latex-extra \
+    texlive-fonts-recommended \
+    nodejs \
+    npm \
     texlive-xetex 
     && rm -rf /var/lib/apt/lists/*
 
