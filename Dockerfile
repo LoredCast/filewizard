@@ -25,16 +25,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     pkg-config \
     git \
-    jpeg-xl-progs \
     potrace \
     curl \
     texlive \
     jpegoptim \
     texlive-latex-extra \
     texlive-fonts-recommended \
-    nodejs \
-    npm \
-    texlive-xetex 
+    libxml2 \
+    texlive-xetex \
     && rm -rf /var/lib/apt/lists/*
 
 
