@@ -3,14 +3,15 @@
 :root {
     /* Core */
     --bg-color: #000000;
-    --surface: #111111;
-    --card-bg: #0b0b0b;
+    --surface: #000000;
+    --card-bg: #000000;
     --text-color: #e6eef6;
     --muted-text: #9aa4ad;
 
     /* Accent / interactive */
-    --primary-color: #00b4ff;
-    --primary-hover: #00d0ff;
+    --primary-color: #ffffff;
+    --secondary-color: #2b2b2b;
+    --primary-hover: #ffffff3d;
     --success-color: #26c281;
     --error-color: #ff6b6b;
     --cancel-color: #f39c12; /* Orange for cancelled */
@@ -43,12 +44,14 @@ body {
 /* Container */
 .container {
     width: 100%;
-    max-width: 960px;
+    max-width: 1280px; /* Increased max-width for 3 columns */
     margin: 0 auto;
     background: var(--card-bg);
     border-radius: 10px;
     padding: 1.5rem;
     border: 1px solid var(--border-color);
+    margin-top: 1em;
+
 }
 @media (max-width: 768px) {
     .container {
@@ -69,8 +72,10 @@ header {
 
 header h1 {
     margin: 0 0 0.25rem 0;
-    font-size: 1.75rem;
+    font-size: 3rem;
     font-weight: 700;
+    font-family: serif;
+    font-weight: lighter;
 }
 
 header p {
@@ -79,17 +84,27 @@ header p {
     font-size: 1rem;
 }
 
+.header-actions {
+    position: absolute;
+    top: 1.5rem;
+    right: 1.5rem;
+}
+.settings-link {
+    font-size: 1.5rem;
+    text-decoration: none;
+    color: var(--muted-text);
+    transition: color 0.2s ease;
+}
+.settings-link:hover {
+    color: var(--text-color);
+}
 /* Form Layout */
 .form-grid {
     display: grid;
-    grid-template-columns: 1fr;
+    /* MODIFICATION: Responsive grid for 1, 2, or 3 items */
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
     gap: 1.5rem;
     margin-bottom: 2rem;
-}
-@media (min-width: 768px) {
-    .form-grid {
-        grid-template-columns: 1fr 1fr;
-    }
 }
 
 .upload-form fieldset {
@@ -130,7 +145,6 @@ input[type="file"] {
     width: 100%;
     height: 100%;
     cursor: pointer;
-    text-overflow: ellipsis;
     inset: 0;
 }
 
@@ -142,8 +156,6 @@ input[type="file"] {
     cursor: pointer;
     transition: background-color 0.15s ease;
     font-weight: 500;
-    text-overflow: ellipsis;
-
     border: 1px solid rgba(255,255,255,0.1);
     white-space: nowrap;
 }
@@ -159,10 +171,10 @@ input[type="file"] {
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
-    max-width: 10em;
+    max-width: 15em;
 }
 
-/* --- STYLES FOR DROPDOWN MENU --- */
+/* Form Controls (for dropdowns) */
 .form-control {
     margin-bottom: 1rem;
 }
@@ -200,22 +212,23 @@ input[type="file"] {
     border-color: var(--primary-color);
     box-shadow: 0 0 0 2px rgba(0, 180, 255, 0.2);
 }
-/* ---------------------------------- */
 
 /* Submit button */
 button[type="submit"] {
     display: block;
     width: 100%;
     background: var(--primary-color);
-    color: #00161b;
-    border: none;
+    background-color: transparent;
+    border-color: var(--border-color);
+    border-width: 1px;
+    color: #ffffff;
     padding: 0.65rem 1rem;
     font-size: 1rem;
     font-weight: 600;
     border-radius: 5px;
     cursor: pointer;
     transition: background-color 0.15s ease;
-    margin-top: auto; /* Pushes button to the bottom */
+    margin-top: auto;
 }
 button[type="submit"]:hover {
     background: var(--primary-hover);
@@ -268,16 +281,24 @@ button[type="submit"]:disabled {
     white-space: nowrap;
 }
 
-#job-table td[data-label="File"] {
-    max-width: 250px;
-    overflow: hidden;
+.cell-value {
+    max-width: 10em;
+    text-wrap: wrap;
+    overflow: scroll;
+}
+
+
+#job-table td[data-label="File"],
+#job-table td[data-label="Task"] {
+    overflow: scroll;
     text-overflow: ellipsis;
-    white-space: nowrap;
+    text-wrap: wrap;
+    max-width: 15em;
 }
 
 .action-col {
     text-align: center;
-    width: 100px;
+    width: 120px;
 }
 #job-table td.action-col {
     text-align: center;
@@ -348,35 +369,87 @@ button[type="submit"]:disabled {
 }
 
 /* Action items */
-.download-button {
-    background-color: var(--success-color);
-    color: #00160b;
+.download-button, .cancel-button {
     padding: 0.3rem 0.8rem;
     text-decoration: none;
     border-radius: 5px;
     font-weight: 600;
     font-size: 0.85rem;
     display: inline-block;
-    transition: transform 0.1s ease;
+    transition: transform 0.1s ease, background-color 0.15s ease;
     border: none;
+    cursor: pointer;
+}
+.download-button {
+    background-color: var(--success-color);
+    color: #00160b;
 }
 .download-button:hover { transform: scale(1.05); }
 
 .cancel-button {
     background-color: var(--error-color);
     color: #1a0000;
-    padding: 0.3rem 0.8rem;
-    border-radius: 5px;
-    font-weight: 600;
-    font-size: 0.85rem;
-    display: inline-block;
-    transition: transform 0.1s ease;
-    border: none;
-    cursor: pointer;
 }
 .cancel-button:hover { background-color: #ff8f8f; }
 
+/* --- MODIFICATION: Dark theme for Choices.js --- */
+.choices {
+    font-size: 0.95rem;
+}
+.choices__inner {
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    padding: 0.35rem 0.75rem;
+    color: var(--text-color);
+    min-height: auto;
+}
+.is-open .choices__inner {
+    border-radius: 5px 5px 0 0;
+    border-color: var(--primary-color);
+}
+.is-focused .choices__inner {
+     border-color: var(--primary-color);
+     box-shadow: 0 0 0 2px rgba(0, 180, 255, 0.2);
+}
+.choices__list--dropdown, .choices__list[aria-expanded] {
+    background-color: var(--surface);
+    border: 1px solid var(--primary-color);
+    border-top: none;
+    border-radius: 0 0 5px 5px;
+}
+.choices__list--dropdown .choices__item--selectable.is-highlighted, 
+.choices__list[aria-expanded] .choices__item--selectable.is-highlighted {
+    background-color: var(--secondary-color);
+    color: var(--text-color)
+}
+.choices__list--dropdown .choices__item, .choices__list[aria-expanded] .choices__item {
+    padding: 0.5rem 0.8rem;
+    font-size: 0.9rem;
+}
+.choices__group {
+    background-color: rgba(0,0,0,0.2);
+    border-bottom: 1px solid var(--divider-color);
+}
+.choices__group .choices__heading {
+    color: var(--primary-hover);
+    font-size: 0.75rem;
+    font-weight: 700;
+    border-bottom: none;
+    padding: 0.5rem 0.8rem;
+}
+.choices__input {
+    color: var(--text-color);
+    background-color: #000000;
+    font-size: 0.95rem;
+}
 
+.choices[data-type*="select-one"] .choices__input {
+    background-color: #000000;
+
+}
+
+/* Spinner */
 .spinner-small {
     border: 3px solid rgba(255,255,255,0.1);
     border-top: 3px solid var(--primary-color);
@@ -392,7 +465,9 @@ button[type="submit"]:disabled {
     100% { transform: rotate(360deg); }
 }
 
+/* Mobile responsive table */
 @media (max-width: 768px) {
+    /* ... (no changes in this section) ... */
     .table-wrapper {
         border: none;
         background-color: transparent;
@@ -432,5 +507,23 @@ button[type="submit"]:disabled {
         text-align: right;
         min-width: 0;
         word-break: break-all;
+        overflow: scroll;
+        max-width: 100em;
     }
+
+    .cell-value {
+        min-width: 0;
+    max-width: 20em;
+    text-wrap: nowrap;
+    overflow: scroll;
+}
+
+
+#job-table td[data-label="File"],
+#job-table td[data-label="Task"] {
+    overflow: scroll;
+    text-overflow: ellipsis;
+    text-wrap: nowrap;
+    max-width: 100em;
+}
 }

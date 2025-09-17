@@ -3,7 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DocProcessor</title>
+    <title>File Wizard</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/choices.js/public/assets/styles/choices.min.css"/>
     <link rel="stylesheet" href="{{ url_for('static', path='/css/style.css') }}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -11,17 +12,38 @@
 </head>
 <body>
     <div class="container">
+        <div class="header-actions">
+            <a href="/settings" title="Settings" class="settings-link">⚙️</a>
+        </div>
+
         <header>
-            <h1>DocProcessor 🚀</h1>
-            <p>PDF OCR & Audio Transcription</p>
+            <h1>File Wizard</h1>
         </header>
 
         <main>
             <div class="form-grid">
                 <section class="processor-section">
+                    <form id="conversion-form" class="upload-form" enctype="multipart/form-data">
+                        <fieldset>
+                            <legend><h2>File Conversion</h2></legend>
+                            <div class="file-input-wrapper">
+                                 <input type="file" name="file" id="conversion-file-input" required>
+                                 <label for="conversion-file-input" class="file-input-label">Choose File...</label>
+                                 <span id="conversion-file-name" class="file-name">No file chosen</span>
+                            </div>
+                            <div class="form-control">
+                                <label for="output-format-select">Convert To</label>
+                                <select name="output_format" id="output-format-select" required></select>
+                            </div>
+                            <button type="submit">Convert File</button>
+                        </fieldset>
+                    </form>
+                </section>
+
+                <section class="processor-section">
                     <form id="pdf-form" class="upload-form" enctype="multipart/form-data">
                         <fieldset>
-                            <legend><h2>📄 PDF OCR</h2></legend>
+                            <legend><h2>PDF OCR</h2></legend>
                             <div class="file-input-wrapper">
                                 <input type="file" name="file" id="pdf-file-input" accept=".pdf" required>
                                 <label for="pdf-file-input" class="file-input-label">Choose PDF...</label>
@@ -35,7 +57,7 @@
                 <section class="processor-section">
                     <form id="audio-form" class="upload-form" enctype="multipart/form-data">
                         <fieldset>
-                            <legend><h2>🎤 Transcribe Audio</h2></legend>
+                            <legend><h2>Transcribe Audio</h2></legend>
                             <div class="file-input-wrapper">
                                  <input type="file" name="file" id="audio-file-input" accept="audio/*" required>
                                  <label for="audio-file-input" class="file-input-label">Choose Audio...</label>
@@ -45,11 +67,11 @@
                                 <label for="model-size-select">Model Size</label>
                                 <select name="model_size" id="model-size-select">
                                     <option value="tiny">Tiny (Fastest, lower accuracy)</option>
-                                    <option value="base" selected>Base (Good balance)</option>
+                                    <option value="base" selected>Base</option>
                                     <option value="small">Small (Better accuracy)</option>
                                     <option value="medium">Medium (High accuracy)</option>
                                     <option value="large-v3">Large v3 (Best accuracy, slow)</option>
-                                    <option value="distil-large-v2">Distilled Large v2 (Fast & Accurate)</option>
+                                    <option value="distil-large-v2">Distilled Large v2</option>
                                 </select>
                             </div>
                             <button type="submit">Transcribe</button>
@@ -65,7 +87,7 @@
                         <thead>
                             <tr>
                                 <th>File</th>
-                                <th>Type</th>
+                                <th>Task</th>
                                 <th>Submitted</th>
                                 <th>Status</th>
                                 <th class="action-col">Action</th>
@@ -78,6 +100,14 @@
             </section>
         </main>
     </div>
+    
+    <script>
+        window.APP_CONFIG = {
+            conversionTools: {{ conversion_tools | tojson }}
+        };
+    </script>
+    
+    <script src="https://cdn.jsdelivr.net/npm/choices.js/public/assets/scripts/choices.min.js"></script>
     <script src="{{ url_for('static', path='/js/script.js') }}"></script>
 </body>
 </html>

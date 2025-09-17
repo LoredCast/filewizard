@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Settings - File Wizard</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/css/style.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='/css/settings.css') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header class="settings-header">
+            <div class="header-content">
+                <h1>Settings</h1>
+            </div>
+            <a href="/" class="back-button">← Back</a>
+        </header>
+
+        <main>
+            <form id="settings-form">
+                
+                <fieldset class="settings-group">
+                    <legend><h2>General Settings</h2></legend>
+                    <div class="form-control">
+                        <label for="app-max-file-size">Max Upload Size (MB)</label>
+                        <input type="number" id="app-max-file-size" name="app_settings.max_file_size_mb" value="{{ config.app_settings.max_file_size_mb }}" class="form-input">
+                    </div>
+                </fieldset>
+                
+                <fieldset class="settings-group">
+                    <legend><h2>OCR (ocrmypdf)</h2></legend>
+                     <div class="form-control checkbox-group">
+                        <input type="checkbox" id="ocr-deskew" name="ocr_settings.ocrmypdf.deskew" {% if config.ocr_settings.ocrmypdf.deskew %}checked{% endif %}>
+                        <label for="ocr-deskew">Deskew (correct tilted pages)</label>
+                    </div>
+                    <div class="form-control checkbox-group">
+                        <input type="checkbox" id="ocr-clean" name="ocr_settings.ocrmypdf.clean" {% if config.ocr_settings.ocrmypdf.clean %}checked{% endif %}>
+                        <label for="ocr-clean">Clean (remove speckles/noise)</label>
+                    </div>
+                    <div class="form-control checkbox-group">
+                        <input type="checkbox" id="ocr-force-ocr" name="ocr_settings.ocrmypdf.force_ocr" {% if config.ocr_settings.ocrmypdf.force_ocr %}checked{% endif %}>
+                        <label for="ocr-force-ocr">Force OCR (re-process pages with existing text)</label>
+                    </div>
+                </fieldset>
+
+                <fieldset class="settings-group">
+                    <legend><h2>Transcription (Whisper)</h2></legend>
+                    <div class="form-control">
+                        <label for="whisper-compute-type">Compute Type</label>
+                        <select id="whisper-compute-type" name="transcription_settings.whisper.compute_type" class="form-select">
+                            {% for ctype in ["default", "int8", "int8_float16", "int16", "float16", "float32"] %}
+                                <option value="{{ ctype }}" {% if config.transcription_settings.whisper.compute_type == ctype %}selected{% endif %}>{{ ctype }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                </fieldset>
+
+                <fieldset class="settings-group">
+                    <legend><h2>Conversion Tools</h2></legend>
+                    <p class="field-description">
+                        Edit the command line templates for each conversion tool. The following placeholders are available: <code>{input}</code>, <code>{output}</code>, <code>{output_dir}</code>, <code>{output_ext}</code>.
+                        Some tools may have additional placeholders; refer to the sourcecode or documentation for details.
+                    </p>
+                    <div class="tool-grid">
+                        {% for tool_id, tool in config.conversion_tools.items() %}
+                        <div class="tool-card">
+                            <h3>{{ tool.name }}</h3>
+                            <div class="form-control">
+                                <label for="tool-{{ tool_id }}-cmd">Command Template</label>
+                                <textarea id="tool-{{ tool_id }}-cmd" name="conversion_tools.{{ tool_id }}.command_template" class="form-textarea" rows="3">{{ tool.command_template }}</textarea>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </fieldset>
+                
+                <div class="form-actions">
+                     <button type="submit" class="button-primary">Save Settings</button>
+                     <div id="save-status" class="save-status"></div>
+                </div>
+            </form>
+            
+            <hr class="divider">
+
+            <div id="history-management" class="settings-group">
+                <h2>History Management</h2>
+                 <p class="field-description">These actions are irreversible. Please be certain before proceeding.</p>
+                <div class="danger-zone">
+                   <div class="danger-action">
+                        <div>
+                            <strong>Clear Job History</strong>
+                            <p>Deletes all job records from the database. Processed files on disk will not be removed.</p>
+                        </div>
+                        <button id="clear-history-btn" class="button-danger">Clear History</button>
+                   </div>
+                   <div class="danger-action">
+                        <div>
+                            <strong>Delete Processed Files</strong>
+                            <p>Deletes all files from the 'processed' directory. Database records will remain but download links will be broken.</p>
+                        </div>
+                        <button id="delete-files-btn" class="button-danger">Delete Files</button>
+                   </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <script src="{{ url_for('static', path='/js/settings.js') }}"></script>
+</body>
+</html>

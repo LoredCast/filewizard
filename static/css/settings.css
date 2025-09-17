@@ -1,0 +1,194 @@
+/* static/css/settings.css */
+
+.settings-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 2rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--divider-color);
+}
+
+.settings-header h1 {e
+    margin: 0 0 0.25rem 0;
+}
+
+.settings-header p {
+    margin: 0;
+    color: var(--muted-text);
+}
+
+.back-button {
+    background-color: var(--secondary-color);
+    color: var(--text-color);
+    padding: 0.5rem 1rem;
+    border-radius: 5px;
+    text-decoration: none;
+    font-weight: 500;
+    transition: background-color 0.15s ease;
+    white-space: nowrap;
+}
+.back-button:hover {
+    background-color: var(--primary-hover);
+}
+
+.settings-group {
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin-bottom: 2rem;
+}
+
+.settings-group legend {
+    padding: 0 0.5rem;
+    font-weight: 500;
+    color: var(--primary-color);
+}
+
+.settings-group legend h2 {
+    margin: 0;
+    font-size: 1.25rem;
+}
+
+.form-input, .form-select, .form-textarea {
+    width: 100%;
+    background-color: rgba(255,255,255,0.05);
+    color: var(--text-color);
+    padding: 0.6rem 0.8rem;
+    border-radius: 5px;
+    border: 1px solid var(--border-color);
+    font-family: inherit;
+    font-size: 0.95rem;
+    transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+}
+.form-input:focus, .form-select:focus, .form-textarea:focus {
+    outline: none;
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 2px rgba(0, 180, 255, 0.2);
+}
+
+.form-textarea {
+    resize: vertical;
+    min-height: 60px;
+    font-family: 'Courier New', Courier, monospace;
+}
+
+.field-description {
+    font-size: 0.85rem;
+    color: var(--muted-text);
+    margin-top: -0.5rem;
+    margin-bottom: 1rem;
+}
+.field-description code {
+    background-color: rgba(255,255,255,0.1);
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+    font-size: 0.8rem;
+}
+
+.checkbox-group {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 0.5rem;
+}
+.checkbox-group input[type="checkbox"] {
+    width: 1rem;
+    height: 1rem;
+}
+
+.tool-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+    gap: 1rem;
+}
+
+.tool-card {
+    border: 1px solid var(--divider-color);
+    padding: 1rem;
+    border-radius: 6px;
+    background-color: rgba(0,0,0,0.2);
+}
+.tool-card h3 {
+    margin-top: 0;
+    margin-bottom: 1rem;
+    font-size: 1.1rem;
+}
+
+.form-actions {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-top: 1.5rem;
+}
+.button-primary {
+    display: inline-block;
+    background: var(--primary-color);
+    background-color: transparent;
+    border-color: var(--border-color);
+    border-width: 1px;
+    color: #ffffff;
+    padding: 0.65rem 1.5rem;
+    font-size: 1rem;
+    font-weight: 600;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+}
+.button-primary:hover {
+    background: var(--primary-hover);
+}
+
+.save-status {
+    font-weight: 500;
+}
+.save-status.success {
+    color: var(--success-color);
+}
+.save-status.error {
+    color: var(--error-color);
+}
+
+.divider {
+    border: none;
+    height: 1px;
+    background-color: var(--divider-color);
+    margin: 3rem 0;
+}
+
+.danger-zone {
+    border: 1px solid var(--error-color);
+    border-radius: 8px;
+    padding: 1rem;
+    background-color: rgba(255, 107, 107, 0.05);
+}
+.danger-action {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+}
+.danger-action + .danger-action {
+    margin-top: 1rem;
+    padding-top: 1rem;
+    border-top: 1px solid rgba(255, 107, 107, 0.2);
+}
+.danger-action p {
+    margin: 0.25rem 0 0 0;
+    font-size: 0.9rem;
+    color: var(--muted-text);
+}
+.button-danger {
+    background-color: var(--error-color);
+    color: #1a0000;
+    border: none;
+    padding: 0.6rem 1.2rem;
+    font-weight: 600;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+    white-space: nowrap;
+}
+.button-danger:hover {
+    background-color: #ff8f8f;
+}
