@@ -1,7 +1,3 @@
-Of course. Here is a short README that summarizes the project's features, architecture, and setup instructions.
-
------
-
 # File Wizard
 
 File Wizard is a self-hosted, browser-based utility for file conversion, OCR, and audio transcription. It features a modern drag-and-drop interface and a powerful, asynchronous backend to handle long-running tasks without tying up the browser.
