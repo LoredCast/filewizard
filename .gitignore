@@ -2,6 +2,7 @@ __pycache__
 uploads
 processed
 venv
+.env
 core
 huey.*
 *.db
