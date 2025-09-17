@@ -1,10 +1,17 @@
 version: "3.9"
 services:
+  # The FastAPI Web Server
   web:
     build: .
+    env_file:
+      - .env 
     ports:
-      - "5000:5000"
+      - "8000:8000"
     volumes:
-      - .:/app  # optional: mount code for live changes
-    environment:
-      - FLASK_ENV=development
+      # Mount local directories and files into the container for persistence
+      - ./uploads:/app/uploads
+      - ./processed:/app/processed
+      - ./settings.yml:/app/settings.yml
+      - ./jobs.db:/app/jobs.db
+      - ./huey.db:/app/huey.db
+

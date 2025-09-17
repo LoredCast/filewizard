@@ -1,9 +1,13 @@
 # Dockerfile
 FROM python:3.13.7-slim
 
+ENV PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-deu \
     ghostscript \
     poppler-utils \
     libreoffice \
@@ -14,6 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libheif-examples \
     inkscape \
     calibre \
+    pngquant \
+    libvips-tools \
     build-essential \
     pkg-config \
     git \
