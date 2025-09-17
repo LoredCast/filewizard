@@ -109,7 +109,6 @@ sympy==1.14.0
 tifffile==2025.9.9
 tokenizers==0.22.0
 tqdm==4.67.1
-triton==3.4.0
 typing-inspection==0.4.1
 typing_extensions==4.15.0
 tzdata==2025.2
