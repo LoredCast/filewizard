@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     potrace \
     curl \
     texlive \
+    jpegoptim \
     texlive-latex-extra \
     texlive-fonts-recommended \
     nodejs \
