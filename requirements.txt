@@ -15,6 +15,7 @@ pytesseract
 pypdf
 
 # Configuration & Utilities
+werkzeug
 PyYAML
 pydantic
 pydantic-settings
