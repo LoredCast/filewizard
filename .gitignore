@@ -6,4 +6,5 @@ venv
 core
 huey.*
 *.db
+req.txt
 
