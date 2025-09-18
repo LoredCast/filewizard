@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     texlive-xetex \
     texlive-science \
     libxml2-dev \
+    supervisor \
     && rm -rf /var/lib/apt/lists/*
 
 
@@ -46,12 +47,15 @@ WORKDIR /app
 # Copy requirements and install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+COPY supervisor.conf /etc/supervisor/conf.d/supervisor.conf
 
 # Copy the rest of the app
 COPY . .
+
 
 # Expose the app port
 EXPOSE 8000
 RUN chmod +x run.sh
 # Command to run when container starts
-CMD ["./run.sh", "&"]
+#CMD ["./run.sh"]
+CMD ["/usr/bin/supervisord", "-n"]

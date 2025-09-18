@@ -751,3 +751,9 @@ async def health():
         logger.exception("Health check failed")
         return JSONResponse({"ok": False}, status_code=500)
     return {"ok": True}
+
+favicon_path = PATHS.BASE_DIR / 'static' / 'favicon.png'
+
+@app.get('/favicon.ico', include_in_schema=False)
+async def favicon():
+    return FileResponse(favicon_path)

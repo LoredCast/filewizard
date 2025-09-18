@@ -1,10 +1,14 @@
 #!/bin/bash
-# This script starts the FastAPI application using Gunicorn.
 
-echo "Starting DocProcessor with Gunicorn on port 0.0.0.0:8000..."
+# Exit immediately if a command exits with a non-zero status.
+set -e
 
-exec gunicorn -w 4 --threads 2 -k uvicorn.workers.UvicornWorker --forwarded-allow-ips='*' main:app -b 0.0.0.0:8000 &
-echo "Done"
-echo "Starting huey..."
+# Start Gunicorn in the background
+gunicorn -w 4 --threads 2 -k uvicorn.workers.UvicornWorker --forwarded-allow-ips='*' main:app -b 0.0.0.0:8000 &
+echo "Started Gunicorn..."
+# Store the Gunicorn process ID
+GUNICORN_PID=$!
+echo "Gunicorn PID: $GUNICORN_PID"
+# Start the Huey consumer in the foreground
 exec huey_consumer.py main.huey -w 4
-echo "Done"
+echo "Started Huey consumer..."
