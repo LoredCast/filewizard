@@ -1,11 +1,11 @@
 auth_settings:
   oidc_client_id: filewiz
-  oidc_client_secret: 5tIR4k75pdmiV2QSlLSSeqsA5vgxB21F
-  oidc_server_metadata_url: https://accounts.manuelunterriker.de/oidc/.well-known/openid-configuration
-  oidc_userinfo_endpoint: https://accounts.manuelunterriker.de/oidc/me
-  oidc_end_session_endpoint: https://accounts.manuelunterriker.de/oidc/session/end
+  oidc_client_secret: 
+  oidc_server_metadata_url: https://accounts.test.de/oidc/.well-known/openid-configuration
+  oidc_userinfo_endpoint: https://accounts.test.de/oidc/me
+  oidc_end_session_endpoint: https://accounts.test.de/oidc/session/end
   admin_users:
-  - manuel@unterriker.com
+  - test@test.com
 app_settings:
   max_file_size_mb: '2000'
   allowed_all_extensions:
