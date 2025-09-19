@@ -3,8 +3,8 @@ services:
   web:
     image: loredcast/filewizard:latest
     build: .
-    env_file:
-      - .env
+    #env_file:
+    #  - .env
     environment:
       - LOCAL_ONLY=True # set to False to enable OIDC auth (requires configuration in settings.yml)
       - SECRET_KEY= # if using auth
