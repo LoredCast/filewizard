@@ -21,6 +21,7 @@ File Wizard is a self-hosted, browser-based utility for file conversion, OCR, an
   * **Configuration:**
       * A dedicated `/settings` page allows for viewing and editing the configuration directly from the UI.
       * OAuth needs to be configured in the `config/settings.yml` file, you can see the default for a reference. By default, it runs without auth in local mode.
+      * Currently it only supports cpu operations, but a future image will include the cuda drivers for running whisper on gpu (torch and cuda is large and I didn't want to inflate the image even more)
 
 -----
 
