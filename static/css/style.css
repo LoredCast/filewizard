@@ -276,7 +276,6 @@ input[type="file"] {
     box-shadow: 0 0 0 2px rgba(0, 180, 255, 0.2);
 }
 
-/* --- NEW: Responsive group for action sections --- */
 .actions-group {
     display: grid;
     grid-template-columns: repeat(3, 1fr); /* 3 columns for wide screens */
@@ -297,7 +296,6 @@ input[type="file"] {
     flex-grow: 1; /* Helps align buttons if one section has more text */
 }
 
-/* --- NEW: Styling for individual action buttons --- */
 .main-action-button {
     display: block;
     width: 100%;
@@ -658,7 +656,7 @@ body.dragging .drag-overlay {
     100% { transform: rotate(360deg); }
 }
 
-/* --- Mobile responsive styles --- */
+/* --- Mobile   --- */
 @media (max-width: 992px) {
     .actions-group {
         grid-template-columns: 1fr; /* Stack to 1 column on tablet and smaller */
