@@ -16,15 +16,17 @@ pypdf
 
 # Configuration & Utilities
 werkzeug
+itsdangerous
+authlib
 dotenv
+httpx
 PyYAML
 pydantic
 pydantic-settings
 python-multipart
 markitdown[pdf,docx,pptx,xlsx,outlook]==0.1.3
 PyPDF2==3.0.1
-PyQt6==6.9.1
-PyQt6-Qt6==6.9.2
-PyQt6-WebEngine==6.9.0
-PyQt6-WebEngine-Qt6==6.9.2
-
+#PyQt6==6.9.1
+#PyQt6-Qt6==6.9.2
+#PyQt6-WebEngine==6.9.0
+#PyQt6-WebEngine-Qt6==6.9.2
