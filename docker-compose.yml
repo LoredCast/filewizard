@@ -2,6 +2,7 @@ version: "3.9"
 services:
   # The FastAPI Web Server
   web:
+    image: loredcast/filewizard:latest
     build: .
     env_file:
       - .env
