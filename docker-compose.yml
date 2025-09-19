@@ -1,6 +1,5 @@
 version: "3.9"
 services:
-  # The FastAPI Web Server
   web:
     image: loredcast/filewizard:latest
     build: .
@@ -11,13 +10,12 @@ services:
       - SECRET_KEY= # if using auth
       - UPLOADS_DIR=/app/uploads
       - PROCESSED_DIR=/app/processed
-
     #user: "1000:1000"
     ports:
       - "6969:8000"
     volumes:
       # Mount local directories and files into the container for persistence
-      - ./config:/app/config
+      - ./config:/app/config #you can copy settings.default.yml into here as settings.yml
       - ./uploads_data:/app/uploads
       - ./processed_data:/app/processed
 
