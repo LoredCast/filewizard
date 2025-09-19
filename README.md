@@ -52,9 +52,9 @@ Note: Building this image will take some time installing all deps ((mostly texli
 ```bash
 docker compose up --build
 ```
-## Installation & Setup 
 
-### With Docker (From Dockerhub)
+
+### With Docker (From Dockerhub) [Recommended]
 I've published 2 images to dockerhub that you can pull:
 
 - `loredcast/filewizard:latest`
