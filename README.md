@@ -1,12 +1,14 @@
 # File Wizard
 
-File Wizard is a self-hosted, browser-based utility for file conversion, OCR, and audio transcription. It features a modern drag-and-drop interface and a powerful, asynchronous backend to handle long-running tasks without tying up the browser.
+File Wizard is a self-hosted, browser-based utility for file conversion, OCR, and audio transcription. It wraps many cli and python converters aswell as fast-whisper and tesseract ocr.
+
+![Screenshot](Screenshot_20250919-211227~2.png)
 
 ## Features
 
-  * **Versatile File Conversion:** Easily convert between various file formats. The system is designed to be extended with any command-line tool (like FFmpeg, ImageMagick, etc.) via a simple `settings.yml` configuration file.
-  * **High-Quality OCR:** Perform Optical Character Recognition (OCR) on PDFs and images to extract text.
-  * **Accurate Audio Transcription:** Transcribe audio files into text using high-performance Whisper models.
+  * **Versatile File Conversion:** Convert between various file formats. The system is designed to be extended with any command-line tool (like FFmpeg, ImageMagick, etc.) via a simple `settings.yml` configuration file.
+  * **OCR:** Perform Optical Character Recognition (OCR) on PDFs and images to extract text.
+  * **Accurate Audio Transcription:** Transcribe audio files into text using Whisper models.
   * **Modern UI & UX:**
       * Clean, responsive, dark-themed interface.
       * Drag-and-drop support for single or multiple files anywhere on the screen.
@@ -15,12 +17,10 @@ File Wizard is a self-hosted, browser-based utility for file conversion, OCR, an
   * **Real-time Updates & History:**
       * Jobs are processed in the background, with the UI updating statuses in real-time via polling.
       * A persistent job history table displays file names, tasks, submission times, file sizes (input → output), and final status.
-      * Timestamps are automatically displayed in the user's local timezone.
-      * Download links are provided for successfully processed files.
-      * Pending or processing jobs can be cancelled.
-  * **Easy Configuration:**
-      * All tools, models, and application settings are managed in a human-readable `settings.yml` file.
+     
+  * **Configuration:**
       * A dedicated `/settings` page allows for viewing and editing the configuration directly from the UI.
+      * OAuth needs to be configured in the `config/settings.yml` file, you can see the default for a reference. By default, it runs without auth in local mode.
 
 -----
 
@@ -28,18 +28,17 @@ File Wizard is a self-hosted, browser-based utility for file conversion, OCR, an
 
   * **Backend:** FastAPI (Python)
   * **Frontend:** Vanilla HTML, CSS, JavaScript (no framework)
-  * **Task Queue:** Huey (with a SQLite backend)
-  * **Database:** SQLAlchemy (with a SQLite database)
+  * **Task Queue:** Huey (with a SQLite backend might do redis soon)
+  * **Database:** SQLAlchemy (with a SQLite database might go postgres soon)
   * **Configuration:** YAML
 
 -----
 
 ## Installation & Setup 
 
-To get File Wizard running, you need to run the web server and the background task processor separately.
-
-### With Docker
+### With Docker (Local Build)
 Clone the Repo and make sure docker compose is working on your environment
+
 ```bash
 git clone https://github.com/LoredCast/filewizard.git
 cd filewizard
@@ -48,10 +47,27 @@ cd filewizard
 Startup Docker, initially the settings.yml file is applied, you can edit it.
 For You can edit the .env file for further configuration.
 
-Note: Building this image will take some time installing all deps ((mostly texlive)).1
+Note: Building this image will take some time installing all deps ((mostly texlive)).
+
 ```bash
 docker compose up --build
 ```
+## Installation & Setup 
+
+### With Docker (From Dockerhub)
+I've published 2 images to dockerhub that you can pull:
+
+- `loredcast/filewizard:latest`
+- `loredcast/filewizard:small`
+
+The smaller one has Tex and many large tools left out.
+
+Copy the `docker-compose.yml` from the repo into a directory on your machine, adjust the file to your needs and startup docker.
+
+```bash
+docker compose up -d
+```
+
 
 ### Manually
 
