@@ -2,9 +2,14 @@
 
 # Exit immediately if a command exits with a non-zero status.
 set -e
+source .env
 
+LOCAL_ONLY=True
+SECRET_KEY=4bd5dcfc32602307e5101efcfedbb7c3e770a8167d596933
+UPLOADS_DIR=/home/manuel/file-wiz/uploads
+PROCESSED_DIR=/home/manuel/file-wiz/processed
 # Start Gunicorn in the background
-gunicorn -w 4 --threads 2 -k uvicorn.workers.UvicornWorker --forwarded-allow-ips='*' main:app -b 0.0.0.0:8000 &
+gunicorn -w 4 --threads 2 -k uvicorn.workers.UvicornWorker --forwarded-allow-ips='*' --error-logfile - --access-logfile - main:app -b 0.0.0.0:8000 &
 echo "Started Gunicorn..."
 # Store the Gunicorn process ID
 GUNICORN_PID=$!

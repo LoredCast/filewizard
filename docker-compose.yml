@@ -5,12 +5,18 @@ services:
     build: .
     env_file:
       - .env
+    environment:
+      - LOCAL_ONLY=True # set to False to enable OIDC auth (requires configuration in settings.yml)
+      - SECRET_KEY= # if using auth
+      - UPLOADS_DIR=/app/uploads
+      - PROCESSED_DIR=/app/processed
 
     #user: "1000:1000"
     ports:
       - "6969:8000"
     volumes:
       # Mount local directories and files into the container for persistence
+      - ./config:/app/config
       - ./uploads_data:/app/uploads
       - ./processed_data:/app/processed
 

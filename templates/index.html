@@ -11,95 +11,99 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
 </head>
 <body>
-    <div class="container">
-        <div class="header-actions">
-            <a href="/settings" title="Settings" class="settings-link">⚙️</a>
-        </div>
 
-        <header>
+    <div id="login-container" style="display: none;">
+        <div class="login-box">
             <h1>File Wizard</h1>
-        </header>
+            <p>Please log in to continue.</p>
+            <button id="login-button" class="login-button-style">Login</button>
+        </div>
+    </div>
 
-        <main>
-            <div class="form-grid">
-                <section class="processor-section">
-                    <form id="conversion-form" class="upload-form" enctype="multipart/form-data">
-                        <fieldset>
-                            <legend><h2>File Conversion</h2></legend>
-                            <div class="file-input-wrapper">
-                                 <input type="file" name="file" id="conversion-file-input" required multiple>
-                                 <label for="conversion-file-input" class="file-input-label">Choose File...</label>
-                                 <span id="conversion-file-name" class="file-name">No file chosen</span>
-                            </div>
-                            <div class="form-control">
-                                <label for="output-format-select">Convert To</label>
-                                <select name="output_format" id="output-format-select" required></select>
-                            </div>
-                            <button type="submit">Convert File</button>
-                        </fieldset>
-                    </form>
-                </section>
-
-                <section class="processor-section">
-                    <form id="pdf-form" class="upload-form" enctype="multipart/form-data">
-                        <fieldset>
-                            <legend><h2>PDF OCR</h2></legend>
-                            <div class="file-input-wrapper">
-                                <input type="file" name="file" id="pdf-file-input" accept=".pdf" required multiple>
-                                <label for="pdf-file-input" class="file-input-label">Choose PDF...</label>
-                                <span id="pdf-file-name" class="file-name">No file chosen</span>
-                            </div>
-                            <button type="submit">Process PDF</button>
-                        </fieldset>
-                    </form>
-                </section>
-
-                <section class="processor-section">
-                    <form id="audio-form" class="upload-form" enctype="multipart/form-data">
-                        <fieldset>
-                            <legend><h2>Transcribe Audio</h2></legend>
-                            <div class="file-input-wrapper">
-                                 <input type="file" name="file" id="audio-file-input" accept="audio/*" required multiple>
-                                 <label for="audio-file-input" class="file-input-label">Choose Audio...</label>
-                                 <span id="audio-file-name" class="file-name">No file chosen</span>
-                            </div>
-                            <div class="form-control">
-                                <label for="model-size-select">Model Size</label>
-                                <select name="model_size" id="model-size-select">
-                                    <option value="tiny">Tiny (Fastest, lower accuracy)</option>
-                                    <option value="base" selected>Base</option>
-                                    <option value="small">Small (Better accuracy)</option>
-                                    <option value="medium">Medium (High accuracy)</option>
-                                    <option value="large-v3">Large v3 (Best accuracy, slow)</option>
-                                    <option value="distil-large-v2">Distilled Large v2</option>
-                                </select>
-                            </div>
-                            <button type="submit">Transcribe</button>
-                        </fieldset>
-                    </form>
-                </section>
+    <div id="app-container" style="display: none;">
+        <div class="container">
+            <div class="header-actions">
+                {% if user and not local_only_mode %}
+                    <div>
+                    <span class="user-info">Logged in as {{ user.name }}</span>
+                    <a href="/logout" title="Logout" class="settings-link">Logout</a>
+                    </div>
+                {% endif %}
+                <a href="/settings" title="Settings" class="settings-link">⚙️</a>
             </div>
 
-            <section id="job-history">
-                <h2>History</h2>
-                <div class="table-wrapper">
-                    <table id="job-table">
-                        <thead>
-                            <tr>
-                                <th>File</th>
-                                <th>File Size</th>
-                                <th>Task</th>
-                                <th>Submitted</th>
-                                <th>Status</th>
-                                <th class="action-col">Action</th>
-                            </tr>
-                        </thead>
-                        <tbody id="job-list-body">
-                            </tbody>
-                    </table>
-                </div>
-            </section>
-        </main>
+            <header>
+                <h1>File Wizard</h1>
+            </header>
+
+            <main>
+                <section class="processor-section">
+                    <form id="main-action-form" class="upload-form">
+                        <fieldset>
+                            <legend><h2>1. Choose Files</h2></legend>
+                            <div class="file-input-wrapper">
+                                 <input type="file" name="file" id="main-file-input" required multiple>
+                                 <label for="main-file-input" class="file-input-label">Choose Files...</label>
+                                 <span id="main-file-name" class="file-name">No files chosen</span>
+                            </div>
+                        </fieldset>
+
+                        <div class="actions-group">
+                            <fieldset class="action-fieldset">
+                                <legend><h2>Convert</h2></legend>
+                                <div class="form-control">
+                                    <label for="main-output-format-select">Output Format</label>
+                                    <select name="output_format" id="main-output-format-select" required></select>
+                                </div>
+                                <button type="button" id="start-conversion-btn" class="main-action-button">Start Conversion</button>
+                            </fieldset>
+
+                            <fieldset class="action-fieldset">
+                                <legend><h2>OCR PDF/Image</h2></legend>
+                                <p class="action-description">Extract text from scanned documents and images.</p>
+                                <button type="button" id="start-ocr-btn" class="main-action-button">Start OCR</button>
+                            </fieldset>
+
+                            <fieldset class="action-fieldset">
+                                <legend><h2>Transcribe Audio/Video</h2></legend>
+                                <div class="form-control">
+                                    <label for="main-model-size-select">Model Size</label>
+                                    <select name="model_size" id="main-model-size-select">
+                                        <option value="tiny">Tiny (Fastest, lower accuracy)</option>
+                                        <option value="base" selected>Base</option>
+                                        <option value="small">Small (Better accuracy)</option>
+                                        <option value="medium">Medium (High accuracy)</option>
+                                        <option value="large-v3">Large v3 (Best accuracy, slow)</option>
+                                        <option value="distil-large-v2">Distilled Large v2</option>
+                                    </select>
+                                </div>
+                                <button type="button" id="start-transcription-btn" class="main-action-button">Start Transcription</button>
+                            </fieldset>
+                        </div>
+                    </form>
+                </section>
+
+                <section id="job-history">
+                    <h2>History</h2>
+                    <div class="table-wrapper">
+                        <table id="job-table">
+                            <thead>
+                                <tr>
+                                    <th>File</th>
+                                    <th>File Size</th>
+                                    <th>Task</th>
+                                    <th>Submitted</th>
+                                    <th>Status</th>
+                                    <th class="action-col">Action</th>
+                                </tr>
+                            </thead>
+                            <tbody id="job-list-body">
+                                </tbody>
+                        </table>
+                    </div>
+                </section>
+            </main>
+        </div>
     </div>
 
     <div id="drag-overlay" class="drag-overlay">
@@ -133,8 +137,11 @@
         </div>
     </div>
     <script>
+        // Inject server-side configuration for the client-side script
         window.APP_CONFIG = {
-            conversionTools: {{ conversion_tools | tojson }}
+            conversionTools: {{ conversion_tools | tojson }},
+            user: {{ user | tojson }},
+            local_only_mode: {{ local_only_mode | tojson }}
         };
     </script>
     

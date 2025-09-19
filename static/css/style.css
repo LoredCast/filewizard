@@ -39,10 +39,61 @@ body {
     -moz-osx-font-smoothing: grayscale;
 }
 
+/* --- START: Login View Styles --- */
+#login-container {
+    display: flex; /* Initially hidden/shown by JS */
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    text-align: center;
+    padding: 1rem;
+}
+
+.login-box {
+    background: var(--card-bg);
+    padding: 2.5rem 3rem;
+    border-radius: 10px;
+    border: 1px solid var(--border-color);
+}
+
+#login-container h1 {
+    font-family: serif;
+    font-weight: lighter;
+    font-size: 3rem;
+    margin: 0 0 0.5rem 0;
+}
+
+#login-container p {
+    font-size: 1.1rem;
+    color: var(--muted-text);
+    margin-bottom: 2rem;
+}
+
+.login-button-style {
+    background-color: var(--primary-color);
+    color: var(--bg-color);
+    border: 1px solid var(--primary-color);
+    padding: 0.7rem 2.5rem;
+    font-size: 1rem;
+    font-weight: 600;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background-color 0.15s ease, color 0.15s ease, transform 0.1s ease;
+}
+
+.login-button-style:hover {
+    background-color: transparent;
+    color: var(--primary-color);
+    transform: scale(1.03);
+}
+/* --- END: Login View Styles --- */
+
+
 /* Container */
 .container {
     width: 100%;
-    max-width: 1280px; /* Increased max-width for 3 columns */
+    max-width: 1280px;
     margin: 0 auto;
     background: var(--card-bg);
     border-radius: 10px;
@@ -71,7 +122,6 @@ header {
 header h1 {
     margin: 0 0 0.25rem 0;
     font-size: 3rem;
-    font-weight: 700;
     font-family: serif;
     font-weight: lighter;
 }
@@ -86,34 +136,50 @@ header p {
     position: absolute;
     top: 1.5rem;
     right: 1.5rem;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+.header-actions div {
+    position: fixed;
+    left: 0;
+    bottom: 0em;
+    width: 100vw;
+    padding: 2em;
+    padding-top: 5em;
+    text-align: center;
+    background-color: rgb(0, 0, 0);
+    background: linear-gradient(0deg, rgb(0, 0, 0) 30%, rgba(0, 0, 0, 0) 100%);
+}
+
+.user-info {
+    font-size: 0.9rem;
+    color: var(--muted-text);
 }
 .settings-link {
-    font-size: 1.5rem;
+    font-size: 0.9rem;
+    margin-left: 0.5em;
     text-decoration: none;
     color: var(--muted-text);
     transition: color 0.2s ease;
+    
 }
 .settings-link:hover {
     color: var(--text-color);
 }
-/* Form Layout */
-.form-grid {
-    display: grid;
-    /* MODIFICATION: Responsive grid for 1, 2, or 3 items */
-    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-    gap: 1.5rem;
+
+/* --- Form and Input Styles --- */
+.processor-section {
     margin-bottom: 2rem;
 }
 
 .upload-form fieldset {
     border: 1px solid var(--border-color);
     border-radius: 8px;
-    padding: 1rem;
+    padding: 1.5rem;
     margin: 0;
     background: transparent;
-    height: 100%;
-    display: flex;
-    flex-direction: column;
 }
 
 .upload-form legend {
@@ -134,7 +200,6 @@ header p {
     align-items: center;
     gap: 1rem;
     margin-top: 1rem;
-    margin-bottom: 1rem;
 }
 
 input[type="file"] {
@@ -211,30 +276,55 @@ input[type="file"] {
     box-shadow: 0 0 0 2px rgba(0, 180, 255, 0.2);
 }
 
-/* Submit button */
-button[type="submit"] {
+/* --- NEW: Responsive group for action sections --- */
+.actions-group {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr); /* 3 columns for wide screens */
+    gap: 1.5rem;
+    margin-top: 1.5rem;
+}
+
+.action-fieldset {
+    /* Inherits border/padding from the generic fieldset style */
+    display: flex;
+    flex-direction: column;
+}
+
+.action-description {
+    color: var(--muted-text);
+    font-size: 0.9rem;
+    margin-bottom: 1rem;
+    flex-grow: 1; /* Helps align buttons if one section has more text */
+}
+
+/* --- NEW: Styling for individual action buttons --- */
+.main-action-button {
     display: block;
     width: 100%;
-    background: var(--primary-color);
-    background-color: transparent;
-    border-color: var(--border-color);
-    border-width: 1px;
-    color: #ffffff;
+    background: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--text-color);
     padding: 0.65rem 1rem;
     font-size: 1rem;
     font-weight: 600;
     border-radius: 5px;
     cursor: pointer;
-    transition: background-color 0.15s ease;
-    margin-top: auto;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+    margin-top: auto; /* Pushes button to the bottom of the flex container (fieldset) */
 }
-button[type="submit"]:hover {
+
+.main-action-button:hover {
     background: var(--primary-hover);
+    border-color: var(--primary-hover);
 }
-button[type="submit"]:disabled {
+
+.main-action-button:disabled {
     background-color: var(--muted-text);
+    border-color: var(--muted-text);
     cursor: not-allowed;
+    opacity: 0.5;
 }
+
 
 /* History Section */
 #job-history h2 {
@@ -251,12 +341,14 @@ button[type="submit"]:disabled {
     border: 1px solid var(--border-color);
     border-radius: 8px;
     background-color: var(--surface);
+    margin-bottom: 6em;
 }
 
 #job-table {
     width: 100%;
     border-collapse: collapse;
     font-size: 0.9rem;
+    margin-bottom: 2em;
 }
 
 #job-table th,
@@ -390,7 +482,7 @@ button[type="submit"]:disabled {
 }
 .cancel-button:hover { background-color: #ff8f8f; }
 
-/* --- MODIFICATION: Dark theme for Choices.js --- */
+/* --- Dark theme for Choices.js --- */
 .choices {
     font-size: 0.95rem;
 }
@@ -447,7 +539,7 @@ button[type="submit"]:disabled {
 
 }
 
-/* --- START: Drag and Drop and Dialog Styles --- */
+/* --- Drag and Drop and Dialog Styles --- */
 .drag-overlay {
     position: fixed;
     inset: 0;
@@ -549,7 +641,6 @@ body.dragging .drag-overlay {
 .dialog-cancel:hover {
     color: var(--text-color);
 }
-/* --- END: Drag and Drop and Dialog Styles --- */
 
 /* Spinner */
 .spinner-small {
@@ -567,7 +658,13 @@ body.dragging .drag-overlay {
     100% { transform: rotate(360deg); }
 }
 
-/* Mobile responsive table */
+/* --- Mobile responsive styles --- */
+@media (max-width: 992px) {
+    .actions-group {
+        grid-template-columns: 1fr; /* Stack to 1 column on tablet and smaller */
+    }
+}
+
 @media (max-width: 768px) {
     .table-wrapper {
         border: none;

@@ -1,45 +1,14 @@
+auth_settings:
+  oidc_client_id: 
+  oidc_client_secret: 
+  oidc_server_metadata_url: https://accounts.oauth.com/oidc/.well-known/openid-configuration
+  oidc_userinfo_endpoint: https://accounts.oauth.com/oidc/me
+  oidc_end_session_endpoint: https://accounts.oauth.com/oidc/session/end
+  admin_users:
+  - admin@local.com
 app_settings:
   max_file_size_mb: '2000'
-  allowed_all_extensions:
-  - .pdf
-  - .ps
-  - .eps
-  - .png
-  - .jpg
-  - .jpeg
-  - .tiff
-  - .tif
-  - .gif
-  - .bmp
-  - .webp
-  - .svg
-  - .jxl
-  - .avif
-  - .ppm
-  - .mp3
-  - .m4a
-  - .ogg
-  - .flac
-  - .opus
-  - .wav
-  - .aac
-  - .mp4
-  - .mkv
-  - .mov
-  - .webm
-  - .avi
-  - .flv
-  - .md
-  - .txt
-  - .html
-  - .docx
-  - .odt
-  - .rst
-  - .epub
-  - .mobi
-  - .azw3
-  - .pptx
-  - .xlsx
+  allowed_all_extensions: [.pdf, .ps, .eps, .png, .jpg, .jpeg, .tiff, .tif, .gif, .bmp, .webp, .svg, .jxl, .avif, .ppm, .mp3, .m4a, .ogg, .flac, .opus, .wav, .aac, .mp4, .mkv, .mov, .webm, .avi, .flv, .md, .txt, .html, .docx, .odt, .rst, .epub, .mobi, .azw3, .pptx, .xlsx]
 ocr_settings:
   ocrmypdf:
     deskew: true
@@ -223,15 +192,15 @@ conversion_tools:
       png_fast: PNG (Fast Compression)
   sox:
     name: SoX Audio Converter
-    command_template: sox {input} -r {samplerate} -b {bitdepth} {output}
+    command_template: sox {input} -r {samplerate} {bitdepth} {output}
     timeout: 600
     formats:
       wav_48k_24b: WAV (48kHz, 24-bit)
       wav_44k_16b: WAV (CD, 44.1kHz, 16-bit)
       flac_48k_24b: FLAC (48kHz, 24-bit)
       flac_44k_16b: FLAC (CD, 44.1kHz, 16-bit)
-      ogg_32k_16b: Ogg Vorbis (32kHz)
-      ogg_16k_16b: Ogg Vorbis (16kHz, Voice)
+      ogg_32k: Ogg Vorbis (32kHz)
+      ogg_16k: Ogg Vorbis (16kHz, Voice)
   mozjpeg:
     name: MozJPEG
     command_template: cjpeg -quality {quality} -outfile {output} {input}

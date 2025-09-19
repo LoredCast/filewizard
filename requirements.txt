@@ -16,6 +16,7 @@ pypdf
 
 # Configuration & Utilities
 werkzeug
+dotenv
 PyYAML
 pydantic
 pydantic-settings

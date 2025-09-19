@@ -7,4 +7,7 @@ core
 huey.*
 *.db
 req.txt
+settings.yml
+app.log
+/config/*
 
