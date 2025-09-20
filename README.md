@@ -10,12 +10,10 @@ File Wizard is a self-hosted, browser-based utility for file conversion, OCR, an
   * **Audio Transcription:** Transcribe audio files into text using Whisper models.
   * **UI:**
       * Clean, responsive, dark-themed interface (hopefully goodlooking idk)
-      * Drag-and-drop support for single or multiple files anywhere on the screen.
-      * Traditional multi-file selection buttons.
-      * A dialog to choose the desired action (Convert, OCR, Transcribe) for dropped files.
+      * Drag-and-drop support for single or multiple files anywhere on the screen, File selection Dialogue 
   * **Real-time Updates & History:**
-      * Jobs are processed in the background, with the UI updating statuses in real-time via polling.
-      * A persistent job history table displays file names, tasks, submission times, file sizes (input → output), and final status.
+      * Jobs are processed in the background, with the UI updating statuses in real-time.
+      * A persistent job history
      
   * **Configuration:**
 [See the Wiki](https://github.com/LoredCast/filewizard/wiki)
