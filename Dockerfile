@@ -1,6 +1,6 @@
 # STAGE 1: BUILDER
 # This stage installs build tools and Python dependencies
-FROM python:3.13.7-slim AS builder
+FROM python:3.12.11-slim AS builder
 
 ENV PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive
@@ -23,7 +23,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # STAGE 2: FINAL
 # This is the lean, final image for running the application
-FROM python:3.13.7-slim
+FROM python:3.12.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive
@@ -49,6 +49,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jpegoptim \
     libsox-fmt-mp3 \
     lame \
+    libportaudio2 \
+    libportaudiocpp0 \
+    portaudio19-dev \
     # Runtime libraries for Python packages
     libxml2 \
     # Process manager
@@ -59,7 +62,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Copy installed Python packages from the builder stage
-COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy supervisor config and application code

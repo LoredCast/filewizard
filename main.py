@@ -22,7 +22,7 @@ import sys
 import re
 import importlib
 import collections.abc
-
+import time
 import ocrmypdf
 import pypdf
 import pytesseract
@@ -40,6 +40,7 @@ from sqlalchemy import (Column, DateTime, Integer, String, Text,
                         create_engine, delete, event)
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import NullPool
+from sqlalchemy.exc import OperationalError
 from string import Formatter
 from werkzeug.utils import secure_filename
 from typing import List as TypingList
@@ -828,7 +829,7 @@ def list_kokoro_voices_cli(timeout: int = 60) -> List[str]:
         voices = []
         voice_pattern = re.compile(r'^\s*\d+\.\s+([a-z]{2,3}_[a-zA-Z0-9]+)$')
         for line in out.splitlines():
-            line = line.strip() 
+            line = line.strip()
             match = voice_pattern.match(line)
             if match:
                 voices.append(match.group(1))
@@ -870,7 +871,7 @@ def list_kokoro_languages_cli(timeout: int = 60) -> List[str]:
         if not out:
             logger.warning("Kokoro TTS language list returned no output.")
             return []
-        
+
         languages = []
         lang_pattern = re.compile(r'^\s*([a-z]{2,3}(?:-[a-z]{2,3})?)$')
         for line in out.splitlines():
@@ -1010,7 +1011,7 @@ def run_tts_task(job_id: str, input_path_str: str, output_path_str: str, model_n
             command_template_str = kokoro_settings.get("command_template")
             if not command_template_str:
                 raise ValueError("Kokoro TTS command_template is not defined in settings.")
-            
+
             try:
                 lang, voice_name = actual_model_name.split('/', 1)
             except ValueError:
@@ -1028,7 +1029,7 @@ def run_tts_task(job_id: str, input_path_str: str, output_path_str: str, model_n
             command = validate_and_build_command(command_template_str, mapping)
             logger.info(f"Executing Kokoro TTS command: {' '.join(command)}")
             run_command(command, timeout=kokoro_settings.get("timeout", 300))
-            
+
             if not tmp_out.exists():
                 raise FileNotFoundError("Kokoro TTS command did not produce an output file.")
 
@@ -1250,9 +1251,39 @@ async def download_kokoro_models_if_missing():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Application starting up...")
-    Base.metadata.create_all(bind=engine)
+    # Base.metadata.create_all(bind=engine)
+
+    create_attempts = 3
+    for attempt in range(1, create_attempts + 1):
+        try:
+            # use engine.begin() to ensure the DDL runs in a connection/transaction context
+            with engine.begin() as conn:
+                Base.metadata.create_all(bind=conn)
+            logger.info("Database tables ensured (create_all succeeded).")
+            break
+        except OperationalError as oe:
+            # Some SQLite drivers raise an OperationalError when two processes try to create the same table at once.
+            msg = str(oe).lower()
+            # If we see "already exists" we treat this as a race and retry briefly.
+            if "already exists" in msg or ("table" in msg and "already exists" in msg):
+                logger.warning(
+                    "Database table creation race detected (attempt %d/%d): %s. Retrying...",
+                    attempt,
+                    create_attempts,
+                    oe,
+                )
+                time.sleep(0.5)
+                continue
+            else:
+                logger.exception("Database initialization failed with OperationalError.")
+                raise
+        except Exception:
+            logger.exception("Unexpected error during DB initialization.")
+            raise
+
+
     load_app_config()
-    
+
     # Download required models on startup
     if shutil.which("kokoro-tts"):
         await download_kokoro_models_if_missing()
@@ -1597,7 +1628,7 @@ def is_allowed_callback_url(url: str, allowed: List[str]) -> bool:
 @app.get("/api/v1/tts-voices")
 async def get_tts_voices_list(user: dict = Depends(require_user)):
     global AVAILABLE_TTS_VOICES_CACHE
-    
+
     kokoro_available = shutil.which("kokoro-tts") is not None
     piper_available = PiperVoice is not None
 
@@ -1626,7 +1657,7 @@ async def get_tts_voices_list(user: dict = Depends(require_user)):
                     all_voices.append({
                         "id": f"kokoro/{lang}/{voice}",
                         "name": f"Kokoro ({lang}): {voice}",
-                        "local": False 
+                        "local": False
                     })
 
         AVAILABLE_TTS_VOICES_CACHE = sorted(all_voices, key=lambda x: x['name'])
@@ -1747,7 +1778,7 @@ async def api_upload_chunk(
     webhook_config = APP_CONFIG.get("webhook_settings", {})
     if not webhook_config.get("enabled", False) or not webhook_config.get("allow_chunked_api_uploads", False):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chunked API uploads are disabled.")
-    
+
     return await upload_chunk(chunk, upload_id, chunk_number, user)
 
 @app.post("/api/v1/upload/finalize", status_code=status.HTTP_202_ACCEPTED, tags=["Webhook API"])
@@ -1758,7 +1789,7 @@ async def api_finalize_upload(
     webhook_config = APP_CONFIG.get("webhook_settings", {})
     if not webhook_config.get("enabled", False) or not webhook_config.get("allow_chunked_api_uploads", False):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Chunked API uploads are disabled.")
-    
+
     # Validate callback URL if provided for a webhook job
     if payload.callback_url and not is_allowed_callback_url(payload.callback_url, webhook_config.get("allowed_callback_urls", [])):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Provided callback_url is not allowed.")
@@ -1883,7 +1914,7 @@ async def save_settings(
 
         with tmp_path.open("w", encoding="utf8") as f:
             yaml.safe_dump(merged_config, f, default_flow_style=False, sort_keys=False)
-        
+
         tmp_path.replace(PATHS.SETTINGS_FILE)
         logger.info(f"Admin '{user.get('email')}' updated settings.yml.")
         load_app_config()
