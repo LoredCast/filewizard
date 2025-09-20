@@ -10,4 +10,4 @@ req.txt
 settings.yml
 app.log
 /config/*
-
+my.settings.yml
