@@ -5,7 +5,6 @@ File Wizard is a self-hosted, browser-based utility for file conversion, OCR, an
 ![Screenshot](swappy-20250920_155526.png)
 
 ## Features
-
   *  Convert between various file formats. The system is designed to be extended with any command-line tool (like FFmpeg, ImageMagick, etc.) via a simple `settings.yml` configuration file.
   * **OCR:** Perform Optical Character Recognition on PDFs and images to extract text.
   * **Audio Transcription:** Transcribe audio files into text using Whisper models.
@@ -19,6 +18,8 @@ File Wizard is a self-hosted, browser-based utility for file conversion, OCR, an
       * A persistent job history table displays file names, tasks, submission times, file sizes (input → output), and final status.
      
   * **Configuration:**
+[See the Wiki](https://github.com/LoredCast/filewizard/wiki)
+
       * A dedicated `/settings` page.
       * OAuth needs to be configured in the `config/settings.yml` file, you can see the default for a reference. By default, it runs without auth in local mode.
       * Currently it only supports cpu operations, but a future image will include the cuda drivers for running whisper on gpu (torch and cuda is large and I didn't want to inflate the image even more)
