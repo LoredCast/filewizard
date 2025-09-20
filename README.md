@@ -2,7 +2,7 @@
 
 File Wizard is a self-hosted, browser-based utility for file conversion, OCR, and audio transcription. It wraps many cli and python converters aswell as fast-whisper and tesseract ocr.
 
-![Screenshot](Screenshot_20250919-211227~2.png)
+![Screenshot](swappy-20250920_155526.png)
 
 ## Features
 
