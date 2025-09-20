@@ -10,6 +10,8 @@ import yaml
 import os
 import httpx
 import glob
+import cv2
+import numpy as np
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1067,7 +1069,8 @@ def run_pdf_ocr_task(job_id: str, input_path_str: str, output_path_str: str, ocr
                      force_ocr=ocr_settings.get('force_ocr', True),
                      clean=ocr_settings.get('clean', True),
                      optimize=ocr_settings.get('optimize', 1),
-                     progress_bar=False)
+                     progress_bar=False,
+                     image_dpi=ocr_settings.get('image_dpi', 300))
         with open(output_path_str, "rb") as f:
             reader = pypdf.PdfReader(f)
             preview = "\n".join(page.extract_text() or "" for page in reader.pages)
@@ -1085,33 +1088,112 @@ def run_pdf_ocr_task(job_id: str, input_path_str: str, output_path_str: str, ocr
         db.close()
         send_webhook_notification(job_id, app_config, base_url)
 
+def image_adjustment_controller(img, brightness=128,
+               contrast=200):
+  
+    brightness = int((brightness - 0) * (255 - (-255)) / (510 - 0) + (-255))
+    contrast = int((contrast - 0) * (127 - (-127)) / (254 - 0) + (-127))
+    if brightness != 0:
+        if brightness > 0:
+            shadow = brightness
+            max = 255
+        else:
+            shadow = 0
+            max = 255 + brightness
+
+        al_pha = (max - shadow) / 255
+        ga_mma = shadow
+        # The function addWeighted calculates
+        # the weighted sum of two arrays
+        cal = cv2.addWeighted(img, al_pha, 
+                              img, 0, ga_mma)
+    else:
+        cal = img
+    if contrast != 0:
+        Alpha = float(131 * (contrast + 127)) / (127 * (131 - contrast))
+        Gamma = 127 * (1 - Alpha)
+        # The function addWeighted calculates
+        # the weighted sum of two arrays
+        cal = cv2.addWeighted(cal, Alpha, 
+                              cal, 0, Gamma)
+    return cal
+
+
+def preprocess_for_ocr(image_path: str) -> np.ndarray:
+    """Loads an image and applies preprocessing steps for OCR."""
+    # Read the image using OpenCV
+    image = cv2.imread(image_path)
+    
+    # 1. Convert to grayscale
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    contrast_img = image_adjustment_controller(gray, brightness=150, contrast=120)
+    # 2. Binarize the image (Otsu's thresholding is great for this)
+    # This turns the image into pure black and white
+    _, binary_image = cv2.threshold(contrast_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # 3. Denoise the image (optional but often helpful)
+    denoised_image = cv2.medianBlur(gray, 3)
+    
+    return binary_image
+
+
 @huey.task()
 def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, app_config: dict, base_url: str):
+    """
+    Performs OCR on an image file, first applying preprocessing steps to clean
+    the image, and then saving the output as a searchable PDF.
+    """
     db = SessionLocal()
     input_path = Path(input_path_str)
     try:
         job = get_job(db, job_id)
         if not job or job.status == 'cancelled':
+            logger.warning(f"OCR job {job_id} was cancelled or not found. Aborting task.")
             return
-        update_job_status(db, job_id, "processing", progress=50)
-        logger.info(f"Starting Image OCR for job {job_id}")
-        text = pytesseract.image_to_string(Image.open(str(input_path)))
-        out_path = Path(output_path_str)
-        tmp_out = out_path.with_name(f"{out_path.stem}.tmp-{uuid.uuid4().hex}{out_path.suffix}")
-        with tmp_out.open("w", encoding="utf-8") as f:
-            f.write(text)
-        tmp_out.replace(out_path)
-        mark_job_as_completed(db, job_id, output_filepath_str=output_path_str, preview=text)
-        logger.info(f"Image OCR for job {job_id} completed.")
+            
+        update_job_status(db, job_id, "processing")
+        logger.info(f"Starting Image to PDF OCR for job {job_id}")
+
+        # Apply the preprocessing steps to the input image for better accuracy
+        logger.info(f"Preprocessing image for job {job_id}...")
+        preprocessed_image = preprocess_for_ocr(input_path_str)
+
+        # Configure Tesseract for optimal performance.
+        # '--psm 3' enables automatic page segmentation, which is a robust default.
+        # '-l eng' specifies English as the language. This should be made dynamic if you support others.
+        tesseract_config = '--psm 3'
+        logger.info(f"Running Tesseract with config: '{tesseract_config}' for job {job_id}")
+
+        # Generate a searchable PDF from the preprocessed image data
+        pdf_bytes = pytesseract.image_to_pdf_or_hocr(
+            Image.fromarray(preprocessed_image),  # Convert numpy array back to PIL Image
+            extension='pdf',
+            config=tesseract_config
+        )
+        with open(output_path_str, "wb") as f:
+            f.write(pdf_bytes)
+
+        # Generate a plain text preview from the same preprocessed image
+        preview_text = pytesseract.image_to_string(
+            Image.fromarray(preprocessed_image),
+            config=tesseract_config
+        )
+        
+        mark_job_as_completed(db, job_id, output_filepath_str=output_path_str, preview=preview_text)
+        logger.info(f"Image to PDF OCR for job {job_id} completed successfully.")
+        
     except Exception as e:
-        logger.exception(f"ERROR during Image OCR for job {job_id}")
+        logger.exception(f"ERROR during Image to PDF OCR for job {job_id}")
         update_job_status(db, job_id, "failed", error=f"Image OCR failed: {e}")
+        
     finally:
         try:
+            # Clean up the original uploaded file
             ensure_path_is_safe(input_path, [PATHS.UPLOADS_DIR])
             input_path.unlink(missing_ok=True)
         except Exception:
-            logger.exception("Failed to cleanup input file after Image OCR.")
+            logger.exception(f"Failed to cleanup input file for job {job_id}.")
+            
         db.close()
         send_webhook_notification(job_id, app_config, base_url)
 
@@ -1487,11 +1569,28 @@ async def finalize_upload(request: Request, payload: FinalizeUploadPayload, user
         create_job(db=db, job=job_data)
         run_tts_task(job_data.id, str(final_path), str(processed_path), payload.model_name, tts_config, APP_CONFIG, base_url)
     elif payload.task_type == "ocr":
-        stem, suffix = Path(safe_filename).stem, Path(safe_filename).suffix
-        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}{suffix}"
+        stem, suffix = Path(safe_filename).stem, Path(safe_filename).suffix.lower()
+        IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.webp'}
+
+        # 1. Validate file type before creating a job
+        if suffix not in IMAGE_EXTENSIONS and suffix != '.pdf':
+            final_path.unlink(missing_ok=True) # Clean up the uploaded file
+            raise HTTPException(
+                status_code=415, 
+                detail=f"Unsupported file type for OCR: '{suffix}'. Please upload a PDF or a supported image."
+            )
+
+        # 2. Set output path to always be a PDF
+        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.pdf"
         job_data.processed_filepath = str(processed_path)
         create_job(db=db, job=job_data)
-        run_pdf_ocr_task(job_data.id, str(final_path), str(processed_path), APP_CONFIG.get("ocr_settings", {}).get("ocrmypdf", {}), APP_CONFIG, base_url)
+        
+        # 3. Dispatch to the correct task based on file type
+        if suffix in IMAGE_EXTENSIONS:
+            # Call the existing image task, which is now modified to produce a PDF
+            run_image_ocr_task(job_data.id, str(final_path), str(processed_path), APP_CONFIG, base_url)
+        else:  # It must be a .pdf due to the earlier check
+            run_pdf_ocr_task(job_data.id, str(final_path), str(processed_path), APP_CONFIG.get("ocr_settings", {}).get("ocrmypdf", {}), APP_CONFIG, base_url)
     elif payload.task_type == "conversion":
         try:
             tool, task_key = payload.output_format.split('_', 1)
