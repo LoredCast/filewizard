@@ -69,15 +69,21 @@
                                 <div class="form-control">
                                     <label for="main-model-size-select">Model Size</label>
                                     <select name="model_size" id="main-model-size-select">
-                                        <option value="tiny">Tiny (Fastest, lower accuracy)</option>
-                                        <option value="base" selected>Base</option>
-                                        <option value="small">Small (Better accuracy)</option>
-                                        <option value="medium">Medium (High accuracy)</option>
-                                        <option value="large-v3">Large v3 (Best accuracy, slow)</option>
-                                        <option value="distil-large-v2">Distilled Large v2</option>
+                                        {% for model in whisper_models %}
+                                        <option value="{{ model }}">{{ model }}</option>
+                                        {% endfor %}
                                     </select>
                                 </div>
                                 <button type="button" id="start-transcription-btn" class="main-action-button">Start Transcription</button>
+                            </fieldset>
+
+                            <fieldset class="action-fieldset">
+                                <legend><h2>Text-to-Speech</h2></legend>
+                                <div class="form-control">
+                                    <label for="main-tts-model-select">Voice Model</label>
+                                    <select name="model_name" id="main-tts-model-select" required></select>
+                                </div>
+                                <button type="button" id="start-tts-btn" class="main-action-button">Start Synthesis</button>
                             </fieldset>
                         </div>
                     </form>
@@ -120,6 +126,7 @@
                 <button id="dialog-action-convert">Convert</button>
                 <button id="dialog-action-ocr">OCR</button>
                 <button id="dialog-action-transcribe">Transcribe</button>
+                <button id="dialog-action-tts">Synthesize Speech</button>
             </div>
             
             <div id="dialog-convert-view" style="display: none;">
@@ -130,6 +137,17 @@
                 <div class="dialog-actions">
                     <button id="dialog-start-conversion">Start Conversion</button>
                     <button id="dialog-back" class="dialog-secondary-action">Back</button>
+                </div>
+            </div>
+
+            <div id="dialog-tts-view" style="display: none;">
+                <div class="form-control" style="text-align: left; margin-bottom: 1rem;">
+                    <label for="dialog-tts-model-select">Voice Model</label>
+                    <select id="dialog-tts-model-select" required></select>
+                </div>
+                <div class="dialog-actions">
+                    <button id="dialog-start-tts">Start Synthesis</button>
+                    <button id="dialog-back-tts" class="dialog-secondary-action">Back</button>
                 </div>
             </div>
 

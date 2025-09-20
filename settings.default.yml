@@ -1,13 +1,31 @@
 auth_settings:
   oidc_client_id: filewiz
-  oidc_client_secret: 
-  oidc_server_metadata_url: https://accounts.test.de/oidc/.well-known/openid-configuration
-  oidc_userinfo_endpoint: https://accounts.test.de/oidc/me
-  oidc_end_session_endpoint: https://accounts.test.de/oidc/session/end
+  oidc_client_secret:
+  oidc_server_metadata_url: https://accounts.example.com/oidc/.well-known/openid-configuration
+  oidc_userinfo_endpoint: https://accounts.example.com/oidc/me
+  oidc_end_session_endpoint: https://accounts.example.com/oidc/session/end
   admin_users:
-  - admin@local.com
+  - user@example.com
+web_hook_settings:
+  enabled: False
+  allow_chunked_api_uploads": False
+  allowed_callback_urls:
+  callback_bearer_token":
+tts_settings: 
+  piper: 
+    model_dir: "./models/tts"
+    use_cuda: False 
+    synthesis_config: 
+      length_scale: 1.0
+      noise_scale: 0.667 
+      noise_w: 0.8
+  kokoro: 
+    model_dir: "./models/tts/kokoro"
+    command_template: "kokoro-tts {input} {output} --model {model_path} --voices {voices_path} --voice {model_name}"
+
 app_settings:
   max_file_size_mb: '2000'
+  # app_public_url: "http://localhost:8000" # Uncomment and set to your public URL if downloads don't work correctly
   allowed_all_extensions:
   - .aac
   - .aiff

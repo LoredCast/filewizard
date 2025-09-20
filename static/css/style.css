@@ -278,7 +278,7 @@ input[type="file"] {
 
 .actions-group {
     display: grid;
-    grid-template-columns: repeat(3, 1fr); /* 3 columns for wide screens */
+    grid-template-columns: repeat(4, 1fr); /* 3 columns for wide screens */
     gap: 1.5rem;
     margin-top: 1.5rem;
 }

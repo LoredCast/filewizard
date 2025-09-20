@@ -13,6 +13,8 @@ faster-whisper
 ocrmypdf
 pytesseract
 pypdf
+piper-tts
+kokoro-tts
 
 # Configuration & Utilities
 werkzeug

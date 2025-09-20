@@ -12,3 +12,6 @@ app.log
 /config/*
 my.settings.yml
 jobs.db-*
+venv312
+models
+config

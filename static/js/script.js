@@ -2,6 +2,18 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Constants ---
     const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB chunks
 
+    // Allow server to provide API prefix (e.g. "/api/v1") via window.APP_CONFIG.api_base
+    const API_BASE = (window.APP_CONFIG && window.APP_CONFIG.api_base) ? window.APP_CONFIG.api_base.replace(/\/$/, '') : '';
+
+    function apiUrl(path) {
+        // path may start with or without a leading slash
+        if (!path) return API_BASE || '/';
+        if (path.startsWith('/')) {
+            return `${API_BASE}${path}`;
+        }
+        return `${API_BASE}/${path}`;
+    }
+
     // --- User Locale and Timezone Detection ---
     const USER_LOCALE = navigator.language || 'en-US';
     const USER_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -24,9 +36,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const mainFileName = document.getElementById('main-file-name');
     const mainOutputFormatSelect = document.getElementById('main-output-format-select');
     const mainModelSizeSelect = document.getElementById('main-model-size-select');
+    const mainTtsModelSelect = document.getElementById('main-tts-model-select');
     const startConversionBtn = document.getElementById('start-conversion-btn');
     const startOcrBtn = document.getElementById('start-ocr-btn');
     const startTranscriptionBtn = document.getElementById('start-transcription-btn');
+    const startTtsBtn = document.getElementById('start-tts-btn');
 
     const jobListBody = document.getElementById('job-list-body');
 
@@ -36,37 +50,50 @@ document.addEventListener('DOMContentLoaded', () => {
     const dialogFileCount = document.getElementById('dialog-file-count');
     const dialogInitialView = document.getElementById('dialog-initial-actions');
     const dialogConvertView = document.getElementById('dialog-convert-view');
+    const dialogTtsView = document.getElementById('dialog-tts-view');
     const dialogConvertBtn = document.getElementById('dialog-action-convert');
     const dialogOcrBtn = document.getElementById('dialog-action-ocr');
     const dialogTranscribeBtn = document.getElementById('dialog-action-transcribe');
+    const dialogTtsBtn = document.getElementById('dialog-action-tts');
     const dialogCancelBtn = document.getElementById('dialog-action-cancel');
     const dialogStartConversionBtn = document.getElementById('dialog-start-conversion');
+    const dialogStartTtsBtn = document.getElementById('dialog-start-tts');
     const dialogBackBtn = document.getElementById('dialog-back');
+    const dialogBackTtsBtn = document.getElementById('dialog-back-tts');
     const dialogOutputFormatSelect = document.getElementById('dialog-output-format-select');
+    const dialogTtsModelSelect = document.getElementById('dialog-tts-model-select');
+
 
     // --- State Variables ---
     let conversionChoices = null;
-    let modelChoices = null; // For the model dropdown instance
+    let transcriptionChoices = null;
+    let ttsChoices = null;
     let dialogConversionChoices = null;
+    let dialogTtsChoices = null;
+    let ttsModelsCache = []; // Cache for formatted TTS models list
     const activePolls = new Map();
     let stagedFiles = null;
 
 
     // --- Authentication-aware Fetch Wrapper ---
-    /**
-     * A wrapper around the native fetch API that handles 401 Unauthorized responses.
-     * If a 401 is received, it assumes the session has expired and redirects to the login page.
-     * @param {string} url - The URL to fetch.
-     * @param {object} options - The options for the fetch request.
-     * @returns {Promise<Response>} - A promise that resolves to the fetch Response.
-     */
-    async function authFetch(url, options) {
+    async function authFetch(url, options = {}) {
+        // Normalize URL through apiUrl() if a bare endpoint is provided
+        if (typeof url === 'string' && url.startsWith('/')) {
+            url = apiUrl(url);
+        }
+
+        // Add default options: include credentials and accept JSON by default
+        options = Object.assign({}, options);
+        if (!Object.prototype.hasOwnProperty.call(options, 'credentials')) {
+            options.credentials = 'include';
+        }
+        options.headers = options.headers || {};
+        if (!options.headers.Accept) options.headers.Accept = 'application/json';
+
         const response = await fetch(url, options);
         if (response.status === 401) {
-            // Use a simple alert for now. A more sophisticated modal could be used.
             alert('Your session has expired. You will be redirected to the login page.');
-            window.location.href = '/login';
-            // Throw an error to stop the promise chain of the calling function
+            window.location.href = apiUrl('/login');
             throw new Error('Session expired');
         }
         return response;
@@ -141,7 +168,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: JSON.stringify(finalizePayload),
             });
             if (!finalizeResponse.ok) {
-                const errorData = await finalizeResponse.json();
+                let errorData = {};
+                try { errorData = await finalizeResponse.json(); } catch (e) {}
                 throw new Error(errorData.detail || 'Finalization failed');
             }
             const result = await finalizeResponse.json();
@@ -203,13 +231,23 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             options.output_format = selectedFormat;
         } else if (taskType === 'transcription') {
-            options.model_size = mainModelSizeSelect.value;
+            const selectedModel = transcriptionChoices.getValue(true);
+            options.model_size = selectedModel;
+        } else if (taskType === 'tts') {
+            const selectedModel = ttsChoices.getValue(true);
+            if (!selectedModel) {
+                alert('Please select a voice model.');
+                return;
+            }
+            options.model_name = selectedModel;
         }
+
 
         // Disable buttons during upload process
         startConversionBtn.disabled = true;
         startOcrBtn.disabled = true;
         startTranscriptionBtn.disabled = true;
+        startTtsBtn.disabled = true;
 
         const uploadPromises = files.map(file => uploadFileInChunks(file, taskType, options));
         await Promise.allSettled(uploadPromises);
@@ -220,6 +258,7 @@ document.addEventListener('DOMContentLoaded', () => {
         startConversionBtn.disabled = false;
         startOcrBtn.disabled = false;
         startTranscriptionBtn.disabled = false;
+        startTtsBtn.disabled = false;
     }
 
 
@@ -251,17 +290,25 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function showActionDialog() {
         dialogFileCount.textContent = stagedFiles.length;
-        dialogOutputFormatSelect.innerHTML = mainOutputFormatSelect.innerHTML; // Use main select as template
+        
+        // Setup Conversion Dropdown
+        dialogOutputFormatSelect.innerHTML = mainOutputFormatSelect.innerHTML;
         if (dialogConversionChoices) dialogConversionChoices.destroy();
         dialogConversionChoices = new Choices(dialogOutputFormatSelect, {
-            searchEnabled: true,
-            itemSelectText: 'Select',
-            shouldSort: false,
-            placeholder: true,
-            placeholderValue: 'Select a format...',
+            searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a format...',
         });
+
+        // Setup TTS Dropdown
+        if (dialogTtsChoices) dialogTtsChoices.destroy();
+        dialogTtsChoices = new Choices(dialogTtsModelSelect, {
+            searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a voice...',
+        });
+        dialogTtsChoices.setChoices(ttsModelsCache, 'value', 'label', true);
+
+
         dialogInitialView.style.display = 'grid';
         dialogConvertView.style.display = 'none';
+        dialogTtsView.style.display = 'none';
         actionDialog.classList.add('visible');
     }
 
@@ -269,21 +316,34 @@ document.addEventListener('DOMContentLoaded', () => {
         actionDialog.classList.remove('visible');
         stagedFiles = null;
         if (dialogConversionChoices) {
-            dialogConversionChoices.hideDropdown();
             dialogConversionChoices.destroy();
             dialogConversionChoices = null;
         }
+        if (dialogTtsChoices) {
+            dialogTtsChoices.destroy();
+            dialogTtsChoices = null;
+        }
     }
-
+    
+    // --- Dialog Button Listeners ---
     dialogConvertBtn.addEventListener('click', () => {
         dialogInitialView.style.display = 'none';
         dialogConvertView.style.display = 'block';
+    });
+    dialogTtsBtn.addEventListener('click', () => {
+        dialogInitialView.style.display = 'none';
+        dialogTtsView.style.display = 'block';
     });
     dialogBackBtn.addEventListener('click', () => {
         dialogInitialView.style.display = 'grid';
         dialogConvertView.style.display = 'none';
     });
+    dialogBackTtsBtn.addEventListener('click', () => {
+        dialogInitialView.style.display = 'grid';
+        dialogTtsView.style.display = 'none';
+    });
     dialogStartConversionBtn.addEventListener('click', () => handleDialogAction('conversion'));
+    dialogStartTtsBtn.addEventListener('click', () => handleDialogAction('tts'));
     dialogOcrBtn.addEventListener('click', () => handleDialogAction('ocr'));
     dialogTranscribeBtn.addEventListener('click', () => handleDialogAction('transcription'));
     dialogCancelBtn.addEventListener('click', closeActionDialog);
@@ -300,23 +360,81 @@ document.addEventListener('DOMContentLoaded', () => {
             options.output_format = selectedFormat;
         } else if (action === 'transcription') {
             options.model_size = mainModelSizeSelect.value;
+        } else if (action === 'tts') {
+            const selectedModel = dialogTtsChoices.getValue(true);
+            if (!selectedModel) {
+                alert('Please select a voice model.');
+                return;
+            }
+            options.model_name = selectedModel;
         }
         Array.from(stagedFiles).forEach(file => uploadFileInChunks(file, action, options));
         closeActionDialog();
     }
 
-    /**
-     * Initializes all Choices.js dropdowns on the page.
-     */
+    // -----------------------
+    // TTS models loader (robust)
+    // -----------------------
+    async function loadTtsModels() {
+        try {
+            const response = await authFetch('/api/v1/tts-voices');
+            if (!response.ok) throw new Error('Failed to fetch TTS voices.');
+            const voicesData = await response.json();
+
+            // voicesData might be an object map { id: meta } or an array [{ id, name, language, ... }]
+            const voicesArray = [];
+            if (Array.isArray(voicesData)) {
+                for (const v of voicesData) {
+                    // Accept either { id, name, language } or { voice_id, title, locale }
+                    const id = v.id || v.voice_id || v.voice || v.name || null;
+                    const name = v.name || v.title || v.display_name || id || 'Unknown';
+                    const lang = (v.language && (v.language.name_native || v.language.name)) || v.locale || (id ? id.split(/[_-]/)[0] : 'Unknown');
+                    if (id) voicesArray.push({ id, name, lang });
+                }
+            } else if (voicesData && typeof voicesData === 'object') {
+                for (const key in voicesData) {
+                    if (!Object.prototype.hasOwnProperty.call(voicesData, key)) continue;
+                    const v = voicesData[key];
+                    const id = v.id || key;
+                    const name = v.name || v.title || v.display_name || id;
+                    const lang = (v.language && (v.language.name_native || v.language.name)) || v.locale || (id ? id.split(/[_-]/)[0] : 'Unknown');
+                    voicesArray.push({ id, name, lang });
+                }
+            } else {
+                throw new Error('Unexpected voices payload');
+            }
+
+            // Group by language
+            const groups = {};
+            for (const v of voicesArray) {
+                const langLabel = v.lang || 'Unknown';
+                if (!groups[langLabel]) {
+                    groups[langLabel] = { label: langLabel, id: langLabel, disabled: false, choices: [] };
+                }
+                groups[langLabel].choices.push({
+                    value: v.id,
+                    label: `${v.name}`
+                });
+            }
+            ttsModelsCache = Object.values(groups).sort((a,b) => a.label.localeCompare(b.label));
+            // If ttsChoices exists, update it; otherwise the initializer will set choices
+            if (ttsChoices) {
+                ttsChoices.setChoices(ttsModelsCache, 'value', 'label', true);
+            }
+        } catch (error) {
+            console.error("Couldn't load TTS voices:", error);
+            if (error.message !== 'Session expired') {
+                if (ttsChoices) {
+                    ttsChoices.setChoices([{ value: '', label: 'Error loading voices', disabled: true }], 'value', 'label');
+                }
+            }
+        }
+    }
+    
     function initializeSelectors() {
-        // --- Conversion Dropdown ---
         if (conversionChoices) conversionChoices.destroy();
         conversionChoices = new Choices(mainOutputFormatSelect, {
-            searchEnabled: true,
-            itemSelectText: 'Select',
-            shouldSort: false,
-            placeholder: true,
-            placeholderValue: 'Select a format...',
+            searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a format...',
         });
         const tools = window.APP_CONFIG.conversionTools || {};
         const choicesArray = [];
@@ -324,22 +442,22 @@ document.addEventListener('DOMContentLoaded', () => {
             const tool = tools[toolKey];
             const group = { label: tool.name, id: toolKey, disabled: false, choices: [] };
             for (const formatKey in tool.formats) {
-                group.choices.push({
-                    value: `${toolKey}_${formatKey}`,
-                    label: `${tool.name} - ${formatKey.toUpperCase()} (${tool.formats[formatKey]})`
-                });
+                group.choices.push({ value: `${toolKey}_${formatKey}`, label: `${tool.name} - ${formatKey.toUpperCase()} (${tool.formats[formatKey]})` });
             }
             choicesArray.push(group);
         }
         conversionChoices.setChoices(choicesArray, 'value', 'label', true);
 
-        // --- Model Size Dropdown ---
-        if (modelChoices) modelChoices.destroy();
-        modelChoices = new Choices(mainModelSizeSelect, {
-            searchEnabled: false,   // Disables the search box
-            shouldSort: false,      // Keeps the original <option> order
-            itemSelectText: '',     // Hides the "Press to select" tooltip
+        if (transcriptionChoices) transcriptionChoices.destroy();
+        transcriptionChoices = new Choices(mainModelSizeSelect, {
+            searchEnabled: false, shouldSort: false, itemSelectText: '',
         });
+
+        if (ttsChoices) ttsChoices.destroy();
+        ttsChoices = new Choices(mainTtsModelSelect, {
+             searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select voice...',
+        });
+        loadTtsModels();
     }
 
     function updateFileName(input, nameDisplay) {
@@ -359,7 +477,8 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const response = await authFetch(`/job/${jobId}/cancel`, { method: 'POST' });
             if (!response.ok) {
-                const errorData = await response.json();
+                let errorData = {};
+                try { errorData = await response.json(); } catch (e) {}
                 throw new Error(errorData.detail || 'Failed to cancel job.');
             }
             stopPolling(jobId);
@@ -422,7 +541,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderJobRow(job) {
-        const rowId = job.id.startsWith('upload-') ? job.id : `job-${job.id}`;
+        const rowId = job.id && String(job.id).startsWith('upload-') ? job.id : `job-${job.id}`;
         let row = document.getElementById(rowId);
         if (!row) {
             row = document.createElement('tr');
@@ -434,9 +553,11 @@ document.addEventListener('DOMContentLoaded', () => {
         if (job.task_type === 'conversion' && job.processed_filepath) {
             const extension = job.processed_filepath.split('.').pop();
             taskTypeLabel = `Convert to ${extension.toUpperCase()}`;
+        } else if (job.task_type === 'tts') {
+            taskTypeLabel = 'Synthesize Speech';
         }
 
-        const submittedDate = new Date(job.created_at);
+        const submittedDate = job.created_at ? new Date(job.created_at) : new Date();
         const formattedDate = submittedDate.toLocaleString(USER_LOCALE, DATETIME_FORMAT_OPTIONS);
 
         let statusHtml = `<span class="job-status-badge status-${job.status}">${job.status}</span>`;
@@ -445,7 +566,7 @@ document.addEventListener('DOMContentLoaded', () => {
             statusHtml += `<div class="progress-bar-container"><div class="progress-bar" style="width: ${job.progress || 0}%"></div></div>`;
         } else if (job.status === 'processing') {
             const progressClass = (job.task_type === 'transcription' && job.progress > 0) ? '' : 'indeterminate';
-            const progressWidth = job.task_type === 'transcription' ? job.progress : 100;
+            const progressWidth = (job.task_type === 'transcription' && job.progress > 0) ? job.progress : 100;
             statusHtml += `<div class="progress-bar-container"><div class="progress-bar ${progressClass}" style="width: ${progressWidth}%"></div></div>`;
         }
 
@@ -454,7 +575,7 @@ document.addEventListener('DOMContentLoaded', () => {
             actionHtml = `<button class="cancel-button" data-job-id="${job.id}">Cancel</button>`;
         } else if (job.status === 'completed' && job.processed_filepath) {
             const downloadFilename = job.processed_filepath.split(/[\\/]/).pop();
-            actionHtml = `<a href="/download/${downloadFilename}" class="download-button" download>Download</a>`;
+            actionHtml = `<a href="${apiUrl('/download')}/${encodeURIComponent(downloadFilename)}" class="download-button" download>Download</a>`;
         } else if (job.status === 'failed') {
             const errorTitle = job.error_message ? ` title="${job.error_message.replace(/"/g, '&quot;')}"` : '';
             actionHtml = `<span class="error-text"${errorTitle}>Failed</span>`;
@@ -485,6 +606,7 @@ document.addEventListener('DOMContentLoaded', () => {
         startConversionBtn.addEventListener('click', () => handleTaskRequest('conversion'));
         startOcrBtn.addEventListener('click', () => handleTaskRequest('ocr'));
         startTranscriptionBtn.addEventListener('click', () => handleTaskRequest('transcription'));
+        startTtsBtn.addEventListener('click', () => handleTaskRequest('tts'));
         mainFileInput.addEventListener('change', () => updateFileName(mainFileInput, mainFileName));
 
         jobListBody.addEventListener('click', (event) => {
@@ -505,7 +627,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (loginContainer) loginContainer.style.display = 'flex';
         if (loginButton) {
             loginButton.addEventListener('click', () => {
-                window.location.href = '/login';
+                window.location.href = apiUrl('/login');
             });
         }
     }
