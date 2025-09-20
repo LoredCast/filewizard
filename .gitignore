@@ -11,3 +11,4 @@ settings.yml
 app.log
 /config/*
 my.settings.yml
+jobs.db-*
