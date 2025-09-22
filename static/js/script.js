@@ -42,6 +42,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const startTranscriptionBtn = document.getElementById('start-transcription-btn');
     const startTtsBtn = document.getElementById('start-tts-btn');
 
+    const downloadSelectedBtn = document.getElementById('download-selected-btn');
+    const selectAllJobsCheckbox = document.getElementById('select-all-jobs');
     const jobListBody = document.getElementById('job-list-body');
 
     // Drag and Drop Elements
@@ -495,27 +497,100 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    function handleSelectionChange() {
+        const selectedCheckboxes = jobListBody.querySelectorAll('.job-checkbox:checked');
+        downloadSelectedBtn.disabled = selectedCheckboxes.length === 0;
+
+        const allCheckboxes = jobListBody.querySelectorAll('.job-checkbox');
+        selectAllJobsCheckbox.checked = allCheckboxes.length > 0 && selectedCheckboxes.length === allCheckboxes.length;
+    }
+
+    async function handleBatchDownload() {
+        const selectedIds = Array.from(jobListBody.querySelectorAll('.job-checkbox:checked')).map(cb => cb.value);
+        if (selectedIds.length === 0) return;
+
+        downloadSelectedBtn.disabled = true;
+        downloadSelectedBtn.textContent = 'Zipping...';
+
+        try {
+            const response = await authFetch('/download/batch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ job_ids: selectedIds })
+            });
+            if (!response.ok) throw new Error('Batch download failed.');
+            
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.style.display = 'none';
+            a.href = url;
+            a.download = `file-wizard-batch-${Date.now()}.zip`;
+            document.body.appendChild(a);
+            a.click();
+            window.URL.revokeObjectURL(url);
+        } catch (error) {
+            console.error("Batch download error:", error);
+            alert("Could not download files. Please try again.");
+        } finally {
+            downloadSelectedBtn.disabled = false;
+            downloadSelectedBtn.textContent = 'Download Selected as ZIP';
+        }
+    }
+
     async function loadInitialJobs() {
         try {
             const response = await authFetch('/jobs');
             if (!response.ok) throw new Error('Failed to fetch jobs.');
-            const jobs = await response.json();
+            let jobs = await response.json();
+            
+            // Sort jobs so parents come before children
+            jobs.sort((a, b) => {
+                if (a.id === b.parent_job_id) return -1;
+                if (b.id === a.parent_job_id) return 1;
+                return new Date(b.created_at) - new Date(a.created_at);
+            });
+
             jobListBody.innerHTML = '';
             for (const job of jobs.reverse()) {
                 renderJobRow(job);
                 if (['pending', 'processing'].includes(job.status)) startPolling(job.id);
             }
+            handleSelectionChange();
         } catch (error) {
             console.error("Couldn't load job history:", error);
             if (error.message !== 'Session expired') {
-                jobListBody.innerHTML = '<tr><td colspan="6" style="text-align: center;">Could not load job history.</td></tr>';
+                jobListBody.innerHTML = '<tr><td colspan="7" style="text-align: center;">Could not load job history.</td></tr>';
             }
+        }
+    }
+    
+    // --- Polling and UI Rendering ---
+    async function fetchAndRenderSubJobs(parentJobId) {
+        try {
+            const response = await authFetch('/jobs');
+            if (!response.ok) return;
+            const allJobs = await response.json();
+            const childJobs = allJobs.filter(j => j.parent_job_id === parentJobId);
+
+            for (const childJob of childJobs) {
+                const childRowId = `job-${childJob.id}`;
+                if (!document.getElementById(childRowId)) {
+                    renderJobRow(childJob);
+                    if (['pending', 'processing'].includes(childJob.status)) {
+                        startPolling(childJob.id);
+                    }
+                }
+            }
+        } catch (error) {
+            console.error(`Failed to fetch sub-jobs for parent ${parentJobId}:`, error);
         }
     }
 
     function startPolling(jobId) {
         if (activePolls.has(jobId)) return;
-        const intervalId = setInterval(async () => {
+
+        const pollLogic = async () => {
             try {
                 const response = await authFetch(`/job/${jobId}`);
                 if (!response.ok) {
@@ -524,14 +599,25 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
                 const job = await response.json();
                 renderJobRow(job);
-                if (['completed', 'failed', 'cancelled'].includes(job.status)) stopPolling(jobId);
+
+                if (job.task_type === 'unzip' && job.status === 'processing') {
+                    await fetchAndRenderSubJobs(job.id);
+                }
+
+                if (['completed', 'failed', 'cancelled'].includes(job.status)) {
+                    stopPolling(jobId);
+                }
             } catch (error) {
                 console.error(`Error polling for job ${jobId}:`, error);
-                stopPolling(jobId); // Stop polling on any error, including auth errors
+                stopPolling(jobId);
             }
-        }, 2500);
+        };
+
+        const intervalId = setInterval(pollLogic, 3000);
         activePolls.set(jobId, intervalId);
+        pollLogic(); // Run once immediately
     }
+
 
     function stopPolling(jobId) {
         if (activePolls.has(jobId)) {
@@ -546,7 +632,12 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!row) {
             row = document.createElement('tr');
             row.id = rowId;
-            jobListBody.prepend(row);
+            const parentRow = job.parent_job_id ? document.getElementById(`job-${job.parent_job_id}`) : null;
+            if (parentRow) {
+                 parentRow.parentNode.insertBefore(row, parentRow.nextSibling);
+            } else {
+                jobListBody.prepend(row);
+            }
         }
 
         let taskTypeLabel = job.task_type;
@@ -555,27 +646,34 @@ document.addEventListener('DOMContentLoaded', () => {
             taskTypeLabel = `Convert to ${extension.toUpperCase()}`;
         } else if (job.task_type === 'tts') {
             taskTypeLabel = 'Synthesize Speech';
+        } else if (job.task_type === 'unzip') {
+            taskTypeLabel = 'Unpack ZIP';
+        } else if (job.task_type) {
+             taskTypeLabel = job.task_type.charAt(0).toUpperCase() + job.task_type.slice(1);
         }
 
         const submittedDate = job.created_at ? new Date(job.created_at) : new Date();
         const formattedDate = submittedDate.toLocaleString(USER_LOCALE, DATETIME_FORMAT_OPTIONS);
 
         let statusHtml = `<span class="job-status-badge status-${job.status}">${job.status}</span>`;
-        if (job.status === 'uploading') {
-            statusHtml = `<span class="job-status-badge status-processing">Uploading</span>`;
-            statusHtml += `<div class="progress-bar-container"><div class="progress-bar" style="width: ${job.progress || 0}%"></div></div>`;
+        if (job.status === 'uploading' || (job.status === 'processing' && job.task_type === 'unzip')) {
+             statusHtml += `<div class="progress-bar-container"><div class="progress-bar" style="width: ${job.progress || 0}%"></div></div>`;
         } else if (job.status === 'processing') {
-            const progressClass = (job.task_type === 'transcription' && job.progress > 0) ? '' : 'indeterminate';
-            const progressWidth = (job.task_type === 'transcription' && job.progress > 0) ? job.progress : 100;
+            const progressClass = (job.progress > 0) ? '' : 'indeterminate';
+            const progressWidth = (job.progress > 0) ? job.progress : 100;
             statusHtml += `<div class="progress-bar-container"><div class="progress-bar ${progressClass}" style="width: ${progressWidth}%"></div></div>`;
         }
 
         let actionHtml = `<span>-</span>`;
-        if (['pending', 'processing'].includes(job.status)) {
+        if (['pending', 'processing', 'uploading'].includes(job.status)) {
             actionHtml = `<button class="cancel-button" data-job-id="${job.id}">Cancel</button>`;
-        } else if (job.status === 'completed' && job.processed_filepath) {
-            const downloadFilename = job.processed_filepath.split(/[\\/]/).pop();
-            actionHtml = `<a href="${apiUrl('/download')}/${encodeURIComponent(downloadFilename)}" class="download-button" download>Download</a>`;
+        } else if (job.status === 'completed') {
+            if (job.task_type === 'unzip') {
+                actionHtml = `<a href="${apiUrl('/download/zip-batch')}/${encodeURIComponent(job.id)}" class="download-button" download>Download Batch</a>`;
+            } else if (job.processed_filepath) {
+                const downloadFilename = job.processed_filepath.split(/[\\/]/).pop();
+                actionHtml = `<a href="${apiUrl('/download')}/${encodeURIComponent(downloadFilename)}" class="download-button" download>Download</a>`;
+            }
         } else if (job.status === 'failed') {
             const errorTitle = job.error_message ? ` title="${job.error_message.replace(/"/g, '&quot;')}"` : '';
             actionHtml = `<span class="error-text"${errorTitle}>Failed</span>`;
@@ -588,12 +686,28 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const escapedFilename = job.original_filename ? job.original_filename.replace(/</g, "&lt;").replace(/>/g, "&gt;") : "No filename";
 
+        let checkboxHtml = '';
+        if (job.status === 'completed' && job.processed_filepath && job.task_type !== 'unzip') {
+            checkboxHtml = `<input type="checkbox" class="job-checkbox" value="${job.id}">`;
+        }
+        
+        const rowClasses = [];
+        if(job.parent_job_id) rowClasses.push('sub-job');
+        if(job.task_type === 'unzip') rowClasses.push('parent-job');
+        row.className = rowClasses.join(' ');
+        if (job.parent_job_id) {
+            row.dataset.parentId = job.parent_job_id;
+        }
+
+        const expanderHtml = job.task_type === 'unzip' ? '<span class="expander-arrow"></span>' : '';
+        
         row.innerHTML = `
-            <td data-label="File"><span class="cell-value" title="${escapedFilename}">${escapedFilename}</span></td>
+            <td data-label="Select"><span class="cell-value">${checkboxHtml}</span></td>
+            <td data-label="File"><span class="cell-value" title="${escapedFilename}">${expanderHtml}<span class="file-cell-content">${escapedFilename}</span></span></td>
             <td data-label="File Size"><span class="cell-value">${fileSizeHtml}</span></td>
             <td data-label="Task"><span class="cell-value">${taskTypeLabel}</span></td>
             <td data-label="Submitted"><span class="cell-value">${formattedDate}</span></td>
-            <td data-label="Status"><span class="cell-value">${statusHtml}</span></td>
+            <td data-label="Status"><span class="cell-value status-cell-value">${statusHtml}</span></td>
             <td data-label="Action" class="action-col"><span class="cell-value">${actionHtml}</span></td>
         `;
     }
@@ -613,8 +727,42 @@ document.addEventListener('DOMContentLoaded', () => {
             if (event.target.classList.contains('cancel-button')) {
                 const jobId = event.target.dataset.jobId;
                 handleCancelJob(jobId);
+                return;
+            }
+             // Event delegation for collapsible rows
+            const parentRow = event.target.closest('tr.parent-job');
+            if (parentRow) {
+                const parentId = parentRow.id.replace('job-', '');
+                parentRow.classList.toggle('sub-jobs-visible');
+                const areVisible = parentRow.classList.contains('sub-jobs-visible');
+
+                // Toggle visibility of all child job rows
+                const subJobs = jobListBody.querySelectorAll(`tr.sub-job[data-parent-id="${parentId}"]`);
+                subJobs.forEach(subJob => {
+                    // Use classes instead of direct style manipulation for robustness
+                    if (areVisible) {
+                        subJob.classList.add('is-visible');
+                    } else {
+                        subJob.classList.remove('is-visible');
+                    }
+                });
             }
         });
+
+        jobListBody.addEventListener('change', (event) => {
+            if (event.target.classList.contains('job-checkbox')) {
+                handleSelectionChange();
+            }
+        });
+
+        selectAllJobsCheckbox.addEventListener('change', () => {
+            const isChecked = selectAllJobsCheckbox.checked;
+            jobListBody.querySelectorAll('.job-checkbox').forEach(cb => {
+                cb.checked = isChecked;
+            });
+            handleSelectionChange();
+        });
+        downloadSelectedBtn.addEventListener('click', handleBatchDownload);
 
         // Load initial data and setup UI components
         initializeSelectors();

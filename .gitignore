@@ -15,3 +15,4 @@ jobs.db-*
 venv312
 models
 config
+app.log*

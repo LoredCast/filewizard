@@ -93,7 +93,7 @@ body {
 /* Container */
 .container {
     width: 100%;
-    max-width: 1280px;
+    max-width: 92vw;
     margin: 0 auto;
     background: var(--card-bg);
     border-radius: 10px;
@@ -329,6 +329,15 @@ input[type="file"] {
     text-align: center;
     color: var(--muted-text);
     font-size: 1.25rem;
+
+    margin: 0;
+    text-align: left;
+}
+
+.history-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
     margin-bottom: 1rem;
     border-top: 1px solid var(--divider-color);
     padding-top: 2rem;
@@ -370,18 +379,29 @@ input[type="file"] {
 }
 
 .cell-value {
-    max-width: 10em;
-    text-wrap: wrap;
-    overflow: scroll;
+    display: flex;
+    align-items: center;
+    max-width: 20em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.status-cell-value {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+}
+
+.file-cell-content {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 
 #job-table td[data-label="File"],
 #job-table td[data-label="Task"] {
-    overflow: scroll;
     text-overflow: ellipsis;
-    text-wrap: wrap;
-    max-width: 15em;
 }
 
 .action-col {
@@ -439,6 +459,12 @@ input[type="file"] {
     transition: width 0.5s ease-in-out;
 }
 
+
+.select-col {
+    width: 20px;
+    text-align: center;
+}
+
 .progress-bar.indeterminate {
     width: 100%;
     background: linear-gradient(
@@ -468,6 +494,12 @@ input[type="file"] {
     border: none;
     cursor: pointer;
 }
+
+#download-selected-btn {
+    width: auto;
+    white-space: nowrap;
+ }
+
 .download-button {
     background-color: var(--success-color);
     color: #00160b;
@@ -703,23 +735,53 @@ body.dragging .drag-overlay {
         text-align: right;
         min-width: 0;
         word-break: break-all;
-        overflow: scroll;
-        max-width: 100em;
     }
 
-    .cell-value {
+    .cell-value, .file-cell-content {
         min-width: 0;
-        max-width: 20em;
-        text-wrap: nowrap;
-        overflow: scroll;
+        max-width: 50vw; /* Adjust for smaller screens */
     }
+}
 
+/* --- Collapsible Job Rows --- */
+tr.parent-job {
+    cursor: pointer;
+}
 
-    #job-table td[data-label="File"],
-    #job-table td[data-label="Task"] {
-        overflow: scroll;
-        text-overflow: ellipsis;
-        text-wrap: nowrap;
-        max-width: 100em;
+.expander-arrow {
+    content: '';
+    display: inline-block;
+    margin-right: 0.7em;
+    transition: transform 0.2s ease-in-out;
+    width: 0.7em;
+    height: 0.7em;
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%239aa4ad' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M2 5l6 6 6-6'/%3e%3c/svg%3e");
+    background-repeat: no-repeat;
+    background-position: center;
+    background-size: contain;
+    transform: rotate(-90deg);
+    flex-shrink: 0;
+}
+
+tr.parent-job.sub-jobs-visible .expander-arrow {
+    transform: rotate(0deg);
+}
+
+tr.sub-job {
+    display: none; /* Initially hidden */
+    background-color: rgba(255, 255, 255, 0.03);
+}
+
+tr.sub-job.is-visible {
+    display: table-row; /* Show on desktop */
+}
+
+tr.sub-job td[data-label="File"] .cell-value {
+    padding-left: 1.7em;
+}
+
+@media (max-width: 768px) {
+    tr.sub-job.is-visible {
+        display: block; /* Show on mobile */
     }
 }

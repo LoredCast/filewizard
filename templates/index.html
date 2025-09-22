@@ -6,9 +6,9 @@
     <title>File Wizard</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/choices.js/public/assets/styles/choices.min.css"/>
     <link rel="stylesheet" href="{{ url_for('static', path='/css/style.css') }}">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
+<!--     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet"> -->
 </head>
 <body>
 
@@ -65,7 +65,7 @@
                             </fieldset>
 
                             <fieldset class="action-fieldset">
-                                <legend><h2>Transcribe Audio/Video</h2></legend>
+                                <legend><h2>Transcribe A/V</h2></legend>
                                 <div class="form-control">
                                     <label for="main-model-size-select">Model Size</label>
                                     <select name="model_size" id="main-model-size-select">
@@ -90,11 +90,15 @@
                 </section>
 
                 <section id="job-history">
-                    <h2>History</h2>
+                    <div class="history-header">
+                        <h2>History</h2>
+                        <button id="download-selected-btn" class="main-action-button" disabled>Download Selected as ZIP</button>
+                    </div>
                     <div class="table-wrapper">
                         <table id="job-table">
                             <thead>
                                 <tr>
+                                    <th class="select-col"><input type="checkbox" id="select-all-jobs"></th>
                                     <th>File</th>
                                     <th>File Size</th>
                                     <th>Task</th>
