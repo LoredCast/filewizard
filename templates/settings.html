@@ -6,9 +6,7 @@
     <title>Settings - File Wizard</title>
     <link rel="stylesheet" href="{{ url_for('static', path='/css/style.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', path='/css/settings.css') }}">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+
 </head>
 <body>
     <div class="container">
@@ -21,14 +19,44 @@
 
         <main>
             <form id="settings-form">
-                
-                <fieldset class="settings-group">
-                    <legend><h2>General Settings</h2></legend>
-                    <div class="form-control">
-                        <label for="app-max-file-size">Max Upload Size (MB)</label>
-                        <input type="number" id="app-max-file-size" name="app_settings.max_file_size_mb" value="{{ config.app_settings.max_file_size_mb }}" class="form-input">
-                    </div>
-                </fieldset>
+                <div class="settings-main-grid">
+                    <fieldset class="settings-group">
+                        <legend><h2>General Settings</h2></legend>
+                        <div class="form-control">
+                            <label for="app-public-url">App Public URL</label>
+                            <p class="field-description">The public-facing base URL of the application (e.g., https://files.example.com). Used for generating absolute URLs in webhooks.</p>
+                            <input type="text" id="app-public-url" name="app_settings.app_public_url" value="{{ config.app_settings.get('app_public_url', '') }}" class="form-input" placeholder="https://... ">
+                        </div>
+                        <div class="form-control">
+                            <label for="app-max-file-size">Max Upload Size (MB)</label>
+                            <input type="number" id="app-max-file-size" name="app_settings.max_file_size_mb" value="{{ config.app_settings.max_file_size_mb }}" class="form-input">
+                        </div>
+                        <div class="form-control">
+                            <label for="app-allowed-extensions">Allowed File Extensions for Conversion</label>
+                            <p class="field-description">A comma-separated list of file extensions (e.g., .pdf, .docx, .png). If empty, all files are allowed.</p>
+                            <textarea id="app-allowed-extensions" name="app_settings.allowed_all_extensions" class="form-textarea" rows="2">{{ config.app_settings.get('allowed_all_extensions', []) | join(', ') }}</textarea>
+                        </div>
+                    </fieldset>
+
+                    <fieldset class="settings-group">
+                        <legend><h2>Performance Tuning</h2></legend>
+                         <div class="form-control">
+                            <label for="perf-model-concurrency">Model Concurrency Limit</label>
+                            <p class="field-description">Maximum number of AI models (e.g., Piper TTS) that can run in parallel. Helps prevent CPU/GPU overload.</p>
+                            <input type="number" id="perf-model-concurrency" name="app_settings.model_concurrency" value="{{ config.app_settings.get('model_concurrency', 1) }}" class="form-input">
+                        </div>
+                         <div class="form-control">
+                            <label for="perf-model-timeout">Model Inactivity Timeout (seconds)</label>
+                            <p class="field-description">Time in seconds before an unused Whisper model is unloaded from memory.</p>
+                            <input type="number" id="perf-model-timeout" name="app_settings.model_inactivity_timeout" value="{{ config.app_settings.get('model_inactivity_timeout', 1800) }}" class="form-input">
+                        </div>
+                         <div class="form-control">
+                            <label for="perf-cache-interval">Cache Check Interval (seconds)</label>
+                            <p class="field-description">How often to check for inactive models to unload.</p>
+                            <input type="number" id="perf-cache-interval" name="app_settings.cache_check_interval" value="{{ config.app_settings.get('cache_check_interval', 300) }}" class="form-input">
+                        </div>
+                    </fieldset>
+                </div>
                 
                 <fieldset class="settings-group">
                     <legend><h2>OCR (ocrmypdf)</h2></legend>
@@ -48,6 +76,7 @@
 
                 <fieldset class="settings-group">
                     <legend><h2>Transcription (Whisper)</h2></legend>
+                    <p class="field-description">Device settings (CPU/GPU) are configured via environment variables (see documentation).</p>
                     <div class="form-control">
                         <label for="whisper-compute-type">Compute Type</label>
                         <select id="whisper-compute-type" name="transcription_settings.whisper.compute_type" class="form-select">
@@ -55,6 +84,71 @@
                                 <option value="{{ ctype }}" {% if config.transcription_settings.whisper.compute_type == ctype %}selected{% endif %}>{{ ctype }}</option>
                             {% endfor %}
                         </select>
+                    </div>
+                </fieldset>
+
+                <fieldset class="settings-group">
+                    <legend><h2>Authentication (OIDC)</h2></legend>
+                    <p class="field-description">Used for logging in users. Requires `LOCAL_ONLY=False` environment variable.</p>
+                    <div class="form-control">
+                        <label for="auth-client-id">Client ID</label>
+                        <input type="text" id="auth-client-id" name="auth_settings.oidc_client_id" value="{{ config.auth_settings.get('oidc_client_id', '') }}" class="form-input">
+                    </div>
+                    <div class="form-control">
+                        <label for="auth-client-secret">Client Secret</label>
+                        <input type="password" id="auth-client-secret" name="auth_settings.oidc_client_secret" value="{{ config.auth_settings.get('oidc_client_secret', '') }}" class="form-input">
+                    </div>
+                    <div class="form-control">
+                        <label for="auth-metadata-url">Server Metadata URL</label>
+                        <input type="text" id="auth-metadata-url" name="auth_settings.oidc_server_metadata_url" value="{{ config.auth_settings.get('oidc_server_metadata_url', '') }}" class="form-input" placeholder="https://your-auth-server/.well-known/openid-configuration">
+                    </div>
+                    <div class="form-control">
+                        <label for="auth-admin-users">Admin User Emails</label>
+                        <p class="field-description">Comma-separated list of email addresses for users who should have admin rights.</p>
+                        <textarea id="auth-admin-users" name="auth_settings.admin_users" class="form-textarea" rows="2">{{ config.auth_settings.get('admin_users', []) | join(', ') }}</textarea>
+                    </div>
+                </fieldset>
+
+                 <fieldset class="settings-group">
+                    <legend><h2>Webhooks</h2></legend>
+                    <p class="field-description">Allow programmatic access and job status callbacks.</p>
+                    <div class="form-control checkbox-group">
+                        <input type="checkbox" id="webhook-enabled" name="webhook_settings.enabled" {% if config.webhook_settings.get('enabled') %}checked{% endif %}>
+                        <label for="webhook-enabled">Enable Webhook API</label>
+                    </div>
+                     <div class="form-control checkbox-group">
+                        <input type="checkbox" id="webhook-chunked-uploads" name="webhook_settings.allow_chunked_api_uploads" {% if config.webhook_settings.get('allow_chunked_api_uploads') %}checked{% endif %}>
+                        <label for="webhook-chunked-uploads">Allow Chunked Uploads via API</label>
+                    </div>
+                    <div class="form-control">
+                        <label for="webhook-allowed-urls">Allowed Callback URLs</label>
+                        <p class="field-description">Comma-separated list of URLs or domain prefixes that are allowed for callbacks (e.g., https://n8n.example.com).</p>
+                        <textarea id="webhook-allowed-urls" name="webhook_settings.allowed_callback_urls" class="form-textarea" rows="2">{{ config.webhook_settings.get('allowed_callback_urls', []) | join(', ') }}</textarea>
+                    </div>
+                    <div class="form-control">
+                        <label for="webhook-token">Callback Bearer Token</label>
+                        <p class="field-description">If set, this token will be sent in the `Authorization` header for all callback requests.</p>
+                        <input type="password" id="webhook-token" name="webhook_settings.callback_bearer_token" value="{{ config.webhook_settings.get('callback_bearer_token', '') }}" class="form-input">
+                    </div>
+                </fieldset>
+
+                <fieldset class="settings-group">
+                    <legend><h2>TTS (Piper)</h2></legend>
+                    <div class="form-control checkbox-group">
+                        <input type="checkbox" id="tts-piper-cuda" name="tts_settings.piper.use_cuda" {% if config.tts_settings.piper.get('use_cuda') %}checked{% endif %}>
+                        <label for="tts-piper-cuda">Use CUDA (GPU)</label>
+                    </div>
+                    <div class="form-control">
+                        <label for="tts-piper-length">Length Scale</label>
+                        <input type="number" step="0.1" id="tts-piper-length" name="tts_settings.piper.synthesis_config.length_scale" value="{{ config.tts_settings.piper.synthesis_config.get('length_scale', 1.0) }}" class="form-input">
+                    </div>
+                    <div class="form-control">
+                        <label for="tts-piper-noise">Noise Scale</label>
+                        <input type="number" step="0.1" id="tts-piper-noise" name="tts_settings.piper.synthesis_config.noise_scale" value="{{ config.tts_settings.piper.synthesis_config.get('noise_scale', 0.667) }}" class="form-input">
+                    </div>
+                    <div class="form-control">
+                        <label for="tts-piper-noise-w">Noise W</label>
+                        <input type="number" step="0.1" id="tts-piper-noise-w" name="tts_settings.piper.synthesis_config.noise_w" value="{{ config.tts_settings.piper.synthesis_config.get('noise_w', 0.8) }}" class="form-input">
                     </div>
                 </fieldset>
 

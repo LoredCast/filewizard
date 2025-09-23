@@ -30,11 +30,13 @@ import time
 import ocrmypdf
 import pypdf
 import pytesseract
+from fastapi.middleware.cors import CORSMiddleware
 from pytesseract import TesseractNotFoundError
 from PIL import Image, UnidentifiedImageError
 from faster_whisper import WhisperModel
 from fastapi import (Depends, FastAPI, File, Form, HTTPException, Request,
                      UploadFile, status, Body)
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -130,9 +132,20 @@ def _limit_resources_preexec():
         logging.getLogger(__name__).warning(f"Could not set resource limits: {e}")
         pass
 
-# --- Model concurrency semaphore ---
-MODEL_CONCURRENCY = int(os.environ.get("MODEL_CONCURRENCY", "1"))
-_model_semaphore = Semaphore(MODEL_CONCURRENCY)
+# --- Model concurrency semaphore (lazily initialized) ---
+_model_semaphore: Optional[Semaphore] = None
+
+def get_model_semaphore() -> Semaphore:
+    """Lazily initializes and returns the global model semaphore."""
+    global _model_semaphore
+    if _model_semaphore is None:
+        # Read from app config, fall back to env var, then to a hardcoded default of 1
+        model_concurrency_from_env = int(os.environ.get("MODEL_CONCURRENCY", "1"))
+        model_concurrency = APP_CONFIG.get("app_settings", {}).get("model_concurrency", model_concurrency_from_env)
+        _model_semaphore = Semaphore(model_concurrency)
+        logger.info(f"Model concurrency semaphore initialized with limit: {model_concurrency}")
+    return _model_semaphore
+
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -176,6 +189,7 @@ def load_app_config():
     """
     Loads configuration from settings.yml, with a fallback to settings.default.yml,
     and finally to hardcoded defaults if both files are missing.
+    Reads environment variables for transcription device settings.
     """
     global APP_CONFIG
     try:
@@ -183,9 +197,33 @@ def load_app_config():
         with open(PATHS.SETTINGS_FILE, 'r', encoding='utf8') as f:
             cfg_raw = yaml.safe_load(f) or {}
 
+        # Read transcription settings from environment variables, providing smart defaults.
+        transcription_device = os.environ.get("TRANSCRIPTION_DEVICE", "cpu")
+        # Default to float16 for CUDA for better performance, otherwise int8 for CPU.
+        default_compute_type = "float16" if transcription_device == "cuda" else "int8"
+        transcription_compute_type = os.environ.get("TRANSCRIPTION_COMPUTE_TYPE", default_compute_type)
+        transcription_device_index_str = os.environ.get("TRANSCRIPTION_DEVICE_INDEX", "0")
+
+        # Handle multiple device indexes (e.g., "0,1")
+        try:
+            if ',' in transcription_device_index_str:
+                transcription_device_index = [int(i.strip()) for i in transcription_device_index_str.split(',')]
+            else:
+                transcription_device_index = int(transcription_device_index_str)
+        except ValueError:
+            logger.warning(f"Invalid TRANSCRIPTION_DEVICE_INDEX value: '{transcription_device_index_str}'. Defaulting to 0.")
+            transcription_device_index = 0
+
         defaults = {
             "app_settings": {"max_file_size_mb": 100, "allowed_all_extensions": [], "app_public_url": ""},
-            "transcription_settings": {"whisper": {"allowed_models": ["tiny", "base", "small"], "compute_type": "int8", "device": "cpu"}},
+            "transcription_settings": {
+                "whisper": {
+                    "allowed_models": ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3"],
+                    "compute_type": transcription_compute_type,
+                    "device": transcription_device,
+                    "device_index": transcription_device_index
+                }
+            },
             "tts_settings": {
                 "piper": {"model_dir": str(PATHS.TTS_MODELS_DIR), "use_cuda": False, "synthesis_config": {"length_scale": 1.0, "noise_scale": 0.667, "noise_w": 0.8}},
                 "kokoro": {"model_dir": str(PATHS.KOKORO_TTS_MODELS_DIR), "command_template": "kokoro-tts {input} {output} --model {model_path} --voices {voices_path} --lang {lang} --voice {model_name}"}
@@ -369,6 +407,8 @@ def create_job(db: Session, job: JobCreate):
     db.add(db_job)
     db.commit()
     db.refresh(db_job)
+    # Broadcast the new job to UI clients via Huey task
+    job_schema = JobSchema.model_validate(db_job)
     return db_job
 
 def update_job_status(db: Session, job_id: str, status: str, progress: int = None, error: str = None):
@@ -381,6 +421,8 @@ def update_job_status(db: Session, job_id: str, status: str, progress: int = Non
             db_job.error_message = error
         db.commit()
         db.refresh(db_job)
+        # Broadcast the updated job to UI clients via Huey task
+        job_schema = JobSchema.model_validate(db_job)
     return db_job
 
 def mark_job_as_completed(db: Session, job_id: str, output_filepath_str: str | None = None, preview: str | None = None):
@@ -398,6 +440,9 @@ def mark_job_as_completed(db: Session, job_id: str, output_filepath_str: str | N
             except Exception:
                 logger.exception(f"Could not stat output file {output_filepath_str} for job {job_id}")
         db.commit()
+        db.refresh(db_job)
+        # Broadcast the final job state to UI clients via Huey task
+        job_schema = JobSchema.model_validate(db_job)
 
     return db_job
 
@@ -461,45 +506,99 @@ huey = SqliteHuey(filename=PATHS.HUEY_DB_PATH)
 WHISPER_MODELS_CACHE: Dict[str, WhisperModel] = {}
 PIPER_VOICES_CACHE: Dict[str, "PiperVoice"] = {}
 AVAILABLE_TTS_VOICES_CACHE: Dict[str, Any] | None = None
+WHISPER_MODELS_LAST_USED: Dict[str, float] = {}
 
-
+# --- Cache Eviction Settings ---
+_cache_cleanup_thread: Optional[threading.Thread] = None
+_cache_lock = threading.Lock() # Global lock for modifying cache dictionaries
 _model_locks: Dict[str, threading.Lock] = {}
-_global_lock = threading.Lock()
+_global_lock = threading.Lock() # Lock for initializing model-specific locks
+
+def _whisper_cache_cleanup_worker():
+    """
+    Periodically checks for and unloads Whisper models that have been inactive.
+    The timeout and check interval are configured in the application settings.
+    """
+    while True:
+        # Read settings within the loop to allow for live changes
+        app_settings = APP_CONFIG.get("app_settings", {})
+        check_interval = app_settings.get("cache_check_interval", 300)
+        inactivity_timeout = app_settings.get("model_inactivity_timeout", 1800)
+
+        time.sleep(check_interval)
+
+        with _cache_lock:
+            # Create a copy of items to avoid issues with modifying dict while iterating
+            expired_models = []
+            for model_size, last_used in WHISPER_MODELS_LAST_USED.items():
+                if time.time() - last_used > inactivity_timeout:
+                    expired_models.append(model_size)
+
+            if not expired_models:
+                continue
+
+            logger.info(f"Found {len(expired_models)} inactive Whisper models to unload: {expired_models}")
+
+            for model_size in expired_models:
+                # Acquire the specific model lock before removing to prevent race conditions
+                model_lock = _get_or_create_model_lock(model_size)
+                with model_lock:
+                    # Check if the model is still in the cache (it should be)
+                    if model_size in WHISPER_MODELS_CACHE:
+                        logger.info(f"Unloading inactive Whisper model: {model_size}")
+                        # Remove from caches
+                        model_to_unload = WHISPER_MODELS_CACHE.pop(model_size, None)
+                        WHISPER_MODELS_LAST_USED.pop(model_size, None)
+
+                        # Explicitly delete the object to encourage garbage collection
+                        if model_to_unload:
+                            del model_to_unload
+
+        # Explicitly run garbage collection outside the main lock
+        import gc
+        gc.collect()
 
 def get_whisper_model(model_size: str, whisper_settings: dict) -> Any:
-    # Fast path: cache hit without any locking
-    if model_size in WHISPER_MODELS_CACHE:
-        logger.debug(f"Cache hit for model '{model_size}'")
-        return WHISPER_MODELS_CACHE[model_size]
-    
-    # Prepare for potential load with minimal contention
-    model_lock = _get_or_create_model_lock(model_size)
-    
-    # Critical section: check cache again under model-specific lock
-    with model_lock:
+    # Fast path: check cache. If hit, update timestamp and return.
+    with _cache_lock:
         if model_size in WHISPER_MODELS_CACHE:
+            logger.debug(f"Cache hit for model '{model_size}'")
+            WHISPER_MODELS_LAST_USED[model_size] = time.time()
             return WHISPER_MODELS_CACHE[model_size]
-            
+
+    # Model not in cache, prepare for loading.
+    model_lock = _get_or_create_model_lock(model_size)
+
+    with model_lock:
+        # Re-check cache inside lock in case another thread loaded it
+        with _cache_lock:
+            if model_size in WHISPER_MODELS_CACHE:
+                WHISPER_MODELS_LAST_USED[model_size] = time.time()
+                return WHISPER_MODELS_CACHE[model_size]
+
         logger.info(f"Loading Whisper model '{model_size}'...")
         try:
-            # Optimized initialization with validated settings
             device = whisper_settings.get("device", "cpu")
             compute_type = whisper_settings.get("compute_type", "int8")
-            
-            # fast_whisper-specific optimizations
+            device_index = whisper_settings.get("device_index", 0)
+
             model = WhisperModel(
                 model_size,
                 device=device,
+                device_index=device_index,
                 compute_type=compute_type,
-                cpu_threads=max(1, os.cpu_count() // 2),  # Prevent CPU oversubscription
-                num_workers=1  # Optimal for most transcription workloads
+                cpu_threads=max(1, os.cpu_count() // 2),
+                num_workers=1
             )
-            
-            # Atomic cache update
-            WHISPER_MODELS_CACHE[model_size] = model
+
+            # Add the new model to the cache under lock
+            with _cache_lock:
+                WHISPER_MODELS_CACHE[model_size] = model
+                WHISPER_MODELS_LAST_USED[model_size] = time.time()
+
             logger.info(f"Model '{model_size}' loaded (device={device}, compute={compute_type})")
             return model
-            
+
         except Exception as e:
             logger.error(f"Model '{model_size}' failed to load: {str(e)}", exc_info=True)
             raise RuntimeError(f"Whisper model initialization failed: {e}") from e
@@ -509,7 +608,7 @@ def _get_or_create_model_lock(model_size: str) -> threading.Lock:
     # Fast path: lock already exists
     if model_size in _model_locks:
         return _model_locks[model_size]
-    
+
     # Slow path: create lock under global lock
     with _global_lock:
         return _model_locks.setdefault(model_size, threading.Lock())
@@ -543,7 +642,7 @@ def get_piper_voice(model_name: str, tts_settings: dict | None) -> "PiperVoice":
         logger.info("Reusing cached Piper voice '%s'.", model_name)
         return PIPER_VOICES_CACHE[model_name]
 
-    with _model_semaphore:
+    with get_model_semaphore():
         if model_name in PIPER_VOICES_CACHE:
             return PIPER_VOICES_CACHE[model_name]
 
@@ -963,178 +1062,46 @@ def list_kokoro_languages_cli(timeout: int = 60) -> List[str]:
 
 def run_command(
     argv: List[str],
-    timeout: int = 300,
-    max_output_size: int = 5 * 1024 * 1024  # 5MB
+    timeout: int = 300
 ) -> subprocess.CompletedProcess:
     """
-    Drop-in replacement for your run_command.
-    - Incrementally reads stdout/stderr in separate threads to avoid unbounded memory growth.
-    - Keeps at most `max_output_size` characters per stream (first N chars).
-    - Enforces a timeout (graceful terminate then kill).
-    - Uses optional preexec function `_limit_resources_preexec` if present in globals.
-    - Raises Exception on non-zero exit or timeout; returns CompletedProcess on success.
+    Executes a command, captures its output, and handles timeouts and errors.
+    Uses resource limits for child processes. This is a simplified, more robust
+    implementation using subprocess.run.
     """
-    logger.debug("Executing command: %s with timeout=%ss", " ".join(argv), timeout)
-
-    # quick sanity: ensure there's a program to execute (improves error clarity)
-    try:
-        exe = argv[0]
-    except Exception:
-        raise Exception("Invalid argv passed to run_command")
+    logger.debug("Executing command: %s with timeout=%ss", " ".join(shlex.quote(s) for s in argv), timeout)
 
     preexec = globals().get("_limit_resources_preexec", None)
 
-    # Buffers and state for threads
-    stdout_chunks = []
-    stderr_chunks = []
-    stdout_len = 0
-    stderr_len = 0
-    stdout_lock = threading.Lock()
-    stderr_lock = threading.Lock()
-    stdout_truncated = False
-    stderr_truncated = False
-
-    def _reader(stream, chunks, lock, name):
-        nonlocal stdout_len, stderr_len, stdout_truncated, stderr_truncated
-        try:
-            while True:
-                data = stream.read(4096)
-                if not data:
-                    break
-                with lock:
-                    # choose which counters to use by stream identity
-                    if name == "stdout":
-                        if stdout_len < max_output_size:
-                            # append as much as fits
-                            remaining = max_output_size - stdout_len
-                            to_append = data[:remaining]
-                            chunks.append(to_append)
-                            stdout_len += len(to_append)
-                            if len(data) > remaining:
-                                stdout_truncated = True
-                        else:
-                            stdout_truncated = True
-                    else:
-                        if stderr_len < max_output_size:
-                            remaining = max_output_size - stderr_len
-                            to_append = data[:remaining]
-                            chunks.append(to_append)
-                            stderr_len += len(to_append)
-                            if len(data) > remaining:
-                                stderr_truncated = True
-                        else:
-                            stderr_truncated = True
-        except Exception:
-            logger.exception("Reader thread for %s failed", name)
-        finally:
-            try:
-                stream.close()
-            except Exception:
-                pass
-
-    # Start process
     try:
-        proc = subprocess.Popen(
+        # subprocess.run handles timeout, output capturing, and error checking.
+        result = subprocess.run(
             argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
+            timeout=timeout,
+            check=True,  # Raises CalledProcessError on non-zero exit
             preexec_fn=preexec
         )
+        logger.debug("Command completed successfully: %s", " ".join(shlex.quote(s) for s in argv))
+        return result
     except FileNotFoundError:
         msg = f"Command not found: {argv[0]}"
         logger.error(msg)
-        raise Exception(msg)
+        raise Exception(msg) from None
+    except subprocess.TimeoutExpired as e:
+        msg = f"Command timed out after {timeout}s: {' '.join(shlex.quote(s) for s in argv)}"
+        logger.error(msg)
+        raise Exception(msg) from e
+    except subprocess.CalledProcessError as e:
+        snippet = (e.stderr or "")[:1000]
+        msg = f"Command failed with exit code {e.returncode}. Stderr: {snippet}"
+        logger.error(msg)
+        raise Exception(msg) from e
     except Exception as e:
         msg = f"Unexpected error launching command: {e}"
         logger.exception(msg)
-        raise Exception(msg)
-
-    # Start reader threads
-    t_stdout = threading.Thread(target=_reader, args=(proc.stdout, stdout_chunks, stdout_lock, "stdout"), daemon=True)
-    t_stderr = threading.Thread(target=_reader, args=(proc.stderr, stderr_chunks, stderr_lock, "stderr"), daemon=True)
-    t_stdout.start()
-    t_stderr.start()
-
-    # Wait loop with timeout
-    start = time.monotonic()
-    try:
-        while True:
-            ret = proc.poll()
-            if ret is not None:
-                break
-            elapsed = time.monotonic() - start
-            if timeout and elapsed > timeout:
-                # Timeout -> try terminate -> kill if needed
-                logger.error("Command timed out after %ss: %s", timeout, " ".join(argv))
-                try:
-                    proc.terminate()
-                    # give it a short while to exit
-                    waited = 0.0
-                    while proc.poll() is None and waited < 2.0:
-                        time.sleep(0.1)
-                        waited += 0.1
-                except Exception:
-                    logger.exception("Failed to terminate process on timeout; attempting kill.")
-                if proc.poll() is None:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        logger.exception("Failed to kill process after timeout.")
-                # ensure threads finish reading leftover data
-                try:
-                    t_stdout.join(timeout=1.0)
-                    t_stderr.join(timeout=1.0)
-                except Exception:
-                    pass
-                raise Exception(f"Command timed out after {timeout}s: {' '.join(argv)}")
-
-            # sleep a little to avoid busy loop
-            time.sleep(0.1)
-
-        # process finished normally; allow readers to finish
-        t_stdout.join(timeout=2.0)
-        t_stderr.join(timeout=2.0)
-
-        # build strings from chunks
-        with stdout_lock:
-            stdout_str = "".join(stdout_chunks) if stdout_chunks else ""
-            if stdout_truncated:
-                truncated_amount = " (truncated to max_output_size)"
-                stdout_str += f"\n[TRUNCATED - output larger than {max_output_size} bytes]{truncated_amount}"
-        with stderr_lock:
-            stderr_str = "".join(stderr_chunks) if stderr_chunks else ""
-            if stderr_truncated:
-                truncated_amount = " (truncated to max_output_size)"
-                stderr_str += f"\n[TRUNCATED - output larger than {max_output_size} bytes]{truncated_amount}"
-
-        # Check return code
-        rc = proc.returncode
-        if rc != 0:
-            # include limited stderr snippet for diagnostics (like your original)
-            snippet = (stderr_str or "")[:1000]
-            msg = f"Command failed with exit code {rc}. Stderr: {snippet}"
-            logger.error(msg)
-            raise Exception(msg)
-
-        logger.debug("Command completed successfully: %s", " ".join(argv))
-        return subprocess.CompletedProcess(args=argv, returncode=rc, stdout=stdout_str, stderr=stderr_str)
-
-    finally:
-        # ensure no resource leaks
-        try:
-            if proc.stdout:
-                try:
-                    proc.stdout.close()
-                except Exception:
-                    pass
-            if proc.stderr:
-                try:
-                    proc.stderr.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        raise Exception(msg) from e
 
 def validate_and_build_command(template_str: str, mapping: Dict[str, str]) -> TypingList[str]:
     fmt = Formatter()
@@ -1147,12 +1114,21 @@ def validate_and_build_command(template_str: str, mapping: Dict[str, str]) -> Ty
     bad = used - ALLOWED_VARS
     if bad:
         raise ValueError(f"Command template contains disallowed placeholders: {bad}")
+
     safe_mapping = dict(mapping)
     for name in used:
         if name not in safe_mapping:
             safe_mapping[name] = safe_mapping.get("output_ext", "") if name == "filter" else ""
-    formatted = template_str.format(**safe_mapping)
-    return shlex.split(formatted)
+
+    # Securely build the command by splitting the template BEFORE formatting.
+    # This prevents argument injection if a value in the mapping (e.g. a filename)
+    # contains spaces or other shell-special characters.
+    command_parts = shlex.split(template_str)
+
+    formatted_command = [part.format(**safe_mapping) for part in command_parts]
+
+    # Filter out any empty strings that result from empty optional placeholders
+    return [part for part in formatted_command if part]
 
 # --- TASK RUNNERS ---
 @huey.task()
@@ -1182,9 +1158,9 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
         segments_generator, info = model.transcribe(str(input_path), beam_size=5)
         logger.info(f"Detected language: {info.language} with probability {info.language_probability:.2f} for a duration of {info.duration:.2f}s")
 
-        
+
         last_update_time = time.time()
-        
+
         # Use a temporary file to ensure atomic writes. The final file will only appear
         # once the transcription is fully and successfully written.
         tmp_output_path = output_path.with_name(f"{output_path.stem}.tmp-{uuid.uuid4().hex}{output_path.suffix}")
@@ -1204,7 +1180,7 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
                     preview_segments.append(segment_text)
                     current_preview_length += len(segment_text)
 
-                
+
                 current_time = time.time()
                 if current_time - last_update_time > DB_POLL_INTERVAL_SECONDS:
                     last_update_time = current_time
@@ -1222,7 +1198,7 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
                         update_job_status(db, job_id, "processing", progress=progress)
 
         tmp_output_path.replace(output_path)
-        
+
         transcript_preview = " ".join(preview_segments)
         if len(transcript_preview) > PREVIEW_MAX_LENGTH:
             transcript_preview = transcript_preview[:PREVIEW_MAX_LENGTH] + "..."
@@ -1237,7 +1213,7 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
     finally:
         # This block executes whether the task succeeded, failed, or was cancelled and returned.
         logger.debug(f"Performing cleanup for job {job_id}")
-        
+
         # Clean up the temporary file if it still exists (e.g., due to cancellation)
         if 'tmp_output_path' in locals() and tmp_output_path.exists():
             try:
@@ -1254,10 +1230,19 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
             logger.debug(f"Removed input file: {input_path}")
         except Exception as e:
             logger.exception(f"Failed to cleanup input file {input_path} for job {job_id}: {e}")
-        
+
         if db:
             db.close()
-        
+
+        # If this was a sub-job, trigger a progress update for its parent.
+        db_for_check = SessionLocal()
+        try:
+            job = get_job(db_for_check, job_id)
+            if job and job.parent_job_id:
+                _update_parent_zip_job_progress(job.parent_job_id)
+        finally:
+            db_for_check.close()
+
         # Send notification last, after all state has been finalized.
         send_webhook_notification(job_id, app_config, base_url)
 
@@ -1344,6 +1329,16 @@ def run_tts_task(job_id: str, input_path_str: str, output_path_str: str, model_n
         except Exception:
             logger.exception("Failed to cleanup input file after TTS.")
         db.close()
+
+        # If this was a sub-job, trigger a progress update for its parent.
+        db_for_check = SessionLocal()
+        try:
+            job = get_job(db_for_check, job_id)
+            if job and job.parent_job_id:
+                _update_parent_zip_job_progress(job.parent_job_id)
+        finally:
+            db_for_check.close()
+
         send_webhook_notification(job_id, app_config, base_url)
 
 @huey.task()
@@ -1377,6 +1372,16 @@ def run_pdf_ocr_task(job_id: str, input_path_str: str, output_path_str: str, ocr
         except Exception:
             logger.exception("Failed to cleanup input file after PDF OCR.")
         db.close()
+
+        # If this was a sub-job, trigger a progress update for its parent.
+        db_for_check = SessionLocal()
+        try:
+            job = get_job(db_for_check, job_id)
+            if job and job.parent_job_id:
+                _update_parent_zip_job_progress(job.parent_job_id)
+        finally:
+            db_for_check.close()
+
         send_webhook_notification(job_id, app_config, base_url)
 
 @huey.task()
@@ -1493,6 +1498,16 @@ def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, a
             db.close()
         except Exception:
             logger.exception("Failed to close DB session after Image OCR.")
+
+        # If this was a sub-job, trigger a progress update for its parent.
+        db_for_check = SessionLocal()
+        try:
+            job = get_job(db_for_check, job_id)
+            if job and job.parent_job_id:
+                _update_parent_zip_job_progress(job.parent_job_id)
+        finally:
+            db_for_check.close()
+
         # send webhook regardless of success/failure (keeps original behavior)
         try:
             send_webhook_notification(job_id, app_config, base_url)
@@ -1756,6 +1771,15 @@ def run_conversion_task(job_id: str,
         except Exception:
             logger.exception("Failed to close DB session after conversion.")
 
+        # If this was a sub-job, trigger a progress update for its parent.
+        db_for_check = SessionLocal()
+        try:
+            job = get_job(db_for_check, job_id)
+            if job and job.parent_job_id:
+                _update_parent_zip_job_progress(job.parent_job_id)
+        finally:
+            db_for_check.close()
+
         try:
             gc.collect()
         except Exception:
@@ -1820,27 +1844,214 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
             run_pdf_ocr_task(job_data.id, str(final_path), str(processed_path), app_config.get("ocr_settings", {}).get("ocrmypdf", {}), app_config, base_url)
     elif task_type == "conversion":
         try:
-            tool, task_key = options.get("output_format").split('_', 1)
+            logger.info(f"Preparing to dispatch conversion job for file '{original_filename}' with requested format '{options.get('output_format')}'")
+            all_tools = app_config.get("conversion_tools", {}).keys()
+            logger.info(f"Available conversion tools: {', '.join(all_tools)}")
+            tool, task_key = _parse_tool_and_task_key(options.get("output_format"), all_tools)
+            logger.info(f"Dispatching conversion job using tool '{tool}' with task key '{task_key}' for file '{original_filename}'")
         except (AttributeError, ValueError):
-            logger.error(f"Invalid or missing output_format for conversion of {original_filename}")
-            final_path.unlink(missing_ok=True)
-            return
+            if parent_job_id:
+                logger.warning(f"Skipping file '{original_filename}' from batch job '{parent_job_id}' as it is not applicable for the selected conversion format '{options.get('output_format')}'.")
+                final_path.unlink(missing_ok=True)
+                return
+            else:
+                logger.error(f"Invalid or missing output_format for conversion of {original_filename}")
+                final_path.unlink(missing_ok=True)
+                return
+
         original_stem = Path(safe_filename).stem
-        target_ext = task_key.split('_')[0]
-        if tool == "ghostscript_pdf": target_ext = "pdf"
-        processed_path = PATHS.PROCESSED_DIR / f"{original_stem}_{job_id}.{target_ext}"
-        job_data.processed_filepath = str(processed_path)
-        create_job(db=db, job=job_data)
-        run_conversion_task(job_data.id, str(final_path), str(processed_path), tool, task_key, app_config.get("conversion_tools", {}), app_config, base_url)
+
+        if tool == 'pandoc_academic':
+            processed_path = PATHS.PROCESSED_DIR / f"{original_stem}_{job_id}.pdf"
+            job_data.processed_filepath = str(processed_path)
+            job_data.task_type = 'academic_pandoc' # Use a more specific task type for the DB
+            create_job(db=db, job=job_data)
+            run_academic_pandoc_task(job_data.id, str(final_path), str(processed_path), task_key, APP_CONFIG, base_url)
+        else:
+            target_ext = task_key.split('_')[0]
+            if tool == "ghostscript_pdf": target_ext = "pdf"
+            processed_path = PATHS.PROCESSED_DIR / f"{original_stem}_{job_id}.{target_ext}"
+            job_data.processed_filepath = str(processed_path)
+            create_job(db=db, job=job_data)
+            run_conversion_task(job_data.id, str(final_path), str(processed_path), tool, task_key, app_config.get("conversion_tools", {}), app_config, base_url)
     else:
         logger.error(f"Invalid task type '{task_type}' for file {original_filename}")
         final_path.unlink(missing_ok=True)
+
+@huey.task()
+def run_academic_pandoc_task(job_id: str, input_path_str: str, output_path_str: str, task_key: str, app_config: dict, base_url: str):
+    """
+    Runs a Pandoc conversion for a zipped academic project (e.g., markdown + bibliography).
+    """
+    db = SessionLocal()
+    input_path = Path(input_path_str)
+    output_path = Path(output_path_str)
+    unzip_dir = PATHS.UPLOADS_DIR / f"unzipped_{job_id}"
+
+    def find_first_file_with_ext(directory: Path, extensions: List[str]) -> Optional[Path]:
+        for ext in extensions:
+            try:
+                return next(directory.rglob(f"*{ext}"))
+            except StopIteration:
+                continue
+        return None
+
+    try:
+        job = get_job(db, job_id)
+        if not job or job.status == 'cancelled':
+            return
+
+        update_job_status(db, job_id, "processing", progress=10)
+        logger.info(f"Starting academic Pandoc task for job {job_id}")
+
+        # 1. Unzip the project
+        if not zipfile.is_zipfile(input_path):
+            raise ValueError("Input is not a valid ZIP archive.")
+        unzip_dir.mkdir()
+        with zipfile.ZipFile(input_path, 'r') as zip_ref:
+            zip_ref.extractall(unzip_dir)
+
+        update_job_status(db, job_id, "processing", progress=25)
+
+        # 2. Find required files
+        main_doc = find_first_file_with_ext(unzip_dir, ['.md', '.tex', '.txt'])
+        bib_file = find_first_file_with_ext(unzip_dir, ['.bib'])
+        csl_file = find_first_file_with_ext(unzip_dir, ['.csl'])
+
+        if not main_doc:
+            raise FileNotFoundError("No main document (.md, .tex, .txt) found in the ZIP archive.")
+        if not bib_file:
+            raise FileNotFoundError("No bibliography file (.bib) found in the ZIP archive.")
+
+        update_job_status(db, job_id, "processing", progress=40)
+
+        # 3. Build Pandoc command
+        command = ['pandoc', str(main_doc), '-o', str(output_path)]
+        command.extend(['--bibliography', str(bib_file)])
+        command.append('--citeproc') # Use the citation processor
+
+        # Handle CSL style
+        style_key = task_key.split('_')[-1] # e.g., 'apa' from 'pdf_apa'
+        csl_path_or_url = None
+
+        if csl_file:
+            logger.info(f"Using CSL file found in ZIP: {csl_file.name}")
+            csl_path_or_url = str(csl_file)
+        else:
+            # Look up CSL from config
+            try:
+                csl_path_or_url = app_config['academic_settings']['pandoc']['csl_files'][style_key]
+                logger.info(f"Using CSL style '{style_key}' from configuration.")
+            except KeyError:
+                logger.warning(f"No CSL style found for key '{style_key}'. Pandoc will use its default.")
+
+        if csl_path_or_url:
+            command.extend(['--csl', csl_path_or_url])
+
+        command.extend(['--pdf-engine', 'xelatex'])
+
+        update_job_status(db, job_id, "processing", progress=50)
+        logger.info(f"Executing Pandoc command for job {job_id}: {' '.join(command)}")
+
+        # 4. Execute command directly to control working directory and error capture
+        try:
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=True,  # Raise CalledProcessError on non-zero exit
+                cwd=unzip_dir, # Run pandoc in the unzipped directory
+                preexec_fn=globals().get("_limit_resources_preexec", None)
+            )
+        except subprocess.CalledProcessError as e:
+            # Capture the full, detailed error log from pandoc/latex
+            error_log = e.stderr or "No stderr output."
+            logger.error(f"Pandoc compilation failed. Full log:\n{error_log}")
+            # Raise a more informative exception for the user
+            raise Exception(f"Pandoc compilation failed. Please check your document for errors. Log: {error_log[:2000]}") from e
+
+        # 5. Verify output
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise Exception("Pandoc conversion failed: The tool produced an empty or missing output file.")
+
+        mark_job_as_completed(db, job_id, output_filepath_str=str(output_path), preview="Successfully created academic PDF.")
+        logger.info(f"Academic Pandoc task for job {job_id} completed.")
+
+    except Exception as e:
+        logger.exception(f"ERROR during academic Pandoc task for job {job_id}")
+        update_job_status(db, job_id, "failed", error=f"Pandoc task failed: {e}")
+    finally:
+        # 6. Cleanup
+        if unzip_dir.exists():
+            shutil.rmtree(unzip_dir, ignore_errors=True)
+        try:
+            ensure_path_is_safe(input_path, [PATHS.UPLOADS_DIR, PATHS.CHUNK_TMP_DIR])
+            input_path.unlink(missing_ok=True)
+        except Exception:
+            logger.exception("Failed to cleanup input ZIP file after Pandoc task.")
+
+        if db:
+            db.close()
+
+        # If this was a sub-job, trigger a progress update for its parent.
+        db_for_check = SessionLocal()
+        try:
+            job = get_job(db_for_check, job_id)
+            if job and job.parent_job_id:
+                _update_parent_zip_job_progress(job.parent_job_id)
+        finally:
+            db_for_check.close()
+
+        send_webhook_notification(job_id, app_config, base_url)
+
+
+@huey.task()
+def _update_parent_zip_job_progress(parent_job_id: str):
+    """Checks and updates the progress of a parent 'unzip' job."""
+    db = SessionLocal()
+    try:
+        parent_job = get_job(db, parent_job_id)
+        if not parent_job or parent_job.status not in ['processing', 'pending']:
+            return # Job is already finalized or doesn't exist
+
+        child_jobs = db.query(Job).filter(Job.parent_job_id == parent_job.id).all()
+        total_children = len(child_jobs)
+
+        if total_children == 0:
+            return # Should not happen if dispatched correctly, but safeguard.
+
+        finished_children = 0
+        for child in child_jobs:
+            if child.status in ['completed', 'failed', 'cancelled']:
+                finished_children += 1
+
+        progress = int((finished_children / total_children) * 100) if total_children > 0 else 100
+
+        if finished_children == total_children:
+            failed_count = sum(1 for child in child_jobs if child.status == 'failed')
+            preview = f"Batch processing complete. {total_children - failed_count}/{total_children} tasks succeeded."
+            if failed_count > 0:
+                preview += f" ({failed_count} failed)."
+            mark_job_as_completed(db, parent_job.id, preview=preview)
+            logger.info(f"Batch job {parent_job.id} marked as completed.")
+        else:
+            if parent_job.progress != progress:
+                update_job_status(db, parent_job.id, 'processing', progress=progress)
+
+    except Exception as e:
+        logger.exception(f"Error in _update_parent_zip_job_progress for parent {parent_job_id}: {e}")
+    finally:
+        db.close()
+
 
 @huey.task()
 def unzip_and_dispatch_task(job_id: str, input_path_str: str, sub_task_type: str, sub_task_options: dict, user: dict, app_config: dict, base_url: str):
     db = SessionLocal()
     input_path = Path(input_path_str)
     unzip_dir = PATHS.UPLOADS_DIR / f"unzipped_{job_id}"
+    logger.info(f"Starting unzip and dispatch task for job {job_id} into {sub_task_type} jobs. ")
+
     try:
         if not zipfile.is_zipfile(input_path):
             raise ValueError("Uploaded file is not a valid ZIP archive.")
@@ -1886,61 +2097,23 @@ def unzip_and_dispatch_task(job_id: str, input_path_str: str, sub_task_type: str
             logger.exception("Failed to cleanup original ZIP file.")
         db.close()
 
-@huey.periodic_task(crontab(minute='*/1'))  # Runs every 1 minutes
-def update_unzip_job_progress():
-    """Periodically checks and updates the progress of parent 'unzip' jobs."""
-    db = SessionLocal()
-    try:
-        # Find all 'unzip' jobs that are still marked as 'processing'
-        parent_jobs_to_check = db.query(Job).filter(
-            Job.task_type == 'unzip',
-            Job.status == 'processing'
-        ).all()
 
-        if not parent_jobs_to_check:
-            return # Nothing to do
-
-        logger.info(f"Checking progress for {len(parent_jobs_to_check)} active batch jobs.")
-
-        for parent_job in parent_jobs_to_check:
-            # Find all children of this parent job
-            child_jobs = db.query(Job).filter(Job.parent_job_id == parent_job.id).all()
-            total_children = len(child_jobs)
-
-            if total_children == 0:
-                # This case shouldn't happen if unzip_and_dispatch_task works, but as a safeguard:
-                mark_job_as_completed(db, parent_job.id, preview="Batch job completed with no sub-tasks.")
-                continue
-
-            finished_children = 0
-            for child in child_jobs:
-                if child.status in ['completed', 'failed', 'cancelled']:
-                    finished_children += 1
-            
-            # Calculate and update progress
-            progress = int((finished_children / total_children) * 100) if total_children > 0 else 100
-            
-            if finished_children == total_children:
-                # All children are done, mark the parent as completed
-                failed_count = sum(1 for child in child_jobs if child.status == 'failed')
-                preview = f"Batch processing complete. {total_children - failed_count}/{total_children} tasks succeeded."
-                if failed_count > 0:
-                    preview += f" ({failed_count} failed)."
-                mark_job_as_completed(db, parent_job.id, preview=preview)
-                logger.info(f"Batch job {parent_job.id} marked as completed.")
-            else:
-                # Update the progress if it has changed
-                if parent_job.progress != progress:
-                    update_job_status(db, parent_job.id, 'processing', progress=progress)
-
-    except Exception as e:
-        logger.exception(f"Error in periodic task update_unzip_job_progress: {e}")
-    finally:
-        db.close()
 
 # --------------------------------------------------------------------------------
 # --- 5. FASTAPI APPLICATION
 # --------------------------------------------------------------------------------
+
+# --- SSE Broadcaster for real-time UI updates ---
+import asyncio
+import json
+
+
+
+
+
+# --------------------------------------------------------------------------------
+# --- 2. DATABASE & Schemas
+
 async def download_kokoro_models_if_missing():
     """Checks for Kokoro TTS model files and downloads them if they don't exist."""
     files_to_download = {
@@ -2001,6 +2174,13 @@ async def lifespan(app: FastAPI):
 
     load_app_config()
 
+    # Start the cache cleanup thread
+    global _cache_cleanup_thread
+    if _cache_cleanup_thread is None:
+        _cache_cleanup_thread = threading.Thread(target=_whisper_cache_cleanup_worker, daemon=True)
+        _cache_cleanup_thread.start()
+        logger.info("Whisper model cache cleanup thread started.")
+
     # Download required models on startup
     if shutil.which("kokoro-tts"):
         await download_kokoro_models_if_missing()
@@ -2047,6 +2227,14 @@ app.add_middleware(
     https_only=False, # Set to True if behind HTTPS proxy
     same_site='lax',
     max_age=14 * 24 * 60 * 60  # 14 days
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
 )
 
 
@@ -2144,28 +2332,59 @@ async def upload_chunk(
     temp_dir.mkdir(exist_ok=True)
     chunk_path = temp_dir / f"{chunk_number}.chunk"
 
-    try:
-        with open(chunk_path, "wb") as buffer:
-            shutil.copyfileobj(chunk.file, buffer)
-    finally:
-        chunk.file.close()
+    def save_chunk_sync():
+        try:
+            with open(chunk_path, "wb") as buffer:
+                shutil.copyfileobj(chunk.file, buffer)
+        finally:
+            chunk.file.close()
+
+    await run_in_threadpool(save_chunk_sync)
+
     return JSONResponse({"message": f"Chunk {chunk_number} for {safe_upload_id} uploaded."})
 
+
 async def _stitch_chunks(temp_dir: Path, final_path: Path, total_chunks: int):
-    """Stitches chunks together and cleans up."""
+    """Stitches chunks together memory-efficiently and cleans up."""
     ensure_path_is_safe(temp_dir, [PATHS.CHUNK_TMP_DIR])
     ensure_path_is_safe(final_path, [PATHS.UPLOADS_DIR])
-    with open(final_path, "wb") as final_file:
-        for i in range(total_chunks):
-            chunk_path = temp_dir / f"{i}.chunk"
-            if not chunk_path.exists():
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                raise HTTPException(status_code=400, detail=f"Upload failed: missing chunk {i}")
-            with open(chunk_path, "rb") as chunk_file:
-                final_file.write(chunk_file.read())
-    shutil.rmtree(temp_dir, ignore_errors=True)
 
-@app.post("/upload/finalize", status_code=status.HTTP_202_ACCEPTED)
+    # This is a blocking function that will be run in a threadpool
+    def do_stitch():
+        with open(final_path, "wb") as final_file:
+            for i in range(total_chunks):
+                chunk_path = temp_dir / f"{i}.chunk"
+                if not chunk_path.exists():
+                    # Raise an exception that can be caught and handled
+                    raise FileNotFoundError(f"Upload failed: missing chunk {i}")
+                with open(chunk_path, "rb") as chunk_file:
+                    # Use copyfileobj for memory efficiency
+                    shutil.copyfileobj(chunk_file, final_file)
+
+    try:
+        await run_in_threadpool(do_stitch)
+    except FileNotFoundError as e:
+        # If a chunk was missing, clean up and re-raise as HTTPException
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        # For any other error during stitching, clean up and re-raise
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise e # Re-raise the original exception
+    else:
+        # If successful, clean up the temp directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+def _parse_tool_and_task_key(output_format: str, all_tool_keys: list) -> (str, str):
+    """Robustly parses an output_format string to find the matching tool and task key."""
+    # Sort keys by length descending to match longest prefix first (e.g., 'ghostscript_image' before 'ghostscript')
+    for tool_key in sorted(all_tool_keys, key=len, reverse=True):
+        if output_format.startswith(tool_key + '_'):
+            task_key = output_format[len(tool_key) + 1:]
+            return tool_key, task_key
+    raise ValueError(f"Could not determine tool from output_format: {output_format}")
+
+@app.post("/upload/finalize", response_model=JobSchema, status_code=status.HTTP_202_ACCEPTED)
 async def finalize_upload(request: Request, payload: FinalizeUploadPayload, user: dict = Depends(require_user), db: Session = Depends(get_db)):
     safe_upload_id = secure_filename(payload.upload_id)
     temp_dir = ensure_path_is_safe(PATHS.CHUNK_TMP_DIR / safe_upload_id, [PATHS.CHUNK_TMP_DIR])
@@ -2183,7 +2402,22 @@ async def finalize_upload(request: Request, payload: FinalizeUploadPayload, user
 
     base_url = str(request.base_url)
 
-    if Path(safe_filename).suffix.lower() == '.zip':
+    # Check if the selected conversion is the new academic pandoc task
+    tool, task_key = None, None
+    if payload.task_type == 'conversion':
+        try:
+            all_tools = APP_CONFIG.get("conversion_tools", {}).keys()
+            tool, task_key = _parse_tool_and_task_key(payload.output_format, all_tools)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid or missing output_format for conversion.")
+
+    if tool == 'pandoc_academic':
+        # This is a single job that processes a ZIP file as a project.
+        options = {"output_format": payload.output_format}
+        dispatch_single_file_job(payload.original_filename, str(final_path), "conversion", user, db, APP_CONFIG, base_url, job_id=job_id, options=options)
+
+    elif Path(safe_filename).suffix.lower() == '.zip':
+        # This is the original batch processing logic for ZIP files.
         job_data = JobCreate(
             id=job_id, user_id=user['sub'], task_type="unzip",
             original_filename=payload.original_filename, input_filepath=str(final_path),
@@ -2197,10 +2431,26 @@ async def finalize_upload(request: Request, payload: FinalizeUploadPayload, user
         }
         unzip_and_dispatch_task(job_id, str(final_path), payload.task_type, sub_task_options, user, APP_CONFIG, base_url)
     else:
+        # This is the logic for all other single-file uploads.
         options = {"model_size": payload.model_size, "model_name": payload.model_name, "output_format": payload.output_format}
         dispatch_single_file_job(payload.original_filename, str(final_path), payload.task_type, user, db, APP_CONFIG, base_url, job_id=job_id, options=options)
 
-    return {"job_id": job_id, "status": "pending"}
+    # --- FIX STARTS HERE ---
+    # Instead of returning a minimal object, fetch the newly created job
+    # from the database and return the full serialized object. This ensures
+    # the frontend has all the data it needs to correctly update the UI row.
+    db.flush() # Ensure the job is available to be queried
+    db_job = get_job(db, job_id)
+    if not db_job:
+        # This is an unlikely race condition but we handle it just in case.
+        # The SSE event will still create the row correctly.
+        raise HTTPException(status_code=500, detail="Job was created but could not be retrieved for an immediate response.")
+    
+    # Also, update the function signature to use the response_model
+    # from: @app.post("/upload/finalize", status_code=status.HTTP_202_ACCEPTED)
+    # to:   @app.post("/upload/finalize", response_model=JobSchema, status_code=status.HTTP_202_ACCEPTED)
+    return db_job
+    # --- FIX ENDS HERE ---
 
 
 # --- LEGACY DIRECT-UPLOAD ROUTES (kept for compatibility) ---
@@ -2545,25 +2795,20 @@ async def get_index(request: Request):
 
 @app.get("/settings")
 async def get_settings_page(request: Request):
-    """Displays the contents of the currently active configuration file."""
+    """Displays the contents of the currently active configuration."""
     user = get_current_user(request)
     admin_status = is_admin(request)
-    current_config, config_source = {}, "none"
-    try:
-        with open(PATHS.SETTINGS_FILE, 'r', encoding='utf8') as f:
-            current_config = yaml.safe_load(f) or {}
+
+    # Use the globally loaded and merged APP_CONFIG for consistency
+    # This ensures all default keys are present before rendering.
+    current_config = APP_CONFIG
+
+    # Determine the source file for display purposes
+    config_source = "none"
+    if PATHS.SETTINGS_FILE.exists():
         config_source = str(PATHS.SETTINGS_FILE.name)
-    except FileNotFoundError:
-        try:
-            with open(PATHS.DEFAULT_SETTINGS_FILE, 'r', encoding='utf8') as f:
-                current_config = yaml.safe_load(f) or {}
-            config_source = str(PATHS.DEFAULT_SETTINGS_FILE.name)
-        except Exception as e:
-            logger.exception(f"CRITICAL: Could not load fallback config: {e}")
-            config_source = "error"
-    except Exception as e:
-        logger.exception(f"Could not load primary config: {e}")
-        config_source = "error"
+    elif PATHS.DEFAULT_SETTINGS_FILE.exists():
+        config_source = str(PATHS.DEFAULT_SETTINGS_FILE.name)
 
     return templates.TemplateResponse(
         "settings.html",
@@ -2671,6 +2916,26 @@ async def get_job_status(job_id: str, db: Session = Depends(get_db), user: dict 
         raise HTTPException(status_code=404, detail="Job not found.")
     return job
 
+
+
+class JobStatusRequest(BaseModel):
+    job_ids: TypingList[str]
+
+@app.post("/api/v1/jobs/status", response_model=TypingList[JobSchema])
+async def get_jobs_status(payload: JobStatusRequest, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+    """
+    Accepts a list of job IDs and returns their current status.
+    This is used by the frontend for polling active jobs.
+    """
+    if not payload.job_ids:
+        return []
+    
+    # Fetch all requested jobs from the database in a single query
+    jobs = db.query(Job).filter(Job.id.in_(payload.job_ids), Job.user_id == user['sub']).all()
+    return jobs
+
+
+
 @app.get("/download/{filename}")
 async def download_file(filename: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
     safe_filename = secure_filename(filename)
@@ -2730,15 +2995,15 @@ async def download_zip_batch(job_id: str, db: Session = Depends(get_db), user: d
                     download_filename = f"{Path(job.original_filename).stem}{file_path.suffix}"
                     zip_file.write(file_path, arcname=download_filename)
                     files_added += 1
-    
+
     if files_added == 0:
          raise HTTPException(status_code=404, detail="No processed files found for the completed sub-jobs.")
 
     zip_buffer.seek(0)
-    
+
     # Generate a filename for the download
     batch_filename = f"{Path(parent_job.original_filename).stem}_processed.zip"
-    
+
     return StreamingResponse(zip_buffer, media_type="application/x-zip-compressed", headers={
         'Content-Disposition': f'attachment; filename="{batch_filename}"'
     })
@@ -2756,3 +3021,4 @@ async def health():
 @app.get('/favicon.ico', include_in_schema=False)
 async def favicon():
     return FileResponse(str(PATHS.BASE_DIR / 'static' / 'favicon.png'))
+

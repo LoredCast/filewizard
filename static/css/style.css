@@ -18,7 +18,7 @@
     --border-color: rgba(255, 255, 255, 0.1);
     --divider-color: rgba(255, 255, 255, 0.06);
 
-    --font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 }
 
 /* Page */

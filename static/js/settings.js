@@ -5,47 +5,51 @@ document.addEventListener('DOMContentLoaded', () => {
     const clearHistoryBtn = document.getElementById('clear-history-btn');
     const deleteFilesBtn = document.getElementById('delete-files-btn');
 
-    // --- Save Settings ---
+    // --- Save Settings --- 
     settingsForm.addEventListener('submit', async (event) => {
         event.preventDefault();
         saveStatus.textContent = 'Saving...';
         saveStatus.classList.remove('success', 'error');
 
-        const formData = new FormData(settingsForm);
         const settingsObject = {};
+        const elements = Array.from(settingsForm.elements);
 
-        // Convert FormData to a nested object
-        formData.forEach((value, key) => {
-            // Handle checkboxes that might not be submitted if unchecked
-            if (key.includes('ocr_settings')) {
-                 const checkbox = document.querySelector(`[name="${key}"]`);
-                 if (checkbox && checkbox.type === 'checkbox') {
-                    value = checkbox.checked;
-                 }
+        for (const el of elements) {
+            if (!el.name || el.type === 'submit') continue; // Skip elements without a name and submit buttons
+
+            let value;
+            const keys = el.name.split('.');
+
+            // Determine value based on element type
+            if (el.type === 'checkbox') {
+                value = el.checked;
+            } else if (el.tagName === 'TEXTAREA') {
+                // Convert comma-separated text into an array of strings
+                value = el.value.split(',')
+                    .map(item => item.trim())
+                    .filter(item => item); // Remove empty strings from the list
+            } else if (el.type === 'number') {
+                value = parseFloat(el.value);
+                if (isNaN(value)) {
+                    value = null; // Represent empty number fields as null
+                }
+            } else {
+                value = el.value;
             }
 
-            const keys = key.split('.');
+            // Build nested object from dot-notation name
             let current = settingsObject;
             keys.forEach((k, index) => {
                 if (index === keys.length - 1) {
                     current[k] = value;
                 } else {
-                    current[k] = current[k] || {};
+                    if (!current[k]) {
+                        current[k] = {};
+                    }
                     current = current[k];
                 }
             });
-        });
-        
-        // Ensure unchecked OCR boxes are sent as false
-        const ocrCheckboxes = settingsForm.querySelectorAll('input[type="checkbox"][name^="ocr_settings"]');
-        ocrCheckboxes.forEach(cb => {
-            const keys = cb.name.split('.');
-            if (!formData.has(cb.name)) {
-                 // this is a bit of a hack but gets the job done for this specific form
-                 settingsObject[keys[0]][keys[1]][keys[2]] = false;
-            }
-        });
-
+        }
 
         try {
             const response = await fetch('/settings/save', {
@@ -74,7 +78,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // --- Clear History ---
+    // --- Clear History --- 
     clearHistoryBtn.addEventListener('click', async () => {
         if (!confirm('ARE YOU SURE?\n\nThis will permanently delete all job history records from the database.')) {
             return;
@@ -90,7 +94,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // --- Delete Files ---
+    // --- Delete Files --- 
     deleteFilesBtn.addEventListener('click', async () => {
         if (!confirm('ARE YOU SURE?\n\nThis will permanently delete all files in the "processed" folder.')) {
             return;

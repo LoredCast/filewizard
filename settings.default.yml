@@ -6,11 +6,11 @@ auth_settings:
   oidc_end_session_endpoint: https://accounts.example.com/oidc/session/end
   admin_users:
   - user@example.com
-web_hook_settings:
+webhook_settings:
   enabled: False
-  allow_chunked_api_uploads": False
-  allowed_callback_urls:
-  callback_bearer_token":
+  allow_chunked_api_uploads: False
+  allowed_callback_urls: []
+  callback_bearer_token:
 tts_settings: 
   piper: 
     model_dir: "./models/tts"
@@ -99,6 +99,13 @@ ocr_settings:
     clean: true
     optimize: 1
     force_ocr: true
+academic_settings:
+  pandoc:
+    csl_files:
+      apa: https://www.zotero.org/styles/apa
+      mla: https://www.zotero.org/styles/modern-language-association
+      chicago: https://www.zotero.org/styles/chicago-author-date
+      chicago-fullnote: https://www.zotero.org/styles/chicago-fullnote-bibliography
 transcription_settings:
   whisper:
     compute_type: int8
@@ -371,3 +378,12 @@ conversion_tools:
       jpg_q85: JPEG (High Quality)
       jpg_q75: JPEG (Web Quality)
       jpg_q60: JPEG (Aggressive Compression)
+  pandoc_academic:
+    name: Pandoc (Academic Document)
+    command_template: "pandoc {main_document} -o {output} --bibliography {bib_file} --citeproc --csl {csl_style}"
+    timeout: 300
+    formats:
+      pdf_apa: "PDF with Bibliography (APA Style)"
+      pdf_mla: "PDF with Bibliography (MLA Style)"
+      pdf_chicago: "PDF with Bibliography (Chicago Style)"
+      pdf_chicago_fullnote: "PDF with Bibliography (Chicago Full Note)"

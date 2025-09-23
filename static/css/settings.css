@@ -9,13 +9,8 @@
     border-bottom: 1px solid var(--divider-color);
 }
 
-.settings-header h1 {e
-    margin: 0 0 0.25rem 0;
-}
-
-.settings-header p {
+.settings-header h1 {
     margin: 0;
-    color: var(--muted-text);
 }
 
 .back-button {
@@ -32,11 +27,18 @@
     background-color: var(--primary-hover);
 }
 
+/* Main layout grid for settings */
+.settings-main-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+    gap: 2rem;
+}
+
 .settings-group {
     border: 1px solid var(--border-color);
     border-radius: 8px;
     padding: 1.5rem;
-    margin-bottom: 2rem;
+    margin-bottom: 2rem; /* Kept for spacing when grid stacks */
 }
 
 .settings-group legend {
@@ -70,36 +72,39 @@
 .form-textarea {
     resize: vertical;
     min-height: 60px;
-    font-family: 'Courier New', Courier, monospace;
+    /* Use a more standard monospace font stack */
+    font-family: Consolas, 'Courier New', Courier, monospace;
 }
 
 .field-description {
-    font-size: 0.85rem;
+    font-size: 0.9rem;
     color: var(--muted-text);
-    margin-top: -0.5rem;
-    margin-bottom: 1rem;
+    margin-top: 0.25rem;
+    margin-bottom: 0.75rem;
+    line-height: 1.4;
 }
 .field-description code {
     background-color: rgba(255,255,255,0.1);
     padding: 0.1rem 0.3rem;
     border-radius: 3px;
-    font-size: 0.8rem;
+    font-size: 0.85rem;
 }
 
 .checkbox-group {
     display: flex;
     align-items: center;
     gap: 0.75rem;
-    margin-bottom: 0.5rem;
+    margin-bottom: 0.75rem;
 }
 .checkbox-group input[type="checkbox"] {
-    width: 1rem;
-    height: 1rem;
+    width: 1.1rem;
+    height: 1.1rem;
+    accent-color: var(--primary-color);
 }
 
 .tool-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+    grid-template-columns: 1fr; /* Simplified to single column within a settings group */
     gap: 1rem;
 }
 
@@ -121,22 +126,23 @@
     gap: 1rem;
     margin-top: 1.5rem;
 }
+
 .button-primary {
     display: inline-block;
     background: var(--primary-color);
-    background-color: transparent;
-    border-color: var(--border-color);
-    border-width: 1px;
-    color: #ffffff;
+    color: var(--bg-color);
+    border: 1px solid var(--primary-color);
     padding: 0.65rem 1.5rem;
     font-size: 1rem;
     font-weight: 600;
     border-radius: 5px;
     cursor: pointer;
-    transition: background-color 0.15s ease;
+    transition: all 0.15s ease;
 }
 .button-primary:hover {
     background: var(--primary-hover);
+    color: var(--text-color);
+    border-color: var(--primary-hover);
 }
 
 .save-status {
@@ -191,4 +197,16 @@
 }
 .button-danger:hover {
     background-color: #ff8f8f;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    .danger-action {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+    .button-danger {
+        width: 100%;
+        text-align: center;
+    }
 }

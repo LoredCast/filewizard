@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pandoc texlive-xetex \
     texlive-latex-recommended \
     texlive-fonts-recommended \
+    unpaper \
     calibre \
     ffmpeg \
     libvips-tools \
