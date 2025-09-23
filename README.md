@@ -53,10 +53,11 @@ docker compose up --build
 
 
 ### With Docker (From Dockerhub) [Recommended]
-I've published 4 images to dockerhub that you can pull:
+I've published 3 images to dockerhub that you can pull:
 
-- `loredcast/filewizard:0.2`
-- `loredcast/filewizard:0.2-small`
+- `loredcast/filewizard:0.3-latest`
+- `loredcast/filewizard:0.3-small`
+- `loredcast/filewizard:0.3-cuda`
 
 and the previous images without tts:
 - `loredcast/filewizard:latest`
