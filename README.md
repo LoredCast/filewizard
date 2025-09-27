@@ -34,24 +34,6 @@ FastAPI for the Server, Vanilla html, js, css for the frontend (might switch to 
 
 ## Installation & Setup 
 
-### With Docker (Local Build)
-Clone the Repo and make sure docker compose is working on your environment
-
-```bash
-git clone https://github.com/LoredCast/filewizard.git
-cd filewizard
-```
-
-Startup Docker, initially the settings.yml file is applied, you can edit it.
-For You can edit the .env file for further configuration.
-
-Note: Building this image will take some time installing all deps ((mostly texlive)).
-
-```bash
-docker compose up --build
-```
-
-
 ### With Docker (From Dockerhub) [Recommended]
 I've published 3 images to dockerhub that you can pull:
 
@@ -69,6 +51,24 @@ Copy the `docker-compose.yml` from the repo into a directory on your machine, ad
 
 ```bash
 docker compose up -d
+```
+
+
+### With Docker (Local Build)
+Clone the Repo and make sure docker compose is working on your environment
+
+```bash
+git clone https://github.com/LoredCast/filewizard.git
+cd filewizard
+```
+
+Startup Docker, initially the settings.yml file is applied, you can edit it.
+For You can edit the .env file for further configuration.
+
+Note: Building this image will take some time installing all deps ((mostly texlive)).
+
+```bash
+docker compose up --build
 ```
 
 
