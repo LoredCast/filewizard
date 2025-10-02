@@ -2,7 +2,7 @@
 
 [![PayPal](https://img.shields.io/badge/PayPal-Donate-blue?logo=paypal&logoColor=white)](https://www.paypal.me/unterrikermanu)
 [![Docker Pulls](https://img.shields.io/docker/pulls/loredcast/filewizard.svg)](https://hub.docker.com/r/loredcast/filewizard)
-[![Docker Image Version](https://img.shields.io/docker/v/loredcast/filewizard/latest.svg)](https://hub.docker.com/r/loredcast/filewizard)
+[![Docker Image Version](https://img.shields.io/docker/v/loredcast/filewizard/0.3-latest.svg)](https://hub.docker.com/r/loredcast/filewizard)
 
 A self-hosted, browser-based utility for file conversion, OCR and audio transcription. It wraps common CLI and Python converters (FFmpeg, LibreOffice, Pandoc, ImageMagick, etc.), plus `faster-whisper` and Tesseract OCR.
 
