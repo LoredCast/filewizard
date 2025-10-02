@@ -1,14 +1,14 @@
 # File Wizard
 
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/loredcast)
 [![PayPal](https://img.shields.io/badge/PayPal-Donate-blue?logo=paypal&logoColor=white)](https://www.paypal.me/unterrikermanu)
-
 [![Docker Pulls](https://img.shields.io/docker/pulls/loredcast/filewizard.svg)](https://hub.docker.com/r/loredcast/filewizard)
 [![Docker Image Version](https://img.shields.io/docker/v/loredcast/filewizard/latest.svg)](https://hub.docker.com/r/loredcast/filewizard)
 
 A self-hosted, browser-based utility for file conversion, OCR and audio transcription. It wraps common CLI and Python converters (FFmpeg, LibreOffice, Pandoc, ImageMagick, etc.), plus `faster-whisper` and Tesseract OCR.
 
 ![Screenshot](swappy-20250920_155526.png)
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/loredcast)
 
 ## Features
 - Convert between many file formats; extendable via `settings.yml` to add any CLI tool.
