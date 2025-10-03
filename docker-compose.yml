@@ -4,11 +4,11 @@ services:
     image: loredcast/filewizard:latest
     build: .
     #env_file:
-    #  - .env
+      #- .env
     environment:
-      - LOCAL_ONLY=True # set to False to enable OIDC auth (requires configuration in settings.yml)
+      - LOCAL_ONLY=False # set to False to enable OIDC auth (requires configuration in settings.yml)
       - SECRET_KEY= # if using auth
-      - UPLOADS_DIR=/app/uploads
+      - UPLOADS_DIR=/app/uploads # directory structure INSIDE the container, not on host
       - PROCESSED_DIR=/app/processed
       - OMP_NUM_THREADS=1
     #user: "1000:1000"

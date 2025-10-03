@@ -1349,6 +1349,11 @@ def run_pdf_ocr_task(job_id: str, input_path_str: str, output_path_str: str, ocr
         job = get_job(db, job_id)
         if not job or job.status == 'cancelled':
             return
+
+        # Re-check for cancellation right before starting the heavy work
+        if get_job(db, job_id).status == 'cancelled':
+            logger.info(f"PDF OCR job {job_id} cancelled before starting. Aborting.")
+            return
         update_job_status(db, job_id, "processing")
         logger.info(f"Starting PDF OCR for job {job_id}")
         ocrmypdf.ocr(str(input_path), str(output_path_str),
@@ -1393,6 +1398,11 @@ def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, a
     try:
         job = get_job(db, job_id)
         if not job or job.status == "cancelled":
+            return
+
+        # Re-check for cancellation right before starting the heavy work
+        if get_job(db, job_id).status == 'cancelled':
+            logger.info(f"Image OCR job {job_id} cancelled before starting. Aborting.")
             return
 
         update_job_status(db, job_id, "processing", progress=10)

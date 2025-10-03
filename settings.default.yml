@@ -109,6 +109,8 @@ academic_settings:
 transcription_settings:
   whisper:
     compute_type: int8
+    # device: cuda 
+    # device_index: 0
     allowed_models:
     - tiny
     - base

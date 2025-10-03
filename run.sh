@@ -9,7 +9,7 @@ SECRET_KEY=
 UPLOADS_DIR=./uploads
 PROCESSED_DIR=./processed
 # Start Gunicorn in the background
-gunicorn -w 4 --threads 2 -k uvicorn.workers.UvicornWorker --forwarded-allow-ips='*' --error-logfile - --access-logfile - main:app -b 0.0.0.0:8008 &
+gunicorn -w 4 --threads 2 -k uvicorn.workers.UvicornWorker --forwarded-allow-ips='*' --error-logfile - --access-logfile - main:app -b 0.0.0.0:8000 &
 echo "Started Gunicorn..."
 # Store the Gunicorn process ID
 GUNICORN_PID=$!

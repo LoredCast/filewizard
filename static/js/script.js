@@ -549,8 +549,8 @@ function initializeSelectors() {
     }
 
     function showLoginView() {
-        if (appContainer) appContainer.style.display = 'block';
-        if (loginContainer) loginContainer.style.display = 'none';
+        if (appContainer) appContainer.style.display = 'none';
+        if (loginContainer) loginContainer.style.display = 'flex';
         if (loginButton) loginButton.addEventListener('click', () => { window.location.href = apiUrl('/login'); });
     }
 
