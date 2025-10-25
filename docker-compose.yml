@@ -1,24 +1,40 @@
 version: "3.9"
 services:
   web:
-    image: loredcast/filewizard:latest
-    build: .
+    image: loredcast/filewizard:0.4-latest
+    build:
+      context: .
+      # Set the target stage for the build. This is the crucial part.
+      target: full-final # Change to 'full-final' or 'small-final' as needed
     #env_file:
-      #- .env
+    # - .env
     environment:
-      - LOCAL_ONLY=False # set to False to enable OIDC auth (requires configuration in settings.yml)
+      - LOCAL_ONLY=True # set to False to enable OIDC auth (requires configuration in settings.yml)
       - SECRET_KEY= # if using auth
       - UPLOADS_DIR=/app/uploads # directory structure INSIDE the container, not on host
       - PROCESSED_DIR=/app/processed
       - OMP_NUM_THREADS=1
+      - DOWNLOAD_KOKORO_ON_STARTUP=true
+      #- TRANSCRIPTION_DEVICE=cpu  # change to 'cuda' if GPU available
+      #- TRANSCRIPTION_COMPUTE_TYPE=int8 # change to 'float16' or 'int8_float16' if GPU available
+      #- TRANSCRIPTION_DEVICE_INDEX=0 # change if multiple GPUs available
     #user: "1000:1000"
     ports:
       - "6969:8000"
     volumes:
       # Mount local directories and files into the container for persistence
-      - ./config:/app/config #you can copy settings.default.yml into here as settings.yml
+      - ./config:/app/config # you can copy settings.default.yml into here as settings.yml
       - ./uploads_data:/app/uploads
       - ./processed_data:/app/processed
+
+    # For CUDA builds, enable GPU access (uncomment below)
+    #deploy:
+    #  resources:
+    #    reservations:
+    #      devices:
+    #        - driver: nvidia
+    #          count: all
+    #          capabilities: [gpu]
 
 volumes:
   uploads_data: {}

@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>File Wizard</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/choices.js/public/assets/styles/choices.min.css"/>
     <link rel="stylesheet" href="{{ url_for('static', path='/css/style.css') }}">
 <!--     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -24,11 +25,15 @@
         <div class="container">
             <div class="header-actions">
                 {% if user and not local_only_mode %}
-                    <div>
+                    <div id="user-info-container" class="user-info-container" style="z-index: 3;">
                     <span class="user-info">Logged in as {{ user.name }}</span>
                     <a href="/logout" title="Logout" class="settings-link">Logout</a>
                     </div>
                 {% endif %}
+                <div id="connection-status" class="connection-status">
+                    <span id="status-indicator" class="status-dot disconnected"></span>
+                    <span id="status-text">Polling active</span>
+                </div>
                 <a href="/settings" title="Settings" class="settings-link">⚙️</a>
             </div>
 
@@ -73,6 +78,12 @@
                                         <option value="{{ model }}">{{ model }}</option>
                                         {% endfor %}
                                     </select>
+                                </div>
+                                <div class="form-control">
+                                    <label class="checkbox-label" for="main-timestamps-checkbox">
+                                        <input type="checkbox" id="main-timestamps-checkbox" name="timestamps">
+                                        <span>Generate Timestamps</span>
+                                    </label>
                                 </div>
                                 <button type="button" id="start-transcription-btn" class="main-action-button">Start Transcription</button>
                             </fieldset>
@@ -130,6 +141,12 @@
                 <button id="dialog-action-convert">Convert</button>
                 <button id="dialog-action-ocr">OCR</button>
                 <button id="dialog-action-transcribe">Transcribe</button>
+                <div class="form-control">
+                    <label class="checkbox-label" for="dialog-timestamps-checkbox">
+                        <input type="checkbox" id="dialog-timestamps-checkbox" name="timestamps">
+                        <span>Generate Timestamps</span>
+                    </label>
+                </div>
                 <button id="dialog-action-tts">Synthesize Speech</button>
             </div>
             
@@ -157,6 +174,9 @@
 
             <button id="dialog-action-cancel" class="dialog-cancel">Cancel</button>
         </div>
+    </div>
+    <div id="format-counter" class="format-counter" style="display: none;">
+        <span id="input-format-count"></span> in | <span id="output-format-count"></span> out
     </div>
     <script>
         // Inject server-side configuration for the client-side script

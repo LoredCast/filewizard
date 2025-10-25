@@ -16,3 +16,9 @@ venv312
 models
 config
 app.log*
+test_chunks
+test_processed
+test_uploads
+uploads_data
+processed_data
+.vscode

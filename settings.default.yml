@@ -5,100 +5,227 @@ auth_settings:
   oidc_userinfo_endpoint: https://accounts.example.com/oidc/me
   oidc_end_session_endpoint: https://accounts.example.com/oidc/session/end
   admin_users:
-  - user@example.com
+    - user@example.com
 webhook_settings:
   enabled: False
   allow_chunked_api_uploads: False
   allowed_callback_urls: []
   callback_bearer_token:
-tts_settings: 
-  piper: 
+tts_settings:
+  piper:
     model_dir: "./models/tts"
-    use_cuda: False 
-    synthesis_config: 
+    use_cuda: False
+    synthesis_config:
       length_scale: 1.0
-      noise_scale: 0.667 
+      noise_scale: 0.667
       noise_w: 0.8
-  kokoro: 
+  kokoro:
     model_dir: "./models/tts/kokoro"
     command_template: "kokoro-tts {input} {output} --model {model_path} --voices {voices_path} --voice {model_name}"
 
 app_settings:
-  max_file_size_mb: '2000'
+  model_concurrency: 1
+  model_inactivity_timeout: 1800
+  cache_check_interval: 300
+  max_file_size_mb: "2000"
   # app_public_url: "http://localhost:8000" # Uncomment and set to your public URL if downloads don't work correctly
   allowed_all_extensions:
-  - .aac
-  - .aiff
-  - .avif
-  - .avi
-  - .azw3
-  - .bmp
-  - .csv
-  - .dbf
-  - .doc
-  - .docx
-  - .dpx
-  - .dxf
-  - .eps
-  - .epub
-  - .fb2
-  - .fits
-  - .flac
-  - .flv
-  - .gif
-  - .gsm
-  - .html
-  - .htmlz
-  - .ico
-  - .jpeg
-  - .jpg
-  - .jxl
-  - .lit
-  - .lrf
-  - .m4a
-  - .md
-  - .mkv
-  - .mobi
-  - .mov
-  - .mp3
-  - .mp4
-  - .odt
-  - .ogg
-  - .ogv
-  - .opml
-  - .opus
-  - .pdb
-  - .pdf
-  - .pnm
-  - .png
-  - .ppt
-  - .pptx
-  - .ps
-  - .rst
-  - .rtf
-  - .svg
-  - .tcr
-  - .tex
-  - .tif
-  - .tiff
-  - .txt
-  - .wav
-  - .webm
-  - .webp
-  - .wma
-  - .wmv
-  - .wps
-  - .xlsx
-  - .xls
-  - .xml
-  - .xpm
-  - .zip
+    - .aac
+    - .aiff
+    - .avif
+    - .avi
+    - .azw3
+    - .bmp
+    - .csv
+    - .dbf
+    - .doc
+    - .docx
+    - .dpx
+    - .dxf
+    - .eps
+    - .epub
+    - .fb2
+    - .fits
+    - .flac
+    - .flv
+    - .gif
+    - .gsm
+    - .html
+    - .htmlz
+    - .ico
+    - .jpeg
+    - .jpg
+    - .jxl
+    - .lit
+    - .lrf
+    - .m4a
+    - .md
+    - .mkv
+    - .mobi
+    - .mov
+    - .mp3
+    - .mp4
+    - .odt
+    - .ogg
+    - .ogv
+    - .opml
+    - .opus
+    - .pdb
+    - .pdf
+    - .pnm
+    - .png
+    - .ppt
+    - .pptx
+    - .ps
+    - .rst
+    - .rtf
+    - .svg
+    - .tcr
+    - .tex
+    - .tif
+    - .tiff
+    - .txt
+    - .wav
+    - .webm
+    - .webp
+    - .wma
+    - .wmv
+    - .wps
+    - .xlsx
+    - .xls
+    - .xml
+    - .xpm
+    - .zip
+    - .3gp
+    - .aif
+    - .ac3
+    - .adoc
+    - .asciidoc
+    - .au
+    - .ape
+    - .avr
+    - .azw
+    - .azw4
+    - .beamer
+    - .cb7
+    - .cbc
+    - .cbr
+    - .cbz
+    - .caf
+    - .chm
+    - .context
+    - .djvu
+    - .dia
+    - .docbook
+    - .docbook5
+    - .dts
+    - .dzslides
+    - .eac3
+    - .eml
+    - .exr
+    - .f32
+    - .f4v
+    - .f64
+    - .fbz
+    - .gfm
+    - .haddock
+    - .hdr
+    - .heic
+    - .heif
+    - .htm
+    - .htk
+    - .ircam
+    - .j2k
+    - .jats
+    - .jp2
+    - .json
+    - .kepub
+    - .latex
+    - .m2ts
+    - .m4b
+    - .m4v
+    - .markdown
+    - .mat
+    - .mbox
+    - .miff
+    - .mka
+    - .mp1
+    - .mp2
+    - .mpc
+    - .mpeg
+    - .mpg
+    - .ms
+    - .msg
+    - .mts
+    - .muse
+    - .mxf
+    - .native
+    - .nist
+    - .oeb
+    - .ods
+    - .odp
+    - .oga
+    - .org
+    - .paf
+    - .pbm
+    - .pcx
+    - .pgm
+    - .pml
+    - .ppm
+    - .prc
+    - .pvf
+    - .ra
+    - .raw
+    - .rb
+    - .revealjs
+    - .rm
+    - .s5
+    - .s8
+    - .s16
+    - .s24
+    - .s32
+    - .sd2
+    - .sds
+    - .sf
+    - .shtml
+    - .slidy
+    - .smp
+    - .snd
+    - .snb
+    - .sph
+    - .spx
+    - .svgz
+    - .tga
+    - .tei
+    - .textile
+    - .ts
+    - .tsv
+    - .tta
+    - .txw
+    - .txtz
+    - .u8
+    - .u16
+    - .u24
+    - .u32
+    - .vips
+    - .vob
+    - .voc
+    - .w64
+    - .wbmp
+    - .wavex
+    - .wv
+    - .wve
+    - .xhtml
+    - .xwd
+    - .xwiki
+    - .zimwiki
 ocr_settings:
   ocrmypdf:
     deskew: true
     clean: true
     optimize: 1
     force_ocr: true
+    image_dpi: 300
 academic_settings:
   pandoc:
     csl_files:
@@ -109,21 +236,42 @@ academic_settings:
 transcription_settings:
   whisper:
     compute_type: int8
-    # device: cuda 
+    # device: cuda
     # device_index: 0
     allowed_models:
-    - tiny
-    - base
-    - small
-    - medium
-    - large-v3
-    - distil-large-v2
+      - tiny
+      - base
+      - small
+      - medium
+      - large-v3
+      - distil-large-v2
 conversion_tools:
   libreoffice:
     name: LibreOffice
-    command_template: libreoffice --headless --convert-to {filter} --outdir {output_dir}
-      {input}
+    command_template: libreoffice --headless --convert-to {filter} --outdir {output_dir} {input}
     timeout: 300
+    supported_input:
+      - .odt
+      - .doc
+      - .docx
+      - .xls
+      - .xlsx
+      - .ods
+      - .csv
+      - .ppt
+      - .pptx
+      - .odp
+      - .rtf
+      - .txt
+      - .html
+      - .xml
+      - .epub
+      - .svg
+      - .png
+      - .jpg
+      - .jpeg
+      - .wps
+      - .dbf
     filters:
       pdf: pdf
       docx: docx
@@ -131,7 +279,7 @@ conversion_tools:
       odt: odt
       html: html
       rtf: rtf
-      txt: txt:Text
+      txt: "Text"
       xml: xml
       epub: epub
       xlsx: xlsx
@@ -172,6 +320,44 @@ conversion_tools:
     name: Pandoc
     command_template: pandoc --standalone {input} -o {output} --to={output_ext} --pdf-engine=xelatex
     timeout: 300
+    supported_input:
+      - .md
+      - .txt
+      - .html
+      - .htm
+      - .docx
+      - .odt
+      - .epub
+      - .tex
+      - .rtf
+      - .rst
+      - .org
+      - .asciidoc
+      - .adoc
+      - .textile
+      - .opml
+      - .fb2
+      - .jats
+      - .tei
+      - .xml
+      - .json
+      - .native
+      - .docbook
+      - .docbook5
+      - .latex
+      - .context
+      - .ms
+      - .zimwiki
+      - .xwiki
+      - .muse
+      - .haddock
+      - .dzslides
+      - .s5
+      - .beamer
+      - .slidy
+      - .revealjs
+      - .gfm
+      - .markdown
     formats:
       docx: Word Document
       odt: OpenDocument Text
@@ -195,12 +381,38 @@ conversion_tools:
       textile: Textile
       opml: OPML
       man: Groff Man Page
-      docbook: DocBook XML
+      docbook:
+        DocBook XML
+        # Additional document formats
+      latex: LaTeX Source
+      context: ConTeXt Document
+      ms: Groff MS Document
+      fb2: FictionBook E-Book
+      jats: JATS XML (Academic Publishing)
+      tei: TEI Simple XML
+      docbook5: DocBook 5 XML
+
+      # More markup formats
+      zimwiki: ZimWiki Markup
+      xwiki: XWiki Markup
+      muse: Emacs Muse
+      haddock: Haddock Haskell Docs
+
+      # Slide formats (if not covered)
+      dzslides: DZSlides HTML Slides
+      s5: S5 HTML Slides
+
+      # Data/interchange formats
+      json: Pandoc JSON AST
+      native: Pandoc Native AST
   ghostscript_pdf:
     name: Ghostscript (PDF)
-    command_template: gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dQUIET
+    command_template:
+      gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dQUIET
       -dBATCH {preset} -sOutputFile={output} {input}
     timeout: 60
+    supported_input:
+      - .pdf
     formats:
       screen: PDF (Optimized for Screen)
       ebook: PDF (Optimized for Ebooks)
@@ -209,9 +421,12 @@ conversion_tools:
       pdfa: PDF/A-2b (for Archiving)
   ghostscript_image:
     name: Ghostscript (Image)
-    command_template: gs -dNOPAUSE -dBATCH -sDEVICE={device} -r{dpi} -sOutputFile={output}
-      {input}
+    command_template: gs -dNOPAUSE -dBATCH -sDEVICE={device} -r{dpi} -sOutputFile={output} {input}
     timeout: 60
+    supported_input:
+      - .ps
+      - .eps
+      - .pdf
     formats:
       jpeg_72: JPEG Image (72 DPI)
       jpeg_150: JPEG Image (150 DPI)
@@ -230,6 +445,49 @@ conversion_tools:
     name: Calibre (ebook-convert)
     command_template: ebook-convert {input} {output}
     timeout: 600
+    supported_input:
+      - .azw
+      - .azw4
+      - .cbz
+      - .cbr
+      - .cb7
+      - .cbc
+      - .chm
+      - .djvu
+      - .fbz
+      - .kepub
+      - .prc
+      - .pdb
+      - .pml
+      - .rb
+      - .snb
+      - .tcr
+      - .txtz
+      - .epub
+      - .mobi
+      - .azw
+      - .azw3
+      - .pdf
+      - .docx
+      - .rtf
+      - .txt
+      - .fb2
+      - .html
+      - .htm
+      - .htmlz
+      - .shtml
+      - .xhtml
+      - .pdb
+      - .lrf
+      - .lit
+      - .tcr
+      - .oeb
+      - .pml
+      - .rb
+      - .snb
+      - .odt
+      - .prc
+      - .djvu
     formats:
       epub: EPUB
       mobi: MOBI
@@ -244,10 +502,68 @@ conversion_tools:
       lrf: Sony BroadBand eBook
       lit: Microsoft Reader
       tcr: Psion Series 3
+      oeb: Open eBook (OEB)
+      pml: Palm Markup Language
+      rb: Rocket eBook
+      snb: Samsung Note eBook
+      kepub: Kobo EPUB
+      oeb: Open eBook
+      pmlz: Palm Markup Language (Zipped)
+      rb: Rocket eBook
+      snb: Samsung Note eBook
+      txtz: Plain Text (Zipped)
+      zip: Zipped Container
   ffmpeg:
     name: FFmpeg
     command_template: ffmpeg -i {input} -y -preset medium {output}
     timeout: 600
+    supported_input:
+      - .mp4
+      - .avi
+      - .mov
+      - .wmv
+      - .flv
+      - .mkv
+      - .webm
+      - .m4v
+      - .3gp
+      - .mpg
+      - .mpeg
+      - .ts
+      - .mts
+      - .m2ts
+      - .vob
+      - .f4v
+      - .mxf
+      - .mp3
+      - .wav
+      - .flac
+      - .aac
+      - .aiff
+      - .wma
+      - .ogg
+      - .opus
+      - .m4a
+      - .ac3
+      - .eac3
+      - .mka
+      - .caf
+      - .mp2
+      - .jpg
+      - .jpeg
+      - .png
+      - .bmp
+      - .tiff
+      - .tif
+      - .gif
+      - .webp
+      - .svg
+      - .tga
+      - .dpx
+      - .exr
+      - .avif
+      - .heif
+      - .heic
     formats:
       mp4: MP4 Video (H.264/AAC)
       mp4_hevc: MP4 Video (H.265/AAC)
@@ -269,10 +585,49 @@ conversion_tools:
       opus: Opus Audio
       gif: Animated GIF
       apng: Animated PNG
+      m4v: MPEG-4 Video (H.264)
+      3gp: 3GPP Mobile Video
+      ts: MPEG Transport Stream
+      f4v: Adobe Flash Video (MP4-based)
+      mxf: MXF (Professional Video)
+      m4a: MPEG-4 Audio (AAC)
+      ac3: Dolby Digital AC-3
+      eac3: Dolby Digital Plus (E-AC-3)
+      mka: Matroska Audio
+      caf: Apple Core Audio Format
+      mp2: MPEG Audio Layer II
+
+      # Images
+      jpg: JPEG Image Sequence
+      png: PNG Image Sequence
   vips:
     name: VIPS
     command_template: vips copy {input} {output}[Q=90]
     timeout: 60
+    supported_input:
+      - .jpg
+      - .jpeg
+      - .png
+      - .webp
+      - .tiff
+      - .tif
+      - .avif
+      - .heif
+      - .heic
+      - .jp2
+      - .j2k
+      - .gif
+      - .pnm
+      - .pgm
+      - .ppm
+      - .pbm
+      - .fits
+      - .bmp
+      - .ico
+      - .exr
+      - .hdr
+      - .jxl
+      - .vips
     formats:
       jpg: JPEG Image (Q90)
       png: PNG Image
@@ -284,10 +639,49 @@ conversion_tools:
       gif: GIF Image
       pnm: PNM Image
       fits: FITS Image
+      # Common raster
+      bmp: BMP Image
+      ico: Windows Icon
+
+      # HDR formats
+      exr: OpenEXR Image
+      hdr: Radiance HDR Image
+
+      # Modern (if supported)
+      jxl: JPEG XL Image (Q90)
+
+      # Native
+      vips: VIPS Native Format
   graphicsmagick:
     name: GraphicsMagick
     command_template: gm convert {input} -quality 90 {output}
     timeout: 60
+    supported_input:
+      - .jpg
+      - .jpeg
+      - .png
+      - .webp
+      - .tiff
+      - .tif
+      - .gif
+      - .bmp
+      - .pdf
+      - .eps
+      - .dpx
+      - .ico
+      - .xpm
+      - .ps
+      - .pnm
+      - .ppm
+      - .pgm
+      - .pbm
+      - .tga
+      - .pcx
+      - .miff
+      - .hdr
+      - .fits
+      - .wbmp
+      - .xwd
     formats:
       jpg: JPEG Image (Q90)
       png: PNG Image
@@ -299,11 +693,42 @@ conversion_tools:
       eps: Encapsulated PostScript
       dpx: DPX Image
       ico: Windows Icon
-      xpm: X PixMap
+      xpm:
+        X PixMap
+        # Vector & page description
+      ps: PostScript
+
+      # Bitmap formats
+      pnm: PNM Image (Portable AnyMap)
+      ppm: PPM Image (Portable Pixmap)
+      pgm: PGM Image (Portable Graymap)
+      pbm: PBM Image (Portable Bitmap)
+      tga: Targa Image
+      pcx: PC Paintbrush Image
+
+      # Native & archival
+      miff: Magick Image File Format (GM Native)
+
+      # HDR (if supported)
+      hdr: Radiance HDR Image
+
+      # Scientific
+      fits: FITS Image
+
+      # Legacy/other
+      wbmp: Wireless Bitmap
+      xwd: X Window Dump
   inkscape:
     name: Inkscape
     command_template: inkscape {input} --export-filename={output}
     timeout: 30
+    supported_input:
+      - .svg
+      - .svgz
+      - .eps
+      - .pdf
+      - .ps
+      - .dia
     formats:
       svg: SVG (Plain)
       inkscape_svg: SVG (Inkscape)
@@ -319,20 +744,47 @@ conversion_tools:
     name: libjxl (cjxl)
     command_template: cjxl {input} {output} -q 90
     timeout: 30
+    supported_input:
+      - .jpg
+      - .jpeg
+      - .png
+      - .tiff
+      - .tif
+      - .gif
+      - .bmp
+      - .webp
+      - .jxl
     formats:
       jxl_q90: JPEG XL (Quality 90)
       jxl_lossless: JPEG XL (Lossless)
       jxl_hq: JPEG XL (High Compression)
+      jxl_q70: JPEG XL (Quality 70)
+      jxl_q50: JPEG XL (Quality 50)
+      jxl_q30: JPEG XL (Quality 30)
   resvg:
     name: resvg
     command_template: resvg {input} {output}
     timeout: 30
+    supported_input:
+      - .svg
+      - .svgz
     formats:
       png: PNG from SVG
   potrace:
     name: Potrace
     command_template: potrace {input} --svg -o {output}
     timeout: 30
+    supported_input:
+      - .png
+      - .jpg
+      - .jpeg
+      - .bmp
+      - .tiff
+      - .tif
+      - .pgm
+      - .ppm
+      - .pbm
+      - .pnm
     formats:
       svg: SVG from Bitmap
       pdf: PDF from Bitmap
@@ -343,13 +795,35 @@ conversion_tools:
     name: Markitdown
     command_template: markitdown {input} -o {output}
     timeout: 300
+    supported_input:
+      - .docx
+      - .pdf
+      - .pptx
+      - .xlsx
+      - .odt
+      - .html
+      - .htm
+      - .epub
+      - .rtf
+      - .txt
+      - .md
+      - .mbox
+      - .msg
+      - .eml
+      - .csv
+      - .tsv
+      - .json
+      - .xml
+      - .odp
+      - .ods
     formats:
       md: Markdown from Everything!
   pngquant:
     name: pngquant
-    command_template: pngquant --quality={quality} --speed {speed} --force --output
-      {output} {input}
+    command_template: pngquant --quality={quality} --speed {speed} --force --output {output} {input}
     timeout: 300
+    supported_input:
+      - .png
     formats:
       png_hq: PNG (High Quality Compression)
       png_mq: PNG (Medium Quality Compression)
@@ -358,6 +832,60 @@ conversion_tools:
     name: SoX Audio Converter
     command_template: sox {input} -r {samplerate} {bitdepth} {output}
     timeout: 600
+    supported_input:
+      - .wav
+      - .flac
+      - .aiff
+      - .aif
+      - .au
+      - .snd
+      - .mp3
+      - .mp2
+      - .mp1
+      - .ogg
+      - .oga
+      - .opus
+      - .spx
+      - .wv
+      - .tta
+      - .m4a
+      - .m4b
+      - .aac
+      - .ac3
+      - .dts
+      - .w64
+      - .sds
+      - .smp
+      - .paf
+      - .nist
+      - .voc
+      - .ircam
+      - .sf
+      - .w64
+      - .mat
+      - .pvf
+      - .xi
+      - .htk
+      - .sds
+      - .avr
+      - .wavex
+      - .sd2
+      - .flac
+      - .caf
+      - .wve
+      - .prc
+      - .txw
+      - .f32
+      - .f64
+      - .s32
+      - .s24
+      - .s16
+      - .s8
+      - .u32
+      - .u24
+      - .u16
+      - .u8
+      - .raw
     formats:
       wav_48k_24b: WAV (48kHz, 24-bit)
       wav_44k_16b: WAV (CD, 44.1kHz, 16-bit)
@@ -369,13 +897,79 @@ conversion_tools:
       mp3_128k: MP3 (128 kbps)
       ogg_192k: Ogg Vorbis (192 kbps)
       ogg_96k: Ogg Vorbis (96 kbps)
-      opus_128k: Opus (128 kbps)
-      opus_64k: Opus (64 kbps, Voice)
       gsm: GSM 06.10 (13kbps, Voice)
+
+      # High-resolution audio
+      wav_96k_24b: WAV (96kHz, 24-bit)
+      wav_192k_24b: WAV (192kHz, 24-bit)
+      flac_96k_24b: FLAC (96kHz, 24-bit)
+      flac_192k_24b: FLAC (192kHz, 24-bit)
+      aiff_48k_24b: AIFF (48kHz, 24-bit)
+      aiff_96k_24b: AIFF (96kHz, 24-bit)
+
+      # More MP3 options
+      mp3_v0: MP3 (V0 VBR, ~245 kbps)
+      mp3_64k: MP3 (64 kbps, mono)
+      mp3_48k: MP3 (48 kbps, ultra-low)
+
+      # More Ogg/Opus
+      ogg_320k: Ogg Vorbis (320 kbps)
+      ogg_45k: Ogg Vorbis (45 kbps)
+
+      # Telephony & legacy
+      ulaw_8k: μ-law (8kHz, North American telephony)
+      alaw_8k: A-law (8kHz, European telephony)
+      vox_8k: Dialogic VOX (8kHz, ADPCM)
+      adpcm_44k: IMA ADPCM (44.1kHz)
+      g722_16k: G.722 Wideband (16kHz, 64kbps)
+
+      # Raw & scientific
+      raw_44k_s16: Raw PCM (44.1kHz, 16-bit signed)
+      raw_48k_f32: Raw PCM (48kHz, 32-bit float)
+
+      # Broadcast & niche
+      au_44k_16b: Sun AU (44.1kHz, 16-bit)
+      sph_16k_16b: NIST SPHERE (16kHz, 16-bit, speech research)
+      w64_48k_24b: Wave64 (48kHz, 24-bit, >4GB support)
+  ffmpeg_audio:
+    name: FFmpeg for Perceptionally Lossless Audio
+    command_template: "ffmpeg -i {input} -c:a libopus -b:a 192k -vbr on -compression_level 10 -application audio {output}"
+    timeout: 600
+    supported_input:
+      - .wav
+      - .flac
+      - .aiff
+      - .aif
+      - .mp3
+      - .m4a
+      - .aac
+      - .ogg
+      - .opus
+      - .wv
+      - .tta
+      - .ape
+      - .mpc
+      - .wma
+      - .ra
+      - .rm
+      - .au
+      - .snd
+      - .caf
+      - .sph
+      - .voc
+      - .ircam
+      - .w64
+    formats:
+      opus: Opus (192 kbps) HQ
   mozjpeg:
     name: MozJPEG
     command_template: cjpeg -quality {quality} -outfile {output} {input}
     timeout: 30
+    supported_input:
+      - .bmp
+      - .ppm
+      - .pgm
+      - .jpg
     formats:
       jpg_q85: JPEG (High Quality)
       jpg_q75: JPEG (Web Quality)
@@ -384,8 +978,52 @@ conversion_tools:
     name: Pandoc (Academic Document)
     command_template: "pandoc {main_document} -o {output} --bibliography {bib_file} --citeproc --csl {csl_style}"
     timeout: 300
+    supported_input:
+      - .zip  # Academic pandoc requires a zip with markdown/tex + bibliography
     formats:
       pdf_apa: "PDF with Bibliography (APA Style)"
       pdf_mla: "PDF with Bibliography (MLA Style)"
       pdf_chicago: "PDF with Bibliography (Chicago Style)"
       pdf_chicago_fullnote: "PDF with Bibliography (Chicago Full Note)"
+  pdftotext:
+    name: pdftotext (Poppler)
+    command_template: pdftotext -layout {input} {output}
+    timeout: 300
+    supported_input:
+      - .pdf
+    formats:
+      txt: Plain Text
+  pdftohtml:
+    name: pdftohtml (Poppler)
+    command_template: pdftohtml -noframes -c -hidden {input} {output}
+    timeout: 300
+    supported_input:
+      - .pdf
+    formats:
+      html: HTML
+  docling:
+    name: Docling (With IBM Granite)
+    command_template: "docling --to {output_ext} --output {output_dir} {input}"
+    timeout: 6000
+    supported_input:
+      - .pdf
+      - .docx
+      - .pptx
+      - .xlsx
+      - .html
+      - .htm
+    formats:
+      html: "HTML"
+      md: "Markdown"
+      json: "Structured JSON"
+      text: "Text"
+  #unstructured:
+  #  name: Unstructured Text Extractor
+  #  command_template: unstructured --input-file {input} --output-file {output}
+  #  timeout: 300
+  #  formats:
+  #    txt: Plain Text
+  #    md: Markdown
+  #    html: HTML
+  #    json: JSON
+  #    docx: Word Document

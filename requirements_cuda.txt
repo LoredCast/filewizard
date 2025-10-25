@@ -9,6 +9,7 @@ SQLAlchemy
 huey
 
 # OCR & Transcription Features
+ctranslate2[cuda]
 faster-whisper
 ocrmypdf
 pytesseract
@@ -16,20 +17,23 @@ pypdf
 piper-tts
 kokoro-tts
 opencv-python-headless
+marker-pdf[full]
 Pillow
+docling
 
 # Configuration & Utilities
-python-dotenv
 werkzeug
 itsdangerous
 authlib
 dotenv
 httpx
+python-dotenv
 PyYAML
 pydantic
 pydantic-settings
 python-multipart
 markitdown[pdf,docx,pptx,xlsx,outlook]==0.1.3
+#unstructured[all-docs]
 PyPDF2==3.0.1
 mechanize
 html5_parser
@@ -41,7 +45,3 @@ css_parser
 
 # Security libraries
 bleach
-
-# Docling
---extra-index-url https://download.pytorch.org/whl/cpu
-docling

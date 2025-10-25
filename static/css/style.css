@@ -10,7 +10,7 @@
     --primary-color: #ffffff;
     --secondary-color: #2b2b2b;
     --primary-hover: #ffffff3d;
-    --success-color: #26c281;
+    --success-color: #17a56a;
     --error-color: #ff6b6b;
     --cancel-color: #f39c12; /* Orange for cancelled */
 
@@ -100,6 +100,7 @@ body {
     padding: 1.5rem;
     border: 1px solid var(--border-color);
     margin-top: 1em;
+    margin-bottom: 6em;
 
 }
 @media (max-width: 768px) {
@@ -141,6 +142,35 @@ header p {
     gap: 1rem;
 }
 
+.connection-status {
+    position: relative;
+    color: var(--muted-text);
+    padding: 6px 10px;
+    border-radius: 4px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.7rem;
+    background: linear-gradient(0deg, rgb(0, 0, 0) 30%, rgba(0, 0, 0, 0) 100%);
+
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.status-dot.connected {
+    background-color: #26c281; /* Success color */
+}
+
+.status-dot.disconnected {
+    background-color: #bafaff; /* Error color */
+}
+
 .header-actions div {
     position: fixed;
     left: 0;
@@ -149,8 +179,11 @@ header p {
     padding: 2em;
     padding-top: 5em;
     text-align: center;
-    background-color: rgb(0, 0, 0);
-    background: linear-gradient(0deg, rgb(0, 0, 0) 30%, rgba(0, 0, 0, 0) 100%);
+    z-index: 2;
+}
+
+.user-info-container {
+    z-index: 3;
 }
 
 .user-info {
@@ -273,6 +306,64 @@ input[type="file"] {
 .form-control select:focus {
     outline: none;
     border-color: var(--primary-color);
+    box-shadow: 0 0 0 2px rgba(0, 180, 255, 0.2);
+}
+
+.checkbox-label {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    font-size: 0.9rem;
+    color: var(--muted-text);
+}
+
+.checkbox-label input[type="checkbox"] {
+    opacity: 0;
+    position: absolute;
+}
+
+.checkbox-label span {
+    position: relative;
+    padding-left: 28px;
+}
+
+.checkbox-label span::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 18px;
+    height: 18px;
+    background-color: rgba(255,255,255,0.05);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.checkbox-label span::after {
+    content: '';
+    position: absolute;
+    left: 6px;
+    top: 50%;
+    transform: translateY(-50%) rotate(45deg) scale(0);
+    width: 6px;
+    height: 12px;
+    border: solid var(--text-color);
+    border-width: 0 2px 2px 0;
+    transition: transform 0.15s ease;
+}
+
+.checkbox-label input[type="checkbox"]:checked + span::before {
+    background-color: var(--primary-color);
+    border-color: var(--primary-color);
+}
+
+.checkbox-label input[type="checkbox"]:checked + span::after {
+    transform: translateY(-50%) rotate(45deg) scale(1);
+}
+
+.checkbox-label input[type="checkbox"]:focus + span::before {
     box-shadow: 0 0 0 2px rgba(0, 180, 255, 0.2);
 }
 
@@ -414,9 +505,9 @@ input[type="file"] {
 
 /* Status Badge */
 .job-status-badge {
-    padding: 0.2rem 0.6rem;
+    padding: 0.15rem 0.5rem;
     border-radius: 12px;
-    font-size: 0.75rem;
+    font-size: 0.6rem;
     font-weight: 600;
     text-transform: capitalize;
     display: inline-block;
@@ -502,7 +593,7 @@ input[type="file"] {
 
 .download-button {
     background-color: var(--success-color);
-    color: #00160b;
+    color: #000000;
 }
 .download-button:hover { transform: scale(1.05); }
 
@@ -695,51 +786,186 @@ body.dragging .drag-overlay {
     }
 }
 
+/* Mobile-specific styles for compact view */
 @media (max-width: 768px) {
     .table-wrapper {
-        border: none;
-        background-color: transparent;
-    }
-    #job-table thead {
-        display: none;
-    }
-    #job-table, #job-table tbody, #job-table tr, #job-table td {
-        display: block;
-        width: 100%;
-    }
-    #job-table tr {
-        margin-bottom: 1rem;
+        overflow-x: auto;
         border: 1px solid var(--border-color);
         border-radius: 8px;
         background-color: var(--surface);
+        margin-bottom: 0em;
     }
+    
+    /* Mobile table styling - hide some columns to keep it compact */
+    #job-table {
+        min-width: 400px; /* Reduced minimum width */
+        font-size: 0.7rem; /* Smaller font size */
+        padding: 25px;
+        margin-bottom: 0em;
+    }
+    
+    #job-table th,
     #job-table td {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 0.75rem 1rem;
-        border-bottom: 1px solid var(--divider-color);
-        white-space: normal;
+        padding: 0.5rem 0.2rem; /* Much smaller padding */
+        font-size: 0.7rem;
     }
-    #job-table tr td:last-child {
-        border-bottom: none;
-    }
-    #job-table td::before {
-        content: attr(data-label);
-        font-weight: 500;
-        color: var(--muted-text);
-        padding-right: 1rem;
-        flex-shrink: 0;
-    }
-    .cell-value {
-        text-align: right;
-        min-width: 0;
-        word-break: break-all;
-    }
+    
+    #job-table th {
+        white-space: nowrap;
+        padding: 0.3rem 0.1rem; /* Even smaller padding for headers */
+        font-size: 0.65rem;
 
-    .cell-value, .file-cell-content {
-        min-width: 0;
-        max-width: 50vw; /* Adjust for smaller screens */
+    }
+    
+    .cell-value {
+        max-width: 60px; /* Smaller max width */
+        font-size: 0.7rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    
+    .file-cell-content {
+        max-width: 60px; /* Smaller max width */
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    
+    /* Adjust action column for mobile */
+    .action-col {
+        width: 60px; /* Smaller width */
+    }
+    
+    /* Show details button on mobile */
+    .details-button {
+        display: inline-block !important;
+        margin-left: 0.1rem;
+        padding: 0.25rem 0.25rem; /* Small padding for square shape */
+        font-size: 0.5rem; /* Smaller font */
+        width: 2em; /* Square shape */
+        height: 2em;
+        font-family: serif;
+        font-weight: 600;
+        text-align: center;
+        line-height: 1.1em; /* Center the text vertically */
+        border-radius: 2em; /* Circular shape */
+        background-color: var(--primary-hover);
+        border: 1px solid var(--border-color);
+        color: var(--muted-text);
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+    
+    .details-button:hover {
+        background-color: var(--primary-color);
+        color: var(--bg-color);
+    }
+    
+    /* Show all details by default on mobile - hide the details row that was for desktop only */
+    .job-details-row {
+        display: none;
+    }
+    
+    /* Adjust table cell behavior on mobile */
+    #job-table td {
+        white-space: nowrap;
+    }
+    
+    /* Hide specific columns to keep table compact on mobile */
+    #job-table th:nth-child(3), /* File Size */
+    #job-table th:nth-child(5), /* Submitted */
+    #job-table td:nth-child(3), /* File Size */
+    #job-table td:nth-child(5) { /* Submitted */
+        display: none;
+    }
+    
+    /* Reduce margins on the container */
+    .container {
+        padding: 0.7rem; /* Smaller padding */
+    }
+    
+    /* Reduce header margins */
+    .history-header {
+        margin-bottom: 0.5rem;
+        padding-top: 1rem;
+    }
+    
+    /* Adjust the table wrapper */
+    .table-wrapper {
+        margin-bottom: 1rem; /* Much smaller margin */
+    }
+}
+
+/* Additional mobile optimizations for very small screens */
+@media (max-width: 480px) {
+    #job-table {
+        font-size: 0.65rem; /* Even smaller font */
+        min-width: 350px; /* Even smaller min width */
+    }
+    
+    #job-table th,
+    #job-table td {
+        padding: 0.2rem 0.15rem; /* Even smaller padding */
+        font-size: 0.65rem;
+    }
+    
+    #job-table th {
+        padding: 0.15rem 0.1rem;
+        font-size: 0.6rem;
+    }
+    
+    .cell-value {
+        max-width: 60px; /* Even smaller max width */
+        font-size: 0.65rem;
+    }
+    
+    .file-cell-content {
+        max-width: 45px; /* Even smaller max width */
+    }
+    
+    .action-col {
+        width: 30px; /* Even smaller width */
+    }
+    
+    .details-button {
+        font-size: 0.55rem;
+        padding: 0.03rem 0.1rem;
+        margin-left: 0.05rem;
+    }
+    
+    /* Further reduce container padding */
+    .container {
+        padding: 0.2rem;
+    }
+}
+
+/* Additional mobile optimizations for very small screens */
+@media (max-width: 480px) {
+    #job-table {
+        font-size: 0.75rem;
+    }
+    
+    #job-table th,
+    #job-table td {
+        padding: 0.5rem;
+        font-size: 0.75rem;
+    }
+    
+    .cell-value {
+        max-width: 80px;
+    }
+    
+    .file-cell-content {
+        max-width: 60px;
+    }
+    
+    .action-col {
+        width: 40px;
+    }
+    
+    .details-button {
+        font-size: 0.65rem;
+        padding: 0.05rem 0.25rem;
+        border-radius: 100%;
     }
 }
 
@@ -780,8 +1006,81 @@ tr.sub-job td[data-label="File"] .cell-value {
     padding-left: 1.7em;
 }
 
-@media (max-width: 768px) {
-    tr.sub-job.is-visible {
-        display: block; /* Show on mobile */
-    }
+/* Details button for mobile view - hide on desktop */
+.details-button {
+    display: none; /* Hidden by default on desktop */
+    margin-left: 0.25rem;
+    padding: 0.1rem 0.3rem;
+    font-size: 0.7rem;
+    background-color: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--muted-text);
+    border-radius: 10px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.details-button:hover {
+    background-color: var(--primary-hover);
+    color: var(--primary-color);
+}
+
+/* Job details row */
+.job-details-row {
+    background-color: var(--surface);
+}
+
+.job-details-content {
+    padding: 0 !important;
+    
+}
+
+.job-details-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 0.6rem;
+    padding: 0.6rem;
+}
+
+.detail-item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    word-wrap: break-word;
+}
+
+.detail-label {
+    font-size: 0.75rem;
+    color: var(--muted-text);
+    font-weight: 500;
+}
+
+.detail-value {
+    font-size: 0.85rem;
+    word-break: break-word;
+    text-wrap: wrap;
+}
+
+
+input[type="checkbox"] {
+  accent-color: #002b3b; /* Changes checkmark and box color */
+  width: 10px;
+  height: 10px;
+}
+
+/* Mobile-specific styles for compact view */
+
+.format-counter {
+    position: fixed;
+    bottom: 1rem;
+    right: 1.5rem;
+    padding: 6px 10px;
+    border-radius: 4px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.7rem;
+    z-index: 1000;
+    color: var(--muted-text);
 }

@@ -39,7 +39,54 @@ Copy `docker-compose.yml` from the repo, adjust as needed, then:
 docker compose up -d
 ```
 
-### Build locally with Docker
+### Build locally with Docker (new build types)
+
+For different build configurations, use the BUILD_TYPE argument:
+
+```bash
+# Full build (includes all dependencies but no CUDA)
+docker build --build-arg BUILD_TYPE=full -t filewizard:full .
+
+# Small build (excludes TeX and markitdown dependencies for smaller image)
+docker build --build-arg BUILD_TYPE=small -t filewizard:small .
+
+# CUDA build (includes CUDA support for GPU acceleration)
+docker build --build-arg BUILD_TYPE=cuda -t filewizard:cuda .
+```
+
+Or with docker-compose:
+
+```bash
+# For full build
+docker compose build --build-arg BUILD_TYPE=full
+
+# For small build
+docker compose build --build-arg BUILD_TYPE=small
+
+# For CUDA build
+docker compose build --build-arg BUILD_TYPE=cuda
+```
+
+For CUDA builds, ensure you have:
+- NVIDIA Docker runtime installed (`nvidia-docker2` package)
+- Compatible GPU with appropriate drivers
+- Add the GPU configuration to docker-compose.yml if building with compose:
+```yaml
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+```
+
+For troubleshooting GPU issues, make sure:
+1. Your GPU drivers support the CUDA version (12.1)
+2. cuDNN libraries are properly installed in the container
+3. The `nvidia-container-toolkit` is properly configured
+4. Test NVIDIA setup with: `docker run --rm --gpus all nvidia/cuda:12.1-base-ubuntu22.04 nvidia-smi`
+
 ```bash
 git clone https://github.com/LoredCast/filewizard.git
 cd filewizard
@@ -52,7 +99,7 @@ Note: building can be slow (TeX and other dependencies).
 git clone https://github.com/LoredCast/filewizard.git
 cd filewizard
 python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
+source venv/bin/activate   # Windows: venv\\Scripts\\activate
 pip install -r requirements.txt
 chmod +x run.sh
 ./run.sh
@@ -74,7 +121,7 @@ https://github.com/LoredCast/filewizard/wiki
 
 | Tool | Common inputs (extensions / format names) | Common outputs (extensions / format names) | Notes |
 |---|---|---|---|
-| **LibreOffice (soffice)** | `.odt`, `.fodt`, `.ott`, `.doc`, `.docx`, `.docm`, `.dot`, `.dotx`, `.rtf`, `.txt`, `.html/.htm/.xhtml`, `.xml`, `.sxw`, `.wps`, `.wpd`, `.abw`, `.pdb`, `.epub`, `.fb2`, `.lit`, `.lrf`, `.pages`, `.csv`, `.tsv`, `.xls`, `.xlsx`, `.xlsm`, `.ods`, `.sxc`, `.123`, `.dbf`, `.ppt`, `.pptx`, `.odp`, images (`.png`, `.jpg`, `.jpeg`, `.bmp`, `.gif`, `.tiff`), `.pdf` | `.pdf`, `.pdfa`, `.odt`, `.fodt`, `.doc`, `.docx`, `.rtf`, `.txt`, `.html/.htm`, `.xhtml`, `.epub`, `.svg`, `.png`, `.jpg/.jpeg`, `.pptx`, `.ppt`, `.odp`, `.xls`, `.xlsx`, `.ods`, `.csv`, `.dbf`, `.pdb`, `.fb2` | Good for office/document conversions; fidelity varies with complex layouts. |
+| **LibreOffice (soffice)** | `.odt`, `.fodt`, `.ott`, `.doc`, `.docx`, `.docm`, `.dot`, `.dotx`, `.rtf`, `.txt`, `.html/.htm/.xhtml`, `.xml`, `.sxw`, `.wps`, `.wpd`, `.abw`, `.pdb`, `.epub`, `.fb2`, `.lit`, `.lrf`, `.pages`, `.csv`, `.tsv`, `.xls`, `.xlsx`, `.xlsm`, `.ods`, `.sxc`, `.123`, `.dbf`, `.fb2` | `.pdf`, `.pdfa`, `.odt`, `.fodt`, `.doc`, `.docx`, `.rtf`, `.txt`, `.html/.htm`, `.xhtml`, `.epub`, `.svg`, `.png`, `.jpg/.jpeg`, `.pptx`, `.ppt`, `.odp`, `.xls`, `.xlsx`, `.ods`, `.csv`, `.dbf`, `.pdb`, `.fb2` | Good for office/document conversions; fidelity varies with complex layouts. |
 | **Pandoc** | Markdown flavors (`.md`, `.markdown`), `.html/.htm`, LaTeX (`.tex`), `.rst`, `.docx`, `.odt`, `.epub`, `.ipynb`, `.opml`, `.adoc`/asciidoc, `.tex`, `.bib`/citation inputs | `.html/.html5`, `.xhtml`, `.latex/.tex`, `.pdf` (via LaTeX engine), `.docx`, `.odt`, `.epub`, `.md` (flavors), `.gfm`, `.rst`, `.pptx`, `.man`, `.mediawiki`, `.docbook` | Highly configurable via templates/filters; requires LaTeX for PDF output. |
 | **Ghostscript (gs)** | `.ps`, `.eps`, `.pdf`, PostScript streams | `.pdf` (various compat levels incl PDF/A), `.ps`, `.eps`, raster images (`.png`, `.jpg`, `.tiff`, `.bmp`, `.pnm`) | Useful for PDF manipulations, rasterization, and producing PDF/A. |
 | **Calibre (ebook-convert)** | `.epub`, `.mobi`, `.azw3`, `.azw`, `.fb2`, `.html`, `.docx`, `.doc`, `.rtf`, `.txt`, `.pdb`, `.lit`, `.tcr`, `.cbz`, `.cbr`, `.odt`, `.pdf` (input with caveats) | `.epub`, `.mobi` (legacy), `.azw3`, `.pdf`, `.docx`, `.rtf`, `.txt`, `.fb2`, `.htmlz`, `.pdb`, `.lrf`, `.lit`, `.tcr`, `.cbz`, `.cbr` | Excellent for ebook format conversions and metadata handling; PDF input/output fidelity varies. |
@@ -91,16 +138,7 @@ https://github.com/LoredCast/filewizard/wiki
 | **pngquant** | `.png` (truecolor/rgba) | `.png` (quantized palette PNG) | Lossy PNG quantization for smaller PNGs. |
 | **MozJPEG (cjpeg, jpegtran)** | `.ppm/.pbm/.pgm` (PNM), `.bmp`, existing `.jpg` | `.jpg/.jpeg` (MozJPEG-optimized) | Produces smaller JPEGs with improved compression; good for recompression. |
 | **SoX (Sound eXchange)** | `.wav`, `.aiff`, `.mp3` (if libmp3lame), `.flac`, `.ogg/.oga`, `.raw`, `.au`, `.voc`, `.w64`, `.gsm`, `.amr`, `.m4a` (if libs present) | `.wav`, `.aiff`, `.flac`, `.mp3`, `.ogg`, `.raw`, `.w64`, `.opus`, `.amr`, `.m4a` | Audio processing, normalization, effects; exact formats depend on linked libraries. |
-| **pngcrush / zopflipng / optipng** | `.png` | `.png` (optimized) | Lossless PNG optimization tools; choose depending on use-case and compression/compatibility trade-offs. |
 | **Tesseract OCR / ocrmypdf** | Image formats (`.png`, `.jpg`, `.jpeg`, `.tiff`), PDFs (image PDFs) | Plain text (`.txt`), searchable PDF (PDF with text layer), HOCR, ALTO XML | OCR engine; language/training data required for best accuracy. `ocrmypdf` is a wrapper for PDF workflows. |
 | **faster-whisper / OpenAI Whisper (local)** | Audio: `.mp3`, `.wav`, `.m4a`, `.flac`, `.ogg`, `.opus`, `.aac` | Plain text transcripts (`.txt`), `.srt`, `.vtt`, other subtitle formats | Local Whisper implementations for speech-to-text. Models and speed depend on CPU/GPU and model variant. |
-| **WhisperX / forced alignment tools** | same as Whisper | time-aligned transcripts, word-level timestamps | Useful for precise timestamping and alignment. |
-| **Calibre tools (ebook-meta, ebook-convert)** | see Calibre row | see Calibre row | Additional CLI tools for metadata editing and bulk operations. |
-| **Ghostscript-based PDF tools (pdftk alternatives)** | `.pdf` | `.pdf`, extracted pages, raster outputs | For splitting/merging, linearization, compatibility conversion. |
-| **djvulibre / ddjvu / djvutool** | `.djvu` | `.djvu`, `.png` (raster), `.pdf` | For DjVu document handling and conversions. |
-| **Raster→Vector helpers (autotrace, potrace, trace-layers)** | raster formats (`.png`, `.bmp`, `.tiff`) | vector (`.svg`, `.eps`, `.pdf`) | Useful pipeline components; exact choices depend on quality/needs. |
-| **OCR & layout tools (abbyy/paid SDKs not included)** | — | — | Proprietary solutions may offer higher accuracy/format support but are not bundled. |
-| **Custom CLI tools via `settings.yml`** | Any formats accepted by the configured tool | Any outputs produced by the configured tool | File Wizard can invoke arbitrary CLI tools; add entries to `settings.yml` to expose them in the UI. |
 
 ---
-

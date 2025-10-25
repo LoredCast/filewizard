@@ -21,3 +21,19 @@ my.settings.yml
 # IDE files
 .vscode/
 .idea/
+
+# Application files
+config/
+models/
+uploads/
+processed/
+app.log*
+core/
+test_chunks/
+test_processed/
+test_uploads/
+jobs.db-*
+huey.*
+*.db
+.env
+

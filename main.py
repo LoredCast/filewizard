@@ -1,4 +1,5 @@
 # main.py (merged)
+import html
 import threading
 import logging
 import shutil
@@ -12,8 +13,10 @@ import httpx
 import glob
 import cv2
 import numpy as np
+import secrets
+import hashlib
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 import resource
@@ -35,7 +38,7 @@ from pytesseract import TesseractNotFoundError
 from PIL import Image, UnidentifiedImageError
 from faster_whisper import WhisperModel
 from fastapi import (Depends, FastAPI, File, Form, HTTPException, Request,
-                     UploadFile, status, Body)
+                     UploadFile, status, Body, WebSocket, Query, WebSocketDisconnect)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -44,7 +47,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from huey import SqliteHuey, crontab
 from pydantic import BaseModel, ConfigDict, field_serializer
 from sqlalchemy import (Column, DateTime, Integer, String, Text,
-                        create_engine, delete, event)
+                        create_engine, delete, event, text)
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import NullPool
 from sqlalchemy.exc import OperationalError
@@ -57,6 +60,9 @@ from dotenv import load_dotenv
 from piper import PiperVoice
 import wave
 import io
+import mimetypes
+
+ENABLE_WEBSOCKETS = False
 
 
 load_dotenv()
@@ -109,16 +115,77 @@ PROCESSED_BASE = Path(os.environ.get("PROCESSED_DIR", "/app/processed")).resolve
 CHUNK_TMP_BASE = Path(os.environ.get("CHUNK_TMP_DIR", str(UPLOADS_BASE / "tmp"))).resolve()
 
 def ensure_path_is_safe(p: Path, allowed_bases: List[Path]):
-    """Ensure a path resolves to a location within one of the allowed base directories."""
+    """Enhanced path safety check with traversal prevention"""
     try:
+        # Resolve the path first to get the absolute path
         resolved_p = p.resolve()
+
+        # Check if resolved path is within allowed base directories
         if not any(resolved_p.is_relative_to(base) for base in allowed_bases):
             raise ValueError(f"Path {resolved_p} is outside of allowed directories.")
+
         return resolved_p
     except Exception as e:
         logger = logging.getLogger(__name__)
         logger.error(f"Path safety check failed for {p}: {e}")
         raise ValueError("Invalid or unsafe path specified.")
+
+def sanitize_filename(filename: str) -> str:
+    """Sanitize filename to prevent path traversal and XSS"""
+    from werkzeug.utils import secure_filename
+    # Use secure_filename and additional sanitization
+    safe_name = secure_filename(filename or "")
+    # Sanitize for HTML output
+    return html.escape(safe_name)
+
+def sanitize_output(output: str) -> str:
+    """Sanitize output to prevent XSS"""
+    if not output:
+        return ""
+    # Limit length and escape HTML
+    output = output[:2000]  # Limit length
+    return html.escape(output)
+
+def validate_file_type(filename: str, allowed_extensions: set) -> bool:
+    """Validate file type by extension"""
+    if not allowed_extensions:  # If set is empty, allow all
+        return True
+    return Path(filename).suffix.lower() in allowed_extensions
+
+def get_file_mime_type(filename: str) -> str:
+    """Get MIME type from file extension"""
+    mime_type, _ = mimetypes.guess_type(filename)
+    return mime_type or "application/octet-stream"  # Default to binary if unknown
+
+def get_file_extension(filename: str) -> str:
+    """Get file extension in lowercase"""
+    return Path(filename).suffix.lower()
+
+def get_supported_output_formats_for_file(filename: str, conversion_tools_config: dict) -> list:
+    """
+    Get all supported output formats for a given input file based on its extension
+    and the supported_input specifications in the tools configuration.
+    """
+    file_ext = get_file_extension(filename)
+    supported_formats = []
+    
+    for tool_name, tool_config in conversion_tools_config.items():
+        supported_inputs = tool_config.get("supported_input", [])
+        # Convert supported inputs to lowercase for comparison
+        supported_inputs_lower = [ext.lower() for ext in supported_inputs]
+        
+        if file_ext in supported_inputs_lower:
+            # Add all available formats for this tool
+            for format_key, format_label in tool_config.get("formats", {}).items():
+                full_format_key = f"{tool_name}_{format_key}"
+                supported_formats.append({
+                    "value": full_format_key,
+                    "label": f"{tool_config['name']} - {format_label}",
+                    "tool": tool_name,
+                    "format": format_key
+                })
+    
+    return supported_formats
 
 # --- Resource Limiting ---
 def _limit_resources_preexec():
@@ -184,115 +251,267 @@ PATHS.CONFIG_DIR.mkdir(exist_ok=True, parents=True)
 PATHS.TTS_MODELS_DIR.mkdir(exist_ok=True, parents=True)
 PATHS.KOKORO_TTS_MODELS_DIR.mkdir(exist_ok=True, parents=True)
 
+# --- WebSocket Connection Manager ---
+import json
+import asyncio
+import threading
+from typing import Dict, List
+from collections import defaultdict
+import time
+
+class ConnectionManager:
+    def __init__(self):
+        # Maps user_id to list of WebSocket connections
+        self.active_connections: Dict[str, List[WebSocket]] = defaultdict(list)
+        # Maps WebSocket to user_id
+        self.connection_to_user: Dict[WebSocket, str] = {}
+        # Maps WebSocket to connection metadata
+        self.connection_metadata: Dict[WebSocket, dict] = {}
+        # Logger
+        self.logger = logging.getLogger(__name__)
+
+    async def connect(self, websocket: WebSocket, user_id: str, connection_id: str = None):
+        await websocket.accept()
+        self.connection_to_user[websocket] = user_id
+        self.connection_metadata[websocket] = {"connection_id": connection_id or str(uuid.uuid4())}
+        self.active_connections[user_id].append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        user_id = self.connection_to_user.pop(websocket, None)
+        if user_id and websocket in self.active_connections[user_id]:
+            self.active_connections[user_id].remove(websocket)
+        self.connection_metadata.pop(websocket, None)
+
+    async def send_personal_message(self, message: str, websocket: WebSocket):
+        await websocket.send_text(message)
+
+    async def broadcast_user_jobs(self, user_id: str, message: str):
+        """Send message to all connections for a specific user"""
+        self.logger.debug(f"Broadcasting message to user {user_id}: {message}")
+        if user_id in self.active_connections:
+            disconnected = []
+            sent_count = 0
+            for websocket in self.active_connections[user_id]:
+                try:
+                    await websocket.send_text(message)
+                    sent_count += 1
+                except WebSocketDisconnect:
+                    disconnected.append(websocket)
+            
+            # Remove disconnected connections
+            for websocket in disconnected:
+                self.disconnect(websocket)
+            
+            if sent_count > 0:
+                self.logger.info(f"Sent WebSocket message to {sent_count} connections for user {user_id}")
+        else:
+            self.logger.info(f"No active connections for user {user_id}")
+
+    async def broadcast_job_status_update(self, user_id: str, job_data: dict):
+        """Send job status update to user's connections"""
+        logger = logging.getLogger(__name__)
+        logger.info(f"Broadcasting job update to user {user_id}: job_id={job_data.get('id')}, status={job_data.get('status')}")
+        
+        message = json.dumps({
+            "type": "job_update",
+            "job": job_data,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+        await self.broadcast_user_jobs(user_id, message)
+        logger.info(f"Finished broadcasting job update to user {user_id}")
+
+    async def broadcast_multiple_jobs_update(self, user_id: str, jobs_data: List):
+        """Send multiple job updates to user's connections"""
+        message = json.dumps({
+            "type": "batch_job_update",
+            "jobs": jobs_data,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+        await self.broadcast_user_jobs(user_id, message)
+
+    def sync_broadcast_job_status_update(self, user_id: str, job_data: dict):
+        """Synchronously broadcast job status update - for use from sync contexts like Huey tasks"""
+        logger = logging.getLogger(__name__)
+        job_id = job_data.get('id')
+        status = job_data.get('status')
+        progress = job_data.get('progress')
+        logger.info(f"Queueing WebSocket notification for user {user_id}: job_id={job_id}, status={status}, progress={progress}")
+        
+        try:
+            db = SessionLocal()
+            notification = Notification(
+                user_id=user_id,
+                job_data=json.dumps(job_data)
+            )
+            db.add(notification)
+            db.commit()
+            logger.info(f"Queued WebSocket notification for user {user_id}, job {job_id}")
+        except Exception as e:
+            logger.warning(f"Could not queue WebSocket notification for user {user_id}, job {job_id}: {e}")
+        finally:
+            if db:
+                db.close()
+
+    async def process_notification_queue(self):
+        """Process queued notifications and send them to WebSocket clients"""
+        db = SessionLocal()
+        claimed_notification_data = None
+        try:
+            # Find a notification to process
+            notification_to_process = db.query(Notification).order_by(Notification.created_at).first()
+            if not notification_to_process:
+                return
+
+            # Try to "claim" it by deleting it.
+            notification_id = notification_to_process.id
+            
+            # We need to copy the data before deleting.
+            claimed_notification_data = {
+                "id": notification_id,
+                "user_id": notification_to_process.user_id,
+                "job_data": notification_to_process.job_data
+            }
+
+            deleted_count = db.query(Notification).filter_by(id=notification_id).delete(synchronize_session=False)
+            db.commit()
+
+            if deleted_count == 0:
+                # Another worker got it first.
+                self.logger.debug(f"Notification {notification_id} was already claimed by another worker.")
+                claimed_notification_data = None # Do not process
+        
+        except Exception as e:
+            self.logger.error(f"Error claiming notification from DB: {e}")
+            db.rollback()
+            claimed_notification_data = None # Do not process
+        finally:
+            db.close()
+
+        # --- Process the claimed notification outside the DB transaction ---
+        if claimed_notification_data:
+            try:
+                user_id = claimed_notification_data["user_id"]
+                notification_id = claimed_notification_data["id"]
+                self.logger.debug(f"Processing claimed notification {notification_id} for user {user_id}")
+
+                if user_id in self.active_connections:
+                    job_data = json.loads(claimed_notification_data["job_data"])
+                    message = json.dumps({
+                        "type": "job_update",
+                        "job": job_data,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    })
+                    await self.broadcast_user_jobs(user_id, message)
+                    self.logger.info(f"Sent claimed notification {notification_id} to user {user_id}")
+            except Exception as e:
+                self.logger.warning(f"Error sending claimed notification {claimed_notification_data['id']}: {e}")
+
+# Initialize manager
+manager = ConnectionManager()
+
+
+def deep_merge(source: dict, dest: dict) -> dict:
+    """
+    Recursively merges source dict into dest dict. Modifies dest in place.
+    """
+    for key, value in source.items():
+        if isinstance(value, dict) and key in dest and isinstance(dest[key], dict):
+            deep_merge(value, dest[key])
+        else:
+            dest[key] = value
+    return dest
+
+def initialize_settings_file():
+    """
+    Ensures that config/settings.yml exists. If not, it copies it from
+    settings.default.yml.
+    """
+    if not PATHS.SETTINGS_FILE.exists():
+        logger.info(f"'{PATHS.SETTINGS_FILE}' not found. Copying from '{PATHS.DEFAULT_SETTINGS_FILE}'.")
+        try:
+            shutil.copy(PATHS.DEFAULT_SETTINGS_FILE, PATHS.SETTINGS_FILE)
+        except FileNotFoundError:
+            logger.error(f"CRITICAL: Default settings file '{PATHS.DEFAULT_SETTINGS_FILE}' not found. Cannot initialize settings.")
+            PATHS.SETTINGS_FILE.touch()
+        except Exception as e:
+            logger.error(f"CRITICAL: Failed to copy default settings file: {e}")
+            PATHS.SETTINGS_FILE.touch()
 
 def load_app_config():
     """
-    Loads configuration from settings.yml, with a fallback to settings.default.yml,
-    and finally to hardcoded defaults if both files are missing.
-    Reads environment variables for transcription device settings.
+    Loads configuration by deeply merging settings from hardcoded defaults,
+    settings.default.yml, and settings.yml, then applies environment variable
+    overrides.
     """
     global APP_CONFIG
+
+    # --- 1. Hardcoded Defaults ---
+    hardcoded_defaults = {
+        "app_settings": {"max_file_size_mb": 100, "allowed_all_extensions": [], "app_public_url": ""},
+        "transcription_settings": {"whisper": {"allowed_models": ["tiny", "base", "small"], "compute_type": "int8", "device": "cpu"}},
+        "tts_settings": {
+            "piper": {"model_dir": str(PATHS.TTS_MODELS_DIR), "use_cuda": False, "synthesis_config": {"length_scale": 1.0, "noise_scale": 0.667, "noise_w": 0.8}},
+            "kokoro": {"model_dir": str(PATHS.KOKORO_TTS_MODELS_DIR), "command_template": "kokoro-tts {input} {output} --model {model_path} --voices {voices_path} --lang {lang} --voice {model_name}"}
+        },
+        "conversion_tools": {},
+        "ocr_settings": {"ocrmypdf": {}},
+        "auth_settings": {"oidc_client_id": "", "oidc_client_secret": "", "oidc_server_metadata_url": "", "admin_users": []},
+        "webhook_settings": {"enabled": False, "allow_chunked_api_uploads": False, "allowed_callback_urls": [], "callback_bearer_token": ""}
+    }
+
+    config = hardcoded_defaults
+
+    # --- 2. Merge settings.default.yml ---
     try:
-        # --- Primary Method: Attempt to load settings.yml ---
-        with open(PATHS.SETTINGS_FILE, 'r', encoding='utf8') as f:
-            cfg_raw = yaml.safe_load(f) or {}
-
-        # Read transcription settings from environment variables, providing smart defaults.
-        transcription_device = os.environ.get("TRANSCRIPTION_DEVICE", "cpu")
-        # Default to float16 for CUDA for better performance, otherwise int8 for CPU.
-        default_compute_type = "float16" if transcription_device == "cuda" else "int8"
-        transcription_compute_type = os.environ.get("TRANSCRIPTION_COMPUTE_TYPE", default_compute_type)
-        transcription_device_index_str = os.environ.get("TRANSCRIPTION_DEVICE_INDEX", "0")
-
-        # Handle multiple device indexes (e.g., "0,1")
-        try:
-            if ',' in transcription_device_index_str:
-                transcription_device_index = [int(i.strip()) for i in transcription_device_index_str.split(',')]
-            else:
-                transcription_device_index = int(transcription_device_index_str)
-        except ValueError:
-            logger.warning(f"Invalid TRANSCRIPTION_DEVICE_INDEX value: '{transcription_device_index_str}'. Defaulting to 0.")
-            transcription_device_index = 0
-
-        defaults = {
-            "app_settings": {"max_file_size_mb": 100, "allowed_all_extensions": [], "app_public_url": ""},
-            "transcription_settings": {
-                "whisper": {
-                    "allowed_models": ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3"],
-                    "compute_type": transcription_compute_type,
-                    "device": transcription_device,
-                    "device_index": transcription_device_index
-                }
-            },
-            "tts_settings": {
-                "piper": {"model_dir": str(PATHS.TTS_MODELS_DIR), "use_cuda": False, "synthesis_config": {"length_scale": 1.0, "noise_scale": 0.667, "noise_w": 0.8}},
-                "kokoro": {"model_dir": str(PATHS.KOKORO_TTS_MODELS_DIR), "command_template": "kokoro-tts {input} {output} --model {model_path} --voices {voices_path} --lang {lang} --voice {model_name}"}
-            },
-            "conversion_tools": {},
-            "ocr_settings": {"ocrmypdf": {}},
-            "auth_settings": {"oidc_client_id": "", "oidc_client_secret": "", "oidc_server_metadata_url": "", "admin_users": []},
-            "webhook_settings": {"enabled": False, "allow_chunked_api_uploads": False, "allowed_callback_urls": [], "callback_bearer_token": ""}
-        }
-        cfg = defaults.copy()
-        cfg.update(cfg_raw) # Merge loaded settings into defaults
-        app_settings = cfg.get("app_settings", {})
-        max_mb = app_settings.get("max_file_size_mb", 100)
-        app_settings["max_file_size_bytes"] = int(max_mb) * 1024 * 1024
-        allowed = app_settings.get("allowed_all_extensions", [])
-        if not isinstance(allowed, (list, set)):
-            allowed = list(allowed)
-        app_settings["allowed_all_extensions"] = set(allowed)
-        cfg["app_settings"] = app_settings
-        APP_CONFIG = cfg
-        logger.info("Successfully loaded settings from settings.yml")
-
+        with open(PATHS.DEFAULT_SETTINGS_FILE, 'r', encoding='utf8') as f:
+            default_cfg = yaml.safe_load(f) or {}
+        config = deep_merge(default_cfg, config)
     except (FileNotFoundError, yaml.YAMLError) as e:
-        logger.warning(f"Could not load settings.yml: {e}. Falling back to settings.default.yml...")
-        try:
-            # --- Fallback Method: Attempt to load settings.default.yml ---
-            with open(PATHS.DEFAULT_SETTINGS_FILE, 'r', encoding='utf8') as f:
-                cfg_raw = yaml.safe_load(f) or {}
+        logger.warning(f"Could not load or parse settings.default.yml: {e}. Using hardcoded defaults.")
 
-            defaults = {
-                "app_settings": {"max_file_size_mb": 100, "allowed_all_extensions": [], "app_public_url": ""},
-                "transcription_settings": {"whisper": {"allowed_models": ["tiny", "base", "small"], "compute_type": "int8", "device": "cpu"}},
-                "tts_settings": {
-                    "piper": {"model_dir": str(PATHS.TTS_MODELS_DIR), "use_cuda": False, "synthesis_config": {"length_scale": 1.0, "noise_scale": 0.667, "noise_w": 0.8}},
-                    "kokoro": {"model_dir": str(PATHS.KOKORO_TTS_MODELS_DIR), "command_template": "kokoro-tts {input} {output} --model {model_path} --voices {voices_path} --lang {lang} --voice {model_name}"}
-                },
-                "conversion_tools": {},
-                "ocr_settings": {"ocrmypdf": {}},
-                "auth_settings": {"oidc_client_id": "", "oidc_client_secret": "", "oidc_server_metadata_url": "", "admin_users": []},
-                "webhook_settings": {"enabled": False, "allow_chunked_api_uploads": False, "allowed_callback_urls": [], "callback_bearer_token": ""}
-            }
-            cfg = defaults.copy()
-            cfg.update(cfg_raw) # Merge loaded settings into defaults
-            app_settings = cfg.get("app_settings", {})
-            max_mb = app_settings.get("max_file_size_mb", 100)
-            app_settings["max_file_size_bytes"] = int(max_mb) * 1024 * 1024
-            allowed = app_settings.get("allowed_all_extensions", [])
-            if not isinstance(allowed, (list, set)):
-                allowed = list(allowed)
-            app_settings["allowed_all_extensions"] = set(allowed)
-            cfg["app_settings"] = app_settings
-            APP_CONFIG = cfg
-            logger.info("Successfully loaded settings from settings.default.yml")
+    # --- 3. Merge settings.yml ---
+    try:
+        with open(PATHS.SETTINGS_FILE, 'r', encoding='utf8') as f:
+            user_cfg = yaml.safe_load(f) or {}
+        config = deep_merge(user_cfg, config)
+    except (FileNotFoundError, yaml.YAMLError):
+        # This is not an error, just means user is using defaults
+        pass
 
-        except (FileNotFoundError, yaml.YAMLError) as e_fallback:
-            # --- Final Failsafe: Use hardcoded defaults ---
-            logger.error(f"CRITICAL: Fallback file settings.default.yml also failed: {e_fallback}. Using hardcoded defaults.")
-            APP_CONFIG = {
-                "app_settings": {"max_file_size_mb": 100, "max_file_size_bytes": 100 * 1024 * 1024, "allowed_all_extensions": set(), "app_public_url": ""},
-                "transcription_settings": {"whisper": {"allowed_models": ["tiny", "base", "small"], "compute_type": "int8", "device": "cpu"}},
-                "tts_settings": {
-                    "piper": {"model_dir": str(PATHS.TTS_MODELS_DIR), "use_cuda": False, "synthesis_config": {"length_scale": 1.0, "noise_scale": 0.667, "noise_w": 0.8}},
-                    "kokoro": {"model_dir": str(PATHS.KOKORO_TTS_MODELS_DIR), "command_template": "kokoro-tts {input} {output} --model {model_path} --voices {voices_path} --lang {lang} --voice {model_name}"}
-                },
-                "conversion_tools": {},
-                "ocr_settings": {"ocrmypdf": {}},
-                "auth_settings": {"oidc_client_id": "", "oidc_client_secret": "", "oidc_server_metadata_url": "", "admin_users": []},
-                "webhook_settings": {"enabled": False, "allow_chunked_api_uploads": False, "allowed_callback_urls": [], "callback_bearer_token": ""}
-            }
+    # --- 4. Environment Variable Overrides for Transcription ---
+    # Safely access nested keys
+    trans_settings = config.get("transcription_settings", {}).get("whisper", {})
+    transcription_device = os.environ.get("TRANSCRIPTION_DEVICE", trans_settings.get("device", "cpu"))
+    default_compute_type = "float16" if transcription_device == "cuda" else "int8"
+    transcription_compute_type = os.environ.get("TRANSCRIPTION_COMPUTE_TYPE", trans_settings.get("compute_type", default_compute_type))
+    transcription_device_index_str = os.environ.get("TRANSCRIPTION_DEVICE_INDEX", "0")
+
+    try:
+        if ',' in transcription_device_index_str:
+            transcription_device_index = [int(i.strip()) for i in transcription_device_index_str.split(',')]
+        else:
+            transcription_device_index = int(transcription_device_index_str)
+    except ValueError:
+        logger.warning(f"Invalid TRANSCRIPTION_DEVICE_INDEX value: '{transcription_device_index_str}'. Defaulting to 0.")
+        transcription_device_index = 0
+
+    config.setdefault("transcription_settings", {}).setdefault("whisper", {})
+    config["transcription_settings"]["whisper"]["device"] = transcription_device
+    config["transcription_settings"]["whisper"]["compute_type"] = transcription_compute_type
+    config["transcription_settings"]["whisper"]["device_index"] = transcription_device_index
+
+    # --- 5. Final Processing & Assignment ---
+    app_settings = config.get("app_settings", {})
+    max_mb = app_settings.get("max_file_size_mb", 100)
+    app_settings["max_file_size_bytes"] = int(max_mb) * 1024 * 1024
+    allowed = app_settings.get("allowed_all_extensions", [])
+    if not isinstance(allowed, (list, set)):
+        allowed = []
+    app_settings["allowed_all_extensions"] = set(allowed)
+    config["app_settings"] = app_settings
+
+    APP_CONFIG = config
+    logger.info("Application configuration loaded.")
 
 
 # --------------------------------------------------------------------------------
@@ -379,10 +598,18 @@ class FinalizeUploadPayload(BaseModel):
     model_size: str = ""
     model_name: str = ""
     output_format: str = ""
+    generate_timestamps: bool = False
     callback_url: Optional[str] = None # For API chunked uploads
 
 class JobSelection(BaseModel):
     job_ids: List[str]
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, index=True, nullable=False)
+    job_data = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 # --------------------------------------------------------------------------------
 # --- 3. CRUD OPERATIONS & WEBHOOKS
@@ -402,6 +629,7 @@ def get_jobs(db: Session, user_id: str | None = None, skip: int = 0, limit: int 
         query = query.filter(Job.user_id == user_id)
     return query.order_by(Job.created_at.desc()).offset(skip).limit(limit).all()
 
+
 def create_job(db: Session, job: JobCreate):
     db_job = Job(**job.model_dump())
     db.add(db_job)
@@ -414,22 +642,29 @@ def create_job(db: Session, job: JobCreate):
 def update_job_status(db: Session, job_id: str, status: str, progress: int = None, error: str = None):
     db_job = get_job(db, job_id)
     if db_job:
+        old_status = db_job.status
+        old_progress = db_job.progress
+
         db_job.status = status
         if progress is not None:
             db_job.progress = progress
         if error:
             db_job.error_message = error
+
+        status_changed = old_status != status
+        progress_changed = progress is not None and old_progress != progress
+
         db.commit()
-        db.refresh(db_job)
-        # Broadcast the updated job to UI clients via Huey task
+
         job_schema = JobSchema.model_validate(db_job)
+
+        if (status_changed or progress_changed) and db_job.user_id:
+            manager.sync_broadcast_job_status_update(db_job.user_id, job_schema.model_dump())
     return db_job
 
 def mark_job_as_completed(db: Session, job_id: str, output_filepath_str: str | None = None, preview: str | None = None):
     db_job = get_job(db, job_id)
     if db_job and db_job.status != 'cancelled':
-        db_job.status = "completed"
-        db_job.progress = 100
         if preview:
             db_job.result_preview = preview.strip()[:2000]
         if output_filepath_str:
@@ -439,11 +674,8 @@ def mark_job_as_completed(db: Session, job_id: str, output_filepath_str: str | N
                     db_job.output_filesize = output_path.stat().st_size
             except Exception:
                 logger.exception(f"Could not stat output file {output_filepath_str} for job {job_id}")
-        db.commit()
-        db.refresh(db_job)
-        # Broadcast the final job state to UI clients via Huey task
-        job_schema = JobSchema.model_validate(db_job)
 
+        update_job_status(db, job_id, "completed", progress=100)
     return db_job
 
 def send_webhook_notification(job_id: str, app_config: Dict[str, Any], base_url: str):
@@ -971,7 +1203,7 @@ def list_kokoro_voices_cli(timeout: int = 60) -> List[str]:
 
     cmd = ["kokoro-tts", "--help-voices", "--model", str(model_path), "--voices", str(voices_path)]
     try:
-        logger.debug("Trying Kokoro TTS CLI list: %s", shlex.join(cmd))
+        logger.info("Trying Kokoro TTS CLI list: %s", shlex.join(cmd))
         cp = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
@@ -1003,6 +1235,7 @@ def list_kokoro_voices_cli(timeout: int = 60) -> List[str]:
         return []
     except subprocess.CalledProcessError as e:
         logger.error("Kokoro TTS CLI list command failed. stderr: %s", e.stderr[:1000])
+        logger.error("Kokoro TTS CLI list command failed. stdout: %s", e.stdout[:1000])
         return []
     except subprocess.TimeoutExpired:
         logger.warning("Kokoro TTS CLI list command timed out.")
@@ -1051,6 +1284,7 @@ def list_kokoro_languages_cli(timeout: int = 60) -> List[str]:
         return []
     except subprocess.CalledProcessError as e:
         logger.error("Kokoro TTS language list command failed. stderr: %s", e.stderr[:1000])
+        logger.error("Kokoro TTS language list command failed. stdout: %s", e.stdout[:1000])
         return []
     except subprocess.TimeoutExpired:
         logger.warning("Kokoro TTS language list command timed out.")
@@ -1130,17 +1364,32 @@ def validate_and_build_command(template_str: str, mapping: Dict[str, str]) -> Ty
     # Filter out any empty strings that result from empty optional placeholders
     return [part for part in formatted_command if part]
 
+class SrtFormatter:
+    def __init__(self):
+        self.segment_count = 0
+
+    def _format_time(self, seconds):
+        delta = timedelta(seconds=seconds)
+        hours, remainder = divmod(int(delta.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        milliseconds = int((delta.total_seconds() % 1) * 1000)
+        return f"{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}"
+
+    def format_segment(self, segment):
+        self.segment_count += 1
+        start_time = self._format_time(segment.start)
+        end_time = self._format_time(segment.end)
+        return f"{self.segment_count}\n{start_time} --> {end_time}\n{segment.text.strip()}\n\n"
+
 # --- TASK RUNNERS ---
 @huey.task()
-def run_transcription_task(job_id: str, input_path_str: str, output_path_str: str, model_size: str, whisper_settings: dict, app_config: dict, base_url: str):
+def run_transcription_task(job_id: str, input_path_str: str, output_path_str: str, model_size: str, whisper_settings: dict, app_config: dict, base_url: str, generate_timestamps: bool = False):
     db = SessionLocal()
     input_path = Path(input_path_str)
     output_path = Path(output_path_str)
 
     # --- Constants ---
-    # Time in seconds between database checks for progress updates and cancellations.
-    # This avoids hammering the database on every single segment.
-    DB_POLL_INTERVAL_SECONDS = 5
+    DB_POLL_INTERVAL_SECONDS = 1
 
     try:
         job = get_job(db, job_id)
@@ -1155,47 +1404,80 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
 
         model = get_whisper_model(model_size, whisper_settings)
         logger.info(f"Starting transcription for job {job_id} with model '{model_size}'")
-        segments_generator, info = model.transcribe(str(input_path), beam_size=5)
+        
+        transcribe_args = {"beam_size": 5}
+        # For SRT format, we need segment timestamps which are generated by default
+        # The 'word_timestamps' parameter is for even more granular word-level timestamps
+        # which are not needed for basic SRT format
+
+        segments_generator, info = model.transcribe(str(input_path), **transcribe_args)
+        
         logger.info(f"Detected language: {info.language} with probability {info.language_probability:.2f} for a duration of {info.duration:.2f}s")
 
-
         last_update_time = time.time()
+        last_db_refresh_time = time.time()
+        DB_REFRESH_INTERVAL = 30
 
-        # Use a temporary file to ensure atomic writes. The final file will only appear
-        # once the transcription is fully and successfully written.
+        update_job_status(db, job_id, "processing", progress=5)
+        logger.info(f"Transcription job {job_id} started, progress at 5%")
+
         tmp_output_path = output_path.with_name(f"{output_path.stem}.tmp-{uuid.uuid4().hex}{output_path.suffix}")
 
-        # Store a small preview in memory for the final update without holding the whole transcript.
         preview_segments = []
-        PREVIEW_MAX_LENGTH = 1000  # characters
+        PREVIEW_MAX_LENGTH = 1000
         current_preview_length = 0
 
         with tmp_output_path.open("w", encoding="utf-8") as f:
-            for segment in segments_generator:
-                segment_text = segment.text.strip()
-                f.write(segment_text + "\n")
+            if generate_timestamps:
+                srt_formatter = SrtFormatter()
+                for segment in segments_generator:
+                    formatted_srt = srt_formatter.format_segment(segment)
+                    f.write(formatted_srt)
+                    
+                    segment_text = segment.text.strip()
+                    if current_preview_length < PREVIEW_MAX_LENGTH:
+                        preview_segments.append(segment_text)
+                        current_preview_length += len(segment_text)
+                    
+                    current_time = time.time()
+                    if current_time - last_db_refresh_time > DB_REFRESH_INTERVAL:
+                        db.close()
+                        db = SessionLocal()
+                        last_db_refresh_time = current_time
 
-                # Build a small preview
-                if current_preview_length < PREVIEW_MAX_LENGTH:
-                    preview_segments.append(segment_text)
-                    current_preview_length += len(segment_text)
+                    if current_time - last_update_time > DB_POLL_INTERVAL_SECONDS:
+                        last_update_time = current_time
+                        job_check = get_job(db, job_id)
+                        if job_check and job_check.status == 'cancelled':
+                            logger.info(f"Job {job_id} cancelled during transcription. Stopping.")
+                            return
+                        if info.duration > 0:
+                            progress = int((segment.end / info.duration) * 100)
+                            update_job_status(db, job_id, "processing", progress=progress)
+            else:
+                for segment in segments_generator:
+                    segment_text = segment.text.strip()
+                    f.write(segment_text + "\n")
 
+                    if current_preview_length < PREVIEW_MAX_LENGTH:
+                        preview_segments.append(segment_text)
+                        current_preview_length += len(segment_text)
 
-                current_time = time.time()
-                if current_time - last_update_time > DB_POLL_INTERVAL_SECONDS:
-                    last_update_time = current_time
+                    current_time = time.time()
+                    if current_time - last_db_refresh_time > DB_REFRESH_INTERVAL:
+                        db.close()
+                        db = SessionLocal()
+                        last_db_refresh_time = current_time
 
-                    # Check for cancellation without overwhelming the DB
-                    job_check = get_job(db, job_id)
-                    if job_check and job_check.status == 'cancelled':
-                        logger.info(f"Job {job_id} cancelled during transcription. Stopping.")
-                        # The temporary file will be cleaned up in the finally block
-                        return
-
-                    # Update progress
-                    if info.duration > 0:
-                        progress = int((segment.end / info.duration) * 100)
-                        update_job_status(db, job_id, "processing", progress=progress)
+                    if current_time - last_update_time > DB_POLL_INTERVAL_SECONDS:
+                        last_update_time = current_time
+                        job_check = get_job(db, job_id)
+                        if job_check and job_check.status == 'cancelled':
+                            logger.info(f"Job {job_id} cancelled during transcription. Stopping.")
+                            return
+                        if info.duration > 0:
+                            progress = int((segment.end / info.duration) * 100)
+                            update_job_status(db, job_id, "processing", progress=progress)
 
         tmp_output_path.replace(output_path)
 
@@ -1593,9 +1875,11 @@ def run_conversion_task(job_id: str,
                 quality_token = parts[1] if len(parts) > 1 else (parts[0] if parts else "")
                 quality = quality_token.replace("q", "") if quality_token else ""
                 mapping.update({"quality": quality})
-            elif tool_name == "libreoffice":
-                target_ext = output_path.suffix.lstrip('.')
-                filter_val = tool_cfg.get("filters", {}).get(target_ext, target_ext)
+            elif tool_name == 'libreoffice':
+                target_ext = mapping['output_ext']
+                filter_val = tool_cfg.get("filters", {}).get(target_ext)
+                if not filter_val:
+                    filter_val = target_ext
                 mapping["filter"] = filter_val
         except Exception:
             logger.exception("Failed to parse task_key for tool %s; continuing with defaults.", tool_name)
@@ -1714,7 +1998,7 @@ def run_conversion_task(job_id: str,
         mapping = {
             "input": str(current_input_path),
             "output": str(temp_output_file),
-            "output_dir": str(output_path.parent),
+            "output_dir": str(current_input_path.parent),
             "output_ext": output_path.suffix.lstrip('.'),
         }
 
@@ -1733,10 +2017,29 @@ def run_conversion_task(job_id: str,
         # Run main conversion in cancellable manner
         timeout_val = int(tool_config.get("timeout", 300))
 
-        # call the cancellable runner above
-        result = _run_cancellable_command(command, timeout=timeout_val) if False else None
-        # the above is replaced with a direct call to the actual function:
         result = _run_cancellable_command(command, timeout=timeout_val)
+
+        # Wait for output file to be created and non-empty, with retry for long-running operations
+        max_wait_time = 30  # seconds
+        wait_interval = 0.5  # seconds
+        elapsed_time = 0
+        
+        while elapsed_time < max_wait_time:
+            if temp_output_file.exists() and temp_output_file.stat().st_size > 0:
+                break
+            time.sleep(wait_interval)
+            elapsed_time += wait_interval
+            
+            # Check if job was cancelled during wait
+            job_check = _get_job(db, job_id)
+            if job_check is None:
+                raise Exception("Job disappeared during file creation wait")
+            if job_check.status == "cancelled":
+                raise Exception("Conversion cancelled during file creation wait")
+
+        # Final check after waiting
+        if not temp_output_file.exists() or temp_output_file.stat().st_size == 0:
+            raise Exception("Conversion failed: The tool produced an empty or missing output file after waiting.")
 
         # If successful and temp output exists, move it into place atomically
         if temp_output_file and temp_output_file.exists():
@@ -1824,12 +2127,12 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
         parent_job_id=parent_job_id
     )
 
-    if task_type == "transcription":
-        stem = Path(safe_filename).stem
-        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.txt"
+    if task_type == 'transcription':
+        output_suffix = '.srt' if options.get('generate_timestamps', False) else '.txt'
+        processed_path = PATHS.PROCESSED_DIR / f"{Path(original_filename).stem}_{job_id[:8]}{output_suffix}"
         job_data.processed_filepath = str(processed_path)
         create_job(db=db, job=job_data)
-        run_transcription_task(job_data.id, str(final_path), str(processed_path), options.get("model_size", "base"), app_config.get("transcription_settings", {}).get("whisper", {}), app_config, base_url)
+        run_transcription_task(job_data.id, str(final_path), str(processed_path), options.get("model_size", "base"), app_config.get("transcription_settings", {}).get("whisper", {}), app_config, base_url, generate_timestamps=options.get('generate_timestamps', False))
     elif task_type == "tts":
         tts_config = app_config.get("tts_settings", {})
         stem = Path(safe_filename).stem
@@ -2125,32 +2428,61 @@ import json
 # --- 2. DATABASE & Schemas
 
 async def download_kokoro_models_if_missing():
-    """Checks for Kokoro TTS model files and downloads them if they don't exist."""
+    """Checks for Kokoro TTS model files and downloads them if they don't exist or are empty."""
     files_to_download = {
-        "model": {"path": PATHS.KOKORO_MODEL_FILE, "url": "https://github.com/nazdridoy/kokoro-tts/releases/download/v1.0.0/kokoro-v1.0.onnx"},
-        "voices": {"path": PATHS.KOKORO_VOICES_FILE, "url": "https://github.com/nazdridoy/kokoro-tts/releases/download/v1.0.0/voices-v1.0.bin"}
+        "model": {
+            "path": PATHS.KOKORO_MODEL_FILE,
+            "url": "https://github.com/nazdridoy/kokoro-tts/releases/download/v1.0.0/kokoro-v1.0.onnx",
+            "size": 325532387
+        },
+        "voices": {
+            "path": PATHS.KOKORO_VOICES_FILE,
+            "url": "https://github.com/nazdridoy/kokoro-tts/releases/download/v1.0.0/voices-v1.0.bin",
+            "size": 26124436
+        }
     }
     async with httpx.AsyncClient() as client:
         for name, details in files_to_download.items():
-            path, url = details["path"], details["url"]
-            if not path.exists():
-                logger.info(f"Kokoro TTS {name} file missing. Downloading from {url}...")
-                try:
-                    with path.open("wb") as f:
-                        async with client.stream("GET", url, follow_redirects=True, timeout=300) as response:
-                            response.raise_for_status()
-                            async for chunk in response.aiter_bytes():
-                                f.write(chunk)
-                    logger.info(f"Successfully downloaded Kokoro TTS {name} file to {path}.")
-                except Exception as e:
-                    logger.error(f"Failed to download Kokoro TTS {name} file: {e}")
-                    if path.exists(): path.unlink(missing_ok=True)
+            path, url, expected_size = details["path"], details["url"], details["size"]
+            
+            # Check for existence and size
+            if not path.exists() or path.stat().st_size != expected_size:
+                if path.exists():
+                    logger.warning(f"Kokoro TTS {name} file found but has incorrect size. Expected {expected_size}, got {path.stat().st_size}. Re-downloading.")
+                else:
+                    logger.info(f"Kokoro TTS {name} file missing. Downloading from {url}...")
+
+                for attempt in range(3):
+                    try:
+                        with path.open("wb") as f:
+                            async with client.stream("GET", url, follow_redirects=True, timeout=300) as response:
+                                response.raise_for_status()
+                                total_downloaded = 0
+                                async for chunk in response.aiter_bytes():
+                                    f.write(chunk)
+                                    total_downloaded += len(chunk)
+                        
+                        if total_downloaded == expected_size:
+                            logger.info(f"Successfully downloaded Kokoro TTS {name} file to {path}.")
+                            break
+                        else:
+                            logger.warning(f"Kokoro TTS {name} download incomplete. Expected {expected_size}, got {total_downloaded}. Retrying...")
+                    except Exception as e:
+                        logger.error(f"Failed to download Kokoro TTS {name} file (attempt {attempt + 1}): {e}")
+                        if path.exists():
+                            path.unlink(missing_ok=True)
+                        await asyncio.sleep(5)
+                else:
+                    logger.critical(f"Failed to download Kokoro TTS {name} file after 3 attempts. TTS will not be available.")
+
             else:
-                logger.info(f"Found existing Kokoro TTS {name} file at {path}.")
+                logger.info(f"Found existing and valid Kokoro TTS {name} file at {path}.")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Application starting up...")
+    global AVAILABLE_TTS_VOICES_CACHE
+    AVAILABLE_TTS_VOICES_CACHE = None
     # Base.metadata.create_all(bind=engine)
 
     create_attempts = 3
@@ -2181,7 +2513,7 @@ async def lifespan(app: FastAPI):
             logger.exception("Unexpected error during DB initialization.")
             raise
 
-
+    initialize_settings_file()
     load_app_config()
 
     # Start the cache cleanup thread
@@ -2192,8 +2524,10 @@ async def lifespan(app: FastAPI):
         logger.info("Whisper model cache cleanup thread started.")
 
     # Download required models on startup
-    if shutil.which("kokoro-tts"):
-        await download_kokoro_models_if_missing()
+    DOWNLOAD_KOKORO_ON_STARTUP = os.environ.get('DOWNLOAD_KOKORO_ON_STARTUP', 'false').lower() == 'true'
+    if shutil.which("kokoro-tts") and DOWNLOAD_KOKORO_ON_STARTUP:
+        logger.info("Checking for Kokoro TTS Models (async)")
+        app.state.download_kokoro_task = asyncio.create_task(download_kokoro_models_if_missing())
 
     if PiperVoice is None:
         logger.warning("piper-tts is not installed. Piper TTS features will be disabled. Install with: pip install piper-tts")
@@ -2207,19 +2541,73 @@ async def lifespan(app: FastAPI):
     if not LOCAL_ONLY_MODE:
         oidc_cfg = APP_CONFIG.get('auth_settings', {})
         if not all(oidc_cfg.get(k) for k in ['oidc_client_id', 'oidc_client_secret', 'oidc_server_metadata_url']):
-            logger.error("OIDC auth settings are incomplete. Auth will be disabled if not in LOCAL_ONLY_MODE.")
+            logger.warning("OIDC auth settings are incomplete. Auth will be disabled.")
+            app.state.oidc_registration_failed = True
         else:
-            oauth.register(
-                name='oidc',
-                client_id=oidc_cfg.get('oidc_client_id'),
-                client_secret=oidc_cfg.get('oidc_client_secret'),
-                server_metadata_url=oidc_cfg.get('oidc_server_metadata_url'),
-                client_kwargs={'scope': 'openid email profile'},
-                userinfo_endpoint=oidc_cfg.get('oidc_userinfo_endpoint'),
-                end_session_endpoint=oidc_cfg.get('oidc_end_session_endpoint')
-            )
-            logger.info('OAuth registered.')
+            try:
+                oauth.register(
+                    name='oidc',
+                    client_id=oidc_cfg.get('oidc_client_id'),
+                    client_secret=oidc_cfg.get('oidc_client_secret'),
+                    server_metadata_url=oidc_cfg.get('oidc_server_metadata_url'),
+                    client_kwargs={'scope': 'openid email profile'},
+                    userinfo_endpoint=oidc_cfg.get('oidc_userinfo_endpoint'),
+                    end_session_endpoint=oidc_cfg.get('oidc_end_session_endpoint')
+                )
+                logger.info('OAuth registered successfully.')
+                app.state.oidc_registration_failed = False
+            except Exception as e:
+                logger.error(f"Failed to register OIDC OAuth provider: {e}. Authentication will be disabled.")
+                app.state.oidc_registration_failed = True
+    
+    # Background task for processing WebSocket notification queue
+    async def process_notifications_periodically():
+        """Process WebSocket notification queue periodically"""
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        
+        while True:
+            try:
+                await manager.process_notification_queue()
+                await asyncio.sleep(0.1)  # Process every 100ms
+                
+                # Reset error counter on success
+                consecutive_errors = 0
+                
+            except Exception as e:
+                consecutive_errors += 1
+                logger.error(f"Error processing WebSocket notifications (consecutive errors: {consecutive_errors}): {e}")
+                
+                # If we have too many consecutive errors, log a warning
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.warning(f"Too many consecutive errors in WebSocket notification processor. Restarting...")
+                    consecutive_errors = 0
+                
+                await asyncio.sleep(min(1 * consecutive_errors, 10))  # Exponential backoff, max 10s
+    
+    if ENABLE_WEBSOCKETS:
+        # Store the task reference so we can cancel it later
+        app.state.notification_processor_task = asyncio.create_task(process_notifications_periodically())
+        logger.info("WebSocket notification processor task started")
+    
     yield
+    
+    # Cleanup
+    if ENABLE_WEBSOCKETS and hasattr(app.state, 'notification_processor_task'):
+        app.state.notification_processor_task.cancel()
+        try:
+            await app.state.notification_processor_task
+        except asyncio.CancelledError:
+            pass
+
+    if hasattr(app.state, 'download_kokoro_task'):
+        app.state.download_kokoro_task.cancel()
+        try:
+            await app.state.download_kokoro_task
+        except asyncio.CancelledError:
+            logger.info("Kokoro download task cancelled.")
+            pass
+
     logger.info('Application shutting down...')
 
 app = FastAPI(lifespan=lifespan)
@@ -2239,12 +2627,21 @@ app.add_middleware(
     max_age=14 * 24 * 60 * 60  # 14 days
 )
 
+# CORS Configuration - allow all in dev, restrict in production
+if ENV == 'production':
+    # Read allowed origins from environment variable
+    allowed_origins_env = os.environ.get('ALLOWED_ORIGINS', 'http://localhost,http://127.0.0.1')
+    allowed_origins = [origin.strip() for origin in allowed_origins_env.split(',') if origin.strip()]
+else:
+    # Allow all in development
+    allowed_origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 
@@ -2267,6 +2664,11 @@ async def require_api_user(request: Request, creds: HTTPAuthorizationCredentials
 
     if not creds:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    
+    if not check_oidc_availability():
+        logger.warning("OIDC not available for API authentication")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication system is not properly configured")
+    
     token = creds.credentials
     try:
         user = await oauth.oidc.userinfo(token={'access_token': token})
@@ -2291,13 +2693,26 @@ def require_admin(request: Request):
     if not is_admin(request): raise HTTPException(status_code=403, detail="Administrator privileges required.")
     return True
 
+def check_oidc_availability():
+    """Check if OIDC is properly configured and registered"""
+    if LOCAL_ONLY_MODE:
+        return True  # No OIDC needed in local mode
+    # In non-local mode, check if registration failed
+    return not getattr(app.state, 'oidc_registration_failed', True)
+
 # --- FILE SAVING UTILITY ---
 async def save_upload_file(upload_file: UploadFile, destination: Path) -> int:
     """
-    Saves an uploaded file to a destination, handling size limits.
+    Saves an uploaded file to a destination, handling size limits and validating file type.
     This function is used by both the simple API and the legacy direct-upload routes.
     """
     max_size = APP_CONFIG.get("app_settings", {}).get("max_file_size_bytes", 100 * 1024 * 1024)
+    
+    # Validate file type before processing
+    allowed_extensions = APP_CONFIG.get("app_settings", {}).get("allowed_all_extensions", set())
+    if not validate_file_type(upload_file.filename, allowed_extensions):
+        raise HTTPException(status_code=400, detail=f"File type '{Path(upload_file.filename).suffix}' not allowed.")
+    
     tmp_path = destination.with_name(f"{destination.stem}.tmp-{uuid.uuid4().hex}{destination.suffix}")
     size = 0
     try:
@@ -2312,17 +2727,23 @@ async def save_upload_file(upload_file: UploadFile, destination: Path) -> int:
                 buffer.write(chunk)
         tmp_path.replace(destination)
         return size
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions
     except Exception as e:
+        logger.exception(f"Error saving upload file: {e}")
+        # Ensure temp file is cleaned up on error
         try:
-            # Ensure temp file is cleaned up on error
-            ensure_path_is_safe(tmp_path, [PATHS.UPLOADS_DIR, PATHS.CHUNK_TMP_DIR])
-            tmp_path.unlink(missing_ok=True)
+            if tmp_path.exists():
+                tmp_path.unlink()
         except Exception:
             logger.exception("Failed to remove temp upload file after error.")
-        # Re-raise the original exception
-        raise e
+        raise HTTPException(status_code=500, 
+                            detail="Failed to save uploaded file due to server error")
     finally:
-        await upload_file.close()
+        try:
+            await upload_file.close()
+        except Exception:
+            pass  # Don't let close failure mask other errors
 
 def is_allowed_file(filename: str, allowed_extensions: set) -> bool:
     if not allowed_extensions: # If set is empty, allow all
@@ -2405,6 +2826,11 @@ async def finalize_upload(request: Request, payload: FinalizeUploadPayload, user
     if payload.callback_url and not is_allowed_callback_url(payload.callback_url, webhook_config.get("allowed_callback_urls", [])):
         raise HTTPException(status_code=400, detail="Provided callback_url is not allowed.")
 
+    # Validate file type before processing
+    allowed_extensions = APP_CONFIG.get("app_settings", {}).get("allowed_all_extensions", set())
+    if not validate_file_type(payload.original_filename, allowed_extensions):
+        raise HTTPException(status_code=400, detail=f"File type '{Path(payload.original_filename).suffix}' not allowed.")
+
     job_id = uuid.uuid4().hex
     safe_filename = secure_filename(payload.original_filename)
     final_path = PATHS.UPLOADS_DIR / f"{Path(safe_filename).stem}_{job_id}{Path(safe_filename).suffix}"
@@ -2442,7 +2868,7 @@ async def finalize_upload(request: Request, payload: FinalizeUploadPayload, user
         unzip_and_dispatch_task(job_id, str(final_path), payload.task_type, sub_task_options, user, APP_CONFIG, base_url)
     else:
         # This is the logic for all other single-file uploads.
-        options = {"model_size": payload.model_size, "model_name": payload.model_name, "output_format": payload.output_format}
+        options = {"model_size": payload.model_size, "model_name": payload.model_name, "output_format": payload.output_format, "generate_timestamps": payload.generate_timestamps}
         dispatch_single_file_job(payload.original_filename, str(final_path), payload.task_type, user, db, APP_CONFIG, base_url, job_id=job_id, options=options)
 
     # --- FIX STARTS HERE ---
@@ -2467,6 +2893,7 @@ async def finalize_upload(request: Request, payload: FinalizeUploadPayload, user
 @app.post("/transcribe-audio", status_code=status.HTTP_202_ACCEPTED)
 async def submit_audio_transcription(
     request: Request, file: UploadFile = File(...), model_size: str = Form("base"),
+    generate_timestamps: bool = Form(False),
     db: Session = Depends(get_db), user: dict = Depends(require_user)
 ):
     allowed_audio_exts = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus"}
@@ -2480,14 +2907,15 @@ async def submit_audio_transcription(
     job_id, safe_basename = uuid.uuid4().hex, secure_filename(file.filename)
     stem, suffix = Path(safe_basename).stem, Path(safe_basename).suffix
     upload_path = PATHS.UPLOADS_DIR / f"{stem}_{job_id}{suffix}"
-    processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.txt"
+    output_suffix = '.srt' if generate_timestamps else '.txt'
+    processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}{output_suffix}"
     input_size = await save_upload_file(file, upload_path)
     base_url = str(request.base_url)
 
     job_data = JobCreate(id=job_id, user_id=user['sub'], task_type="transcription", original_filename=file.filename,
                          input_filepath=str(upload_path), input_filesize=input_size, processed_filepath=str(processed_path))
     new_job = create_job(db=db, job=job_data)
-    run_transcription_task(new_job.id, str(upload_path), str(processed_path), model_size, whisper_settings=whisper_config, app_config=APP_CONFIG, base_url=base_url)
+    run_transcription_task(new_job.id, str(upload_path), str(processed_path), model_size, whisper_settings=whisper_config, app_config=APP_CONFIG, base_url=base_url, generate_timestamps=generate_timestamps)
     return {"job_id": new_job.id, "status": new_job.status, "status_url": f"/job/{new_job.id}"}
 
 @app.post("/convert-file", status_code=status.HTTP_202_ACCEPTED)
@@ -2581,14 +3009,20 @@ def is_allowed_callback_url(url: str, allowed: List[str]) -> bool:
 async def get_tts_voices_list(user: dict = Depends(require_user)):
     global AVAILABLE_TTS_VOICES_CACHE
 
+    if AVAILABLE_TTS_VOICES_CACHE is not None:
+        return AVAILABLE_TTS_VOICES_CACHE
+
     kokoro_available = shutil.which("kokoro-tts") is not None
-    piper_available = PiperVoice is not None
+    piper_available = False
+    try:
+        import piper
+        piper_available = True
+    except ImportError:
+        pass
 
     if not piper_available and not kokoro_available:
+        AVAILABLE_TTS_VOICES_CACHE = []
         return JSONResponse(content={"error": "TTS feature not configured on server (no TTS engines found)."}, status_code=501)
-
-    if AVAILABLE_TTS_VOICES_CACHE:
-        return AVAILABLE_TTS_VOICES_CACHE
 
     all_voices = []
     try:
@@ -2616,6 +3050,7 @@ async def get_tts_voices_list(user: dict = Depends(require_user)):
         return AVAILABLE_TTS_VOICES_CACHE
     except Exception as e:
         logger.exception("Could not fetch list of TTS voices.")
+        AVAILABLE_TTS_VOICES_CACHE = [] # Cache the failure
         raise HTTPException(status_code=500, detail=f"Could not retrieve voices list: {e}")
 
 # --- Standard API endpoint (non-chunked) ---
@@ -2624,6 +3059,7 @@ async def api_process_file(
     request: Request, file: UploadFile = File(...), task_type: str = Form(...), callback_url: str = Form(...),
     model_size: Optional[str] = Form("base"), model_name: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
+    generate_timestamps: bool = Form(False),
     db: Session = Depends(get_db), user: dict = Depends(require_api_user)
 ):
     """
@@ -2665,10 +3101,11 @@ async def api_process_file(
         whisper_config = APP_CONFIG.get("transcription_settings", {}).get("whisper", {})
         if model_size not in whisper_config.get("allowed_models", []):
             raise HTTPException(status_code=400, detail=f"Invalid model_size '{model_size}'")
-        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.txt"
+        output_suffix = '.srt' if generate_timestamps else '.txt'
+        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}{output_suffix}"
         job_data_args["processed_filepath"] = str(processed_path)
         create_job(db=db, job=JobCreate(**job_data_args))
-        run_transcription_task(job_id, str(upload_path), str(processed_path), model_size, whisper_config, APP_CONFIG, base_url)
+        run_transcription_task(job_id, str(upload_path), str(processed_path), model_size, whisper_config, APP_CONFIG, base_url, generate_timestamps=generate_timestamps)
 
     elif task_type == "tts":
         if not is_allowed_file(file.filename, {".txt"}):
@@ -2756,11 +3193,18 @@ async def api_finalize_upload(
 if not LOCAL_ONLY_MODE:
     @app.get('/login')
     async def login(request: Request):
+        if not check_oidc_availability():
+            logger.warning("OIDC not available, redirecting to home with error")
+            return RedirectResponse(url='/?error=auth_not_configured')
         redirect_uri = request.url_for('auth')
         return await oauth.oidc.authorize_redirect(request, redirect_uri)
 
     @app.get('/auth')
     async def auth(request: Request):
+        if not check_oidc_availability():
+            logger.warning("OIDC not available for authentication")
+            raise HTTPException(status_code=401, detail="Authentication system is not properly configured")
+        
         try:
             token = await oauth.oidc.authorize_access_token(request)
             user = await oauth.oidc.userinfo(token=token)
@@ -2773,14 +3217,24 @@ if not LOCAL_ONLY_MODE:
 
     @app.get("/logout")
     async def logout(request: Request):
-        logout_endpoint = oauth.oidc.server_metadata.get("end_session_endpoint")
-        if not logout_endpoint:
+        if not check_oidc_availability():
             request.session.clear()
-            logger.warning("OIDC 'end_session_endpoint' not found. Performing local-only logout.")
             return RedirectResponse(url="/", status_code=302)
+            
+        try:
+            logout_endpoint = oauth.oidc.server_metadata.get("end_session_endpoint")
+            if not logout_endpoint:
+                request.session.clear()
+                logger.warning("OIDC 'end_session_endpoint' not found. Performing local-only logout.")
+                return RedirectResponse(url="/", status_code=302)
 
-        post_logout_redirect_uri = str(request.url_for("get_index"))
-        logout_url = f"{logout_endpoint}?post_logout_redirect_uri={post_logout_redirect_uri}"
+            post_logout_redirect_uri = str(request.url_for("get_index"))
+            logout_url = f"{logout_endpoint}?post_logout_redirect_uri={post_logout_redirect_uri}"
+        except Exception as e:
+            logger.warning(f"Could not determine OIDC logout endpoint: {e}. Performing local-only logout.")
+            request.session.clear()
+            return RedirectResponse(url="/", status_code=302)
+        
         request.session.clear()
         return RedirectResponse(url=logout_url, status_code=302)
 
@@ -2788,6 +3242,8 @@ if not LOCAL_ONLY_MODE:
 # This is for reverse proxies that use forward auth
 @app.get("/api/authz/forward-auth")
 async def forward_auth(request: Request):
+    if not check_oidc_availability():
+        raise HTTPException(status_code=401, detail="Authentication system is not properly configured")
     redirect_uri = request.url_for('auth')
     return await oauth.oidc.authorize_redirect(request, redirect_uri)
 
@@ -2810,8 +3266,43 @@ async def get_settings_page(request: Request):
     admin_status = is_admin(request)
 
     # Use the globally loaded and merged APP_CONFIG for consistency
-    # This ensures all default keys are present before rendering.
-    current_config = APP_CONFIG
+    # Ensure all required keys exist for template rendering
+    current_config = APP_CONFIG.copy()
+    
+    # Ensure all required nested dictionaries exist
+    if "app_settings" not in current_config:
+        current_config["app_settings"] = {}
+    if "transcription_settings" not in current_config:
+        current_config["transcription_settings"] = {"whisper": {}}
+    if "tts_settings" not in current_config:
+        current_config["tts_settings"] = {"piper": {"synthesis_config": {}}}
+    if "conversion_tools" not in current_config:
+        current_config["conversion_tools"] = {}
+    if "ocr_settings" not in current_config:
+        current_config["ocr_settings"] = {"ocrmypdf": {}}
+    if "auth_settings" not in current_config:
+        current_config["auth_settings"] = {}
+    if "webhook_settings" not in current_config:
+        current_config["webhook_settings"] = {}
+
+    # Fix potential format issues in conversion tools - ensure 'formats' is always a dict
+    for tool_id, tool_config in current_config.get("conversion_tools", {}).items():
+        if "formats" in tool_config:
+            formats_data = tool_config["formats"]
+            if isinstance(formats_data, list):
+                # Convert list back to dict format - this handles cases where JS processing created a list
+                formats_dict = {}
+                for item in formats_data:
+                    if isinstance(item, str) and ':' in item:
+                        parts = item.split(':', 1)  # Split only on first colon to handle values with colons
+                        key = parts[0].strip()
+                        value = parts[1].strip() if len(parts) > 1 else ""
+                        if key:  # Only add if key is not empty
+                            formats_dict[key] = value
+                current_config["conversion_tools"][tool_id]["formats"] = formats_dict
+            elif not isinstance(formats_data, dict):
+                # If it's neither list nor dict, set to empty dict
+                current_config["conversion_tools"][tool_id]["formats"] = {}
 
     # Determine the source file for display purposes
     config_source = "none"
@@ -2836,6 +3327,49 @@ def deep_merge(source: dict, destination: dict) -> dict:
             destination[key] = value
     return destination
 
+def _preprocess_settings_for_saving(config: Dict) -> Dict:
+    """
+    Pre-processes the settings dictionary before saving it to YAML.
+    This function corrects data structures that may be misinterpreted
+    when converted from JSON from the frontend.
+    """
+    if "conversion_tools" in config and isinstance(config["conversion_tools"], dict):
+        for tool_name, tool_config in config["conversion_tools"].items():
+            if isinstance(tool_config, dict):
+                # --- Fix command_template: Convert list back to string ---
+                if "command_template" in tool_config:
+                    ct = tool_config["command_template"]
+                    if isinstance(ct, list) and len(ct) == 1 and isinstance(ct[0], str):
+                        tool_config["command_template"] = ct[0]
+                    # Also handle the case where it might be a string with incorrect newlines
+                    elif isinstance(ct, str):
+                        tool_config["command_template"] = ct.replace('\n', '\n')
+
+                # --- Fix formats: Convert list of strings back to a dictionary ---
+                if "formats" in tool_config:
+                    formats_data = tool_config["formats"]
+                    if isinstance(formats_data, list):
+                        new_formats = {}
+                        for item in formats_data:
+                            if isinstance(item, str):
+                                # Split the string into lines and then into key-value pairs
+                                for line in item.split('\n'):
+                                    line = line.strip()
+                                    if ':' in line:
+                                        key, value = line.split(':', 1)
+                                        new_formats[key.strip()] = value.strip()
+                        tool_config["formats"] = new_formats
+                    elif isinstance(formats_data, str):
+                        # Handle the case where the whole thing is a single string
+                        new_formats = {}
+                        for line in formats_data.split('\n'):
+                            line = line.strip()
+                            if ':' in line:
+                                key, value = line.split(':', 1)
+                                new_formats[key.strip()] = value.strip()
+                        tool_config["formats"] = new_formats
+
+    return config
 @app.post("/settings/save")
 async def save_settings(
     request: Request, new_config_from_ui: Dict = Body(...), admin: bool = Depends(require_admin)
@@ -2851,16 +3385,19 @@ async def save_settings(
             load_app_config()
             return JSONResponse({"message": "Settings reverted to default."})
 
+        # Pre-process the incoming config to fix formatting issues
+        processed_config = _preprocess_settings_for_saving(new_config_from_ui)
+
         try:
             with PATHS.SETTINGS_FILE.open("r", encoding="utf8") as f:
                 current_config_on_disk = yaml.safe_load(f) or {}
         except FileNotFoundError:
             current_config_on_disk = {}
 
-        merged_config = deep_merge(source=new_config_from_ui, destination=current_config_on_disk)
+        merged_config = deep_merge(source=processed_config, destination=current_config_on_disk)
 
         with tmp_path.open("w", encoding="utf8") as f:
-            yaml.safe_dump(merged_config, f, default_flow_style=False, sort_keys=False)
+            yaml.safe_dump(merged_config, f, default_flow_style=False, sort_keys=False, width=float('inf'))
 
         tmp_path.replace(PATHS.SETTINGS_FILE)
         logger.info(f"Admin '{user.get('email')}' updated settings.yml.")
@@ -2871,6 +3408,114 @@ async def save_settings(
         logger.exception(f"Failed to update settings for admin '{user.get('email')}'")
         if tmp_path.exists(): tmp_path.unlink()
         raise HTTPException(status_code=500, detail=f"Could not save settings.yml: {e}")
+
+# WebSocket endpoint for real-time job updates
+@app.websocket("/ws/jobs")
+async def websocket_job_updates(websocket: WebSocket, 
+                               token: str = Query(None),
+                               request: Request = None):
+    """
+    WebSocket endpoint for real-time job status updates.
+    Requires authentication via token or session.
+    """
+    if not ENABLE_WEBSOCKETS:
+        await websocket.close(code=1008, reason="WebSockets are disabled")
+        return
+
+    # Get user from either token or session
+    user = None
+    if token:
+        # Validate bearer token for API users  
+        try:
+            from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+            http_bearer = HTTPBearer()
+            creds = HTTPAuthorizationCredentials(credentials=token)
+            user = await require_api_user(request, creds) if not LOCAL_ONLY_MODE else {'sub': 'local_api_user', 'email': 'local@api.user.com', 'name': 'Local API User'}
+        except Exception:
+            await websocket.close(code=1008, reason="Invalid token")
+            return
+    elif LOCAL_ONLY_MODE:
+        # In local-only mode, always allow with local user
+        user = {'sub': 'local_user', 'email': 'local@user.com', 'name': 'Local User'}
+    else:
+        # Get from session for UI users
+        user = get_current_user(request) if request else None
+    
+    if not user:
+        await websocket.close(code=1008, reason="Authentication required")
+        return
+    
+    user_id = user['sub']
+    
+    # Establish connection
+    await manager.connect(websocket, user_id)
+    
+    try:
+        # Send initial connection confirmation
+        await websocket.send_text(json.dumps({
+            "type": "connection_established",
+            "user_id": user_id,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }))
+        logger.info(f"WebSocket connection established for user {user_id}")
+        
+        # Send initial job states
+        db = SessionLocal()
+        try:
+            # Get recent jobs for user
+            recent_jobs = get_jobs(db, user_id=user_id, skip=0, limit=50)  # Configurable limit
+            if recent_jobs:
+                jobs_data = [JobSchema.model_validate(job).model_dump() for job in recent_jobs]
+                await manager.broadcast_multiple_jobs_update(user_id, jobs_data)
+                logger.info(f"Sent initial job states to user {user_id}: {len(jobs_data)} jobs")
+            else:
+                logger.info(f"No initial jobs to send to user {user_id}")
+        finally:
+            db.close()
+        
+        # Listen for messages and maintain connection
+        # Add server-side heartbeat to prevent timeout
+        async def send_keepalive():
+            while True:
+                await asyncio.sleep(45)  # Send keepalive every 45 seconds
+                try:
+                    await websocket.send_text(json.dumps({
+                        "type": "keepalive", 
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }))
+                except Exception:
+                    # Connection likely closed, break the loop
+                    break
+        
+        # Start keepalive task
+        keepalive_task = asyncio.create_task(send_keepalive())
+        
+        try:
+            while True:
+                # WebSocket operations are handled by the manager and job updates
+                data = await websocket.receive_text()
+                # In the basic implementation, client just sends keep-alive or commands
+                try:
+                    message = json.loads(data)
+                    msg_type = message.get("type", "")
+                    if msg_type == "ping":
+                        await websocket.send_text(json.dumps({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()}))
+                except json.JSONDecodeError:
+                    # Ignore malformed messages
+                    pass
+        finally:
+            # Cancel the keepalive task when connection closes
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except asyncio.CancelledError:
+                pass
+    except WebSocketDisconnect as e:
+        manager.disconnect(websocket)
+        logger.info(f"WebSocket disconnected for user {user_id}. Code: {e.code}, Reason: {e.reason}")
+    except Exception as e:
+        logger.error(f"WebSocket error for user {user_id}: {e}", exc_info=True)
+        manager.disconnect(websocket)
 
 # --------------------------------------------------------------------------------
 # --- JOB MANAGEMENT & UTILITY ROUTES
@@ -3018,15 +3663,93 @@ async def download_zip_batch(job_id: str, db: Session = Depends(get_db), user: d
         'Content-Disposition': f'attachment; filename="{batch_filename}"'
     })
 
+@app.get("/api/v1/supported-formats/{file_extension}")
+async def get_supported_formats_for_file_type(file_extension: str, user: dict = Depends(require_user)):
+    """
+    Get supported output formats for a given file extension.
+    The file_extension should include the dot (e.g., '.pdf', '.docx').
+    """
+    # Validate file extension format
+    if not file_extension.startswith('.'):
+        file_extension = '.' + file_extension
+    
+    file_extension = file_extension.lower()
+    conversion_tools = APP_CONFIG.get("conversion_tools", {})
+    
+    # Find tools that support this input extension
+    supported_formats = []
+    for tool_name, tool_config in conversion_tools.items():
+        supported_inputs = tool_config.get("supported_input", [])
+        # Convert supported inputs to lowercase for comparison
+        supported_inputs_lower = [ext.lower() for ext in supported_inputs]
+        
+        if file_extension in supported_inputs_lower:
+            # Add all available formats for this tool
+            for format_key, format_label in tool_config.get("formats", {}).items():
+                full_format_key = f"{tool_name}_{format_key}"
+                supported_formats.append({
+                    "value": full_format_key,
+                    "label": f"{tool_config['name']} - {format_label}",
+                    "tool": tool_name,
+                    "format": format_key
+                })
+    
+    return {"formats": supported_formats}
+
+
+@app.get("/api/formats/count")
+async def get_formats_count():
+    """
+    Returns the number of supported input and output formats.
+    """
+    try:
+        with open(PATHS.DEFAULT_SETTINGS_FILE, 'r') as f:
+            settings = yaml.safe_load(f)
+
+        input_formats = set()
+        output_formats = set()
+
+        for tool, config in settings.get('conversion_tools', {}).items():
+            if 'supported_input' in config:
+                for fmt in config['supported_input']:
+                    input_formats.add(fmt)
+            if 'formats' in config:
+                for fmt in config['formats']:
+                    output_formats.add(fmt)
+
+        return {
+            "input_formats_count": len(input_formats),
+            "output_formats_count": len(output_formats)
+        }
+    except Exception as e:
+        logger.error(f"Error counting formats: {e}")
+        raise HTTPException(status_code=500, detail="Error counting formats")
+
 @app.get("/health")
 async def health():
     try:
         with engine.connect() as conn:
-            conn.execution_options(isolation_level="AUTOCOMMIT").execute("SELECT 1")
+            conn.execute(text("SELECT 1"))
     except Exception:
         logger.exception("Health check failed")
         return JSONResponse({"ok": False}, status_code=500)
     return {"ok": True}
+
+@app.get("/test-websocket-notification")
+async def test_websocket_notification(request: Request, user: dict = Depends(require_user)):
+    """Test endpoint to trigger a WebSocket notification"""
+    fake_job_data = {
+        "id": "test-notification",
+        "user_id": user['sub'],
+        "status": "processing",
+        "progress": 50,
+        "original_filename": "test.txt",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    manager.sync_broadcast_job_status_update(user['sub'], fake_job_data)
+    return {"message": "Test notification sent"}
 
 @app.get('/favicon.ico', include_in_schema=False)
 async def favicon():

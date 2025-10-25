@@ -23,11 +23,33 @@ document.addEventListener('DOMContentLoaded', () => {
             // Determine value based on element type
             if (el.type === 'checkbox') {
                 value = el.checked;
-            } else if (el.tagName === 'TEXTAREA') {
+            } else if (el.name.endsWith('.command_template')) {
+                value = el.value;
+            } else if (el.name.endsWith('.supported_input') || el.name === 'app_settings.allowed_all_extensions' || el.name === 'auth_settings.admin_users' || el.name === 'webhook_settings.allowed_callback_urls') {
                 // Convert comma-separated text into an array of strings
                 value = el.value.split(',')
                     .map(item => item.trim())
                     .filter(item => item); // Remove empty strings from the list
+            } else if (el.name.endsWith('.formats')) {
+                // Parse key:value pairs from textarea
+                const lines = el.value.split('\n');
+                const formatsObj = {};
+                for (const line of lines) {
+                    const parts = line.split(':');
+                    if (parts.length >= 2) {
+                        const key = parts[0].trim();
+                        const value = parts.slice(1).join(':').trim();
+                        if (key) {
+                            formatsObj[key] = value;
+                        }
+                    }
+                }
+                value = formatsObj;
+            } else if (el.tagName === 'TEXTAREA' && !el.name.endsWith('.command_template')) {
+                // For any other text area, assume it's a comma separated list
+                value = el.value.split(',')
+                    .map(item => item.trim())
+                    .filter(item => item);
             } else if (el.type === 'number') {
                 value = parseFloat(el.value);
                 if (isNaN(value)) {

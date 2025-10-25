@@ -161,10 +161,22 @@
                     <div class="tool-grid">
                         {% for tool_id, tool in config.conversion_tools.items() %}
                         <div class="tool-card">
-                            <h3>{{ tool.name }}</h3>
+                            <div class="form-control">
+                                <label for="tool-{{ tool_id }}-name">Tool Name</label>
+                                <input type="text" id="tool-{{ tool_id }}-name" name="conversion_tools.{{ tool_id }}.name" value="{{ tool.name }}" class="form-input">
+                            </div>
                             <div class="form-control">
                                 <label for="tool-{{ tool_id }}-cmd">Command Template</label>
                                 <textarea id="tool-{{ tool_id }}-cmd" name="conversion_tools.{{ tool_id }}.command_template" class="form-textarea" rows="3">{{ tool.command_template }}</textarea>
+                            </div>
+                            <div class="form-control">
+                                <label for="tool-{{ tool_id }}-supported-input">Accepted File Formats (comma-separated)</label>
+                                <textarea id="tool-{{ tool_id }}-supported-input" name="conversion_tools.{{ tool_id }}.supported_input" class="form-textarea" rows="2">{{ tool.supported_input | join(', ') }}</textarea>
+                            </div>
+                            <div class="form-control">
+                                <label for="tool-{{ tool_id }}-formats">Output Formats (key: value, one per line)</label>
+                                <textarea id="tool-{{ tool_id }}-formats" name="conversion_tools.{{ tool_id }}.formats" class="form-textarea" rows="4">{% if tool.formats %}{% for item_key, item_value in (tool.formats.items() if (tool.formats is mapping) else {}) %}{{ item_key }}: {{ item_value }}{{ "
+" if not loop.last }}{% endfor %}{% endif %}</textarea>
                             </div>
                         </div>
                         {% endfor %}
@@ -186,7 +198,7 @@
                    <div class="danger-action">
                         <div>
                             <strong>Clear Job History</strong>
-                            <p>Deletes all job records from the database. Processed files on disk will not be removed.</p>
+                            <p>Deletes all job records from the database. Files remain in the filesystem but cannot be deleted through the app anymore.</p>
                         </div>
                         <button id="clear-history-btn" class="button-danger">Clear History</button>
                    </div>

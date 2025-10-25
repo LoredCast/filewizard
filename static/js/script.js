@@ -59,7 +59,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let ttsModelsCache = [];
     let stagedFiles = null;
     let jobPollerInterval = null; // Polling timer
-    const POLLING_INTERVAL_MS = 1000; // Check for updates every 3 seconds
+    const POLLING_INTERVAL_MS = 1500; // Check for updates every 1.5 seconds
 
     // --- Core Functions ---
 
@@ -94,6 +94,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function pollForJobUpdates() {
+        // If WebSocket is connected, we don't need to poll
+        if (webSocketConnected) {
+            // Still check for any local state issues but don't poll server
+            return;
+        }
+        
+        // Fallback to polling if WebSocket is not connected
         try {
             const allJobs = await authFetch('/jobs').then(res => res.json());
 
@@ -125,9 +132,18 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function startJobPolling() {
+        // If WebSocket is connected, stop any existing polling
+        if (webSocketConnected && jobPollerInterval) {
+            clearInterval(jobPollerInterval);
+            jobPollerInterval = null;
+            console.log('Stopped polling since WebSocket is connected');
+            return;
+        }
+        
         if (jobPollerInterval) return; // Poller is already running
-        // Run once after a short delay, then start the regular interval
-        setTimeout(pollForJobUpdates, 1000);
+        
+        // Run once immediately, then start the regular interval
+        pollForJobUpdates();
         jobPollerInterval = setInterval(pollForJobUpdates, POLLING_INTERVAL_MS);
     }
 
@@ -170,14 +186,14 @@ document.addEventListener('DOMContentLoaded', () => {
             actionHtml = `<button class="cancel-button" data-job-id="${job.id}">Cancel</button>`;
         } else if (job.status === 'completed') {
             if (job.task_type === 'unzip') {
-                actionHtml = `<a href="${apiUrl('/download/zip-batch')}/${encodeURIComponent(job.id)}" class="download-button" download>Download Batch</a>`;
+                actionHtml = `<a href="${apiUrl('/download/zip-batch')}/${encodeURIComponent(job.id)}" class="download-button" download><i class="fa">&#xf019;</i> Batch</a>`;
             } else if (job.processed_filepath) {
-                const downloadFilename = job.processed_filepath.split(/[\\/]/).pop();
-                actionHtml = `<a href="${apiUrl('/download')}/${encodeURIComponent(downloadFilename)}" class="download-button" download>Download</a>`;
+                const downloadFilename = job.processed_filepath.split(/[\\\/]/).pop();
+                actionHtml = `<a href="${apiUrl('/download')}/${encodeURIComponent(downloadFilename)}" class="download-button" download><i class="fa">&#xf019;</i></a>`;
             }
         } else if (job.status === 'failed') {
             const errorTitle = job.error_message ? ` title="${job.error_message.replace(/"/g, '&quot;')}"` : '';
-            actionHtml = `<span class="error-text"${errorTitle}>Failed</span>`;
+            actionHtml = `<span class="error-text"${errorTitle}>Error</span>`;
         } else if (job.status === 'cancelled') {
             actionHtml = `<span>Cancelled</span>`;
         }
@@ -190,19 +206,61 @@ document.addEventListener('DOMContentLoaded', () => {
             checkboxHtml = `<input type="checkbox" class="job-checkbox" value="${job.id}">`;
         }
 
+        // Truncate filename for mobile view
+        const truncatedFilename = job.original_filename ? (job.original_filename.length > 25 ? job.original_filename.substring(0, 25) + '...' : job.original_filename) : "No filename";
+
         // --- Create or Update logic ---
         if (row) {
             // UPDATE an existing row
-            row.querySelector('td[data-label="Select"] .cell-value').innerHTML = checkboxHtml;
-            row.querySelector('td[data-label="File Size"] .cell-value').innerHTML = fileSizeHtml;
-            row.querySelector('td[data-label="Task"] .cell-value').innerHTML = taskTypeLabel;
-            row.querySelector('td[data-label="Status"] .cell-value').innerHTML = statusHtml;
-            row.querySelector('td[data-label="Action"] .cell-value').innerHTML = actionHtml;
+            const selectCell = row.querySelector('td[data-label="Select"] .cell-value');
+            const fileCell = row.querySelector('td[data-label="File"] .cell-value');
+            const taskCell = row.querySelector('td[data-label="Task"] .cell-value');
+            const statusCell = row.querySelector('td[data-label="Status"] .cell-value');
+            const actionCell = row.querySelector('td[data-label="Action"] .cell-value');
+            
+            if (selectCell) selectCell.innerHTML = checkboxHtml;
+            // Calculate expanderHtml for the update section
+            const expanderHtml = job.task_type === 'unzip' ? '<span class="expander-arrow"></span>' : '';
+            if (fileCell) {
+                fileCell.innerHTML = `<span class="file-cell-content" title="${job.original_filename}">${expanderHtml}${truncatedFilename}</span><button class="details-button" style="display: none;" title="Show details">i</button>`;
+            }
+            if (taskCell) taskCell.innerHTML = taskTypeLabel;
+            if (statusCell) statusCell.innerHTML = statusHtml;
+            if (actionCell) actionCell.innerHTML = actionHtml;
+            
+            // Update the expanded details if they exist
+            const detailsRow = document.getElementById(`${permanentDomId}-details`);
+            if (detailsRow) {
+                detailsRow.querySelector('.details-full-filename').textContent = job.original_filename || "No filename";
+                detailsRow.querySelector('.details-submitted').textContent = formattedDate;
+                detailsRow.querySelector('.details-file-size').textContent = fileSizeHtml;
+                detailsRow.querySelector('.details-id').textContent = job.id.substring(0, 8); // Truncate ID for display
+                if (job.processed_filepath) {
+                    const downloadLink = detailsRow.querySelector('.details-download-link');
+                    if (downloadLink) {
+                        const downloadFilename = job.processed_filepath.split(/[\\\/]/).pop();
+                        downloadLink.href = `${apiUrl('/download')}/${encodeURIComponent(downloadFilename)}`;
+                        downloadLink.textContent = downloadFilename;
+                    }
+                }
+            }
         } else {
             // CREATE a new row
             row = document.createElement('tr');
             row.id = permanentDomId;
-            const escapedFilename = job.original_filename ? job.original_filename.replace(/</g, "&lt;").replace(/>/g, "&gt;") : "No filename";
+            // Sanitize filename to prevent XSS
+            let escapedFilename = "No filename";
+            if (job.original_filename) {
+                escapedFilename = job.original_filename.replace(/[<>"'&]/g, function(match) {
+                    return {
+                        '<': '&lt;',
+                        '>': '&gt;',
+                        '"': '&quot;',
+                        "'": '&#x27;',
+                        '&': '&amp;'
+                    }[match];
+                });
+            }
             const rowClasses = [];
             if (job.parent_job_id) rowClasses.push('sub-job');
             if (job.task_type === 'unzip') rowClasses.push('parent-job');
@@ -210,9 +268,12 @@ document.addEventListener('DOMContentLoaded', () => {
             if (job.parent_job_id) row.dataset.parentId = job.parent_job_id;
             const expanderHtml = job.task_type === 'unzip' ? '<span class="expander-arrow"></span>' : '';
 
+            // Define expanderHtml for the new row creation
+            const newExpanderHtml = job.task_type === 'unzip' ? '<span class="expander-arrow"></span>' : '';
+            // Create the row with all columns to match the table headers
             row.innerHTML = `
                 <td data-label="Select"><span class="cell-value">${checkboxHtml}</span></td>
-                <td data-label="File"><span class="cell-value" title="${escapedFilename}">${expanderHtml}<span class="file-cell-content">${escapedFilename}</span></span></td>
+                <td data-label="File"><span class="cell-value" title="${escapedFilename}">${newExpanderHtml}<span class="file-cell-content">${truncatedFilename}</span><button class="details-button" style="display: none;" title="Show details">i</button></span></td>
                 <td data-label="File Size"><span class="cell-value">${fileSizeHtml}</span></td>
                 <td data-label="Task"><span class="cell-value">${taskTypeLabel}</span></td>
                 <td data-label="Submitted"><span class="cell-value">${formattedDate}</span></td>
@@ -225,6 +286,66 @@ document.addEventListener('DOMContentLoaded', () => {
             } else {
                 jobListBody.prepend(row);
             }
+
+            // Create the details row (initially hidden)
+            const detailsRow = document.createElement('tr');
+            detailsRow.id = `${permanentDomId}-details`;
+            detailsRow.className = 'job-details-row';
+            detailsRow.style.display = 'none';
+            
+            // Sanitize values for details
+            const escapedOriginalFilename = job.original_filename ? job.original_filename.replace(/[<>"'&]/g, function(match) {
+                return {
+                    '<': '&lt;',
+                    '>': '&gt;',
+                    '"': '&quot;',
+                    "'": '&#x27;',
+                    '&': '&amp;'
+                }[match];
+            }) : "No filename";
+            const escapedProcessedFilepath = job.processed_filepath ? job.processed_filepath.split(/[\\\/]/).pop() : "Not available";
+            
+            detailsRow.innerHTML = `
+                <td colspan="5" class="job-details-content">
+                    <div class="job-details-grid">
+                        <div class="detail-item">
+                            <span class="detail-label">Full Filename:</span>
+                            <span class="detail-value details-full-filename">${escapedOriginalFilename}</span>
+                        </div>
+                        <div class="detail-item">
+                            <span class="detail-label">Submitted:</span>
+                            <span class="detail-value details-submitted">${formattedDate}</span>
+                        </div>
+                        <div class="detail-item">
+                            <span class="detail-label">File Size:</span>
+                            <span class="detail-value details-file-size">${fileSizeHtml}</span>
+                        </div>
+                        <div class="detail-item">
+                            <span class="detail-label">ID:</span>
+                            <span class="detail-value details-id">${job.id.substring(0, 8)}</span>
+                        </div>
+                        <div class="detail-item">
+                            <span class="detail-label">Processed File:</span>
+                            <span class="detail-value">${escapedProcessedFilepath}</span>
+                        </div>
+                        ${job.processed_filepath && job.status === 'completed' && job.task_type !== 'unzip' ? 
+                            `<div class="detail-item">
+                                <span class="detail-label">Download:</span>
+                                <a class="detail-value details-download-link" href="${apiUrl('/download')}/${encodeURIComponent(job.processed_filepath.split(/[\\\/]/).pop())}" download>
+                                    ${job.processed_filepath.split(/[\\\/]/).pop()}
+                                </a>
+                            </div>` : ''}
+                        ${job.error_message ? 
+                            `<div class="detail-item">
+                                <span class="detail-label">Error:</span>
+                                <span class="detail-value error-text details-error" title="${job.error_message.replace(/"/g, '&quot;')}">${job.error_message.length > 50 ? job.error_message.substring(0, 50) + '...' : job.error_message}</span>
+                            </div>` : ''}
+                    </div>
+                </td>
+            `;
+
+            // Insert details row after the main row
+            row.parentNode.insertBefore(detailsRow, row.nextSibling);
         }
     }
 
@@ -235,7 +356,13 @@ document.addEventListener('DOMContentLoaded', () => {
         // Manually create and insert the temporary "uploading" row.
         const tempRow = document.createElement('tr');
         tempRow.id = uploadId;
-        const escapedFilename = file.name.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        // Properly sanitize filename for XSS prevention
+        const escapedFilename = file.name
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#x27;");
         const taskLabel = taskType.charAt(0).toUpperCase() + taskType.slice(1);
         tempRow.innerHTML = `
             <td data-label="Select"><span class="cell-value">-</span></td>
@@ -263,12 +390,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
             try {
                 const response = await authFetch('/upload/chunk', { method: 'POST', body: formData });
-                if (!response.ok) throw new Error(`Chunk upload failed: ${response.statusText}`);
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`Chunk upload failed: ${response.status} - ${errorText}`);
+                }
                 const progress = Math.round(((chunkNumber + 1) / totalChunks) * 100);
-                tempRow.querySelector('.progress-bar').style.width = `${progress}%`;
+                const progressBar = tempRow.querySelector('.progress-bar');
+                if (progressBar) {  // Check if element still exists
+                    progressBar.style.width = `${progress}%`;
+                }
             } catch (error) {
                 console.error(`Error uploading chunk ${chunkNumber}:`, error);
-                tempRow.querySelector('.status-cell-value').innerHTML = `<span class="job-status-badge status-failed">Upload Failed</span>`;
+                const statusCell = tempRow.querySelector('.status-cell-value');
+                if (statusCell) {  // Check if element still exists
+                    statusCell.innerHTML = `<span class="job-status-badge status-failed">Upload Failed</span>`;
+                }
                 return; // Stop the upload process
             }
         }
@@ -291,7 +427,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
         } catch (error) {
             console.error(`Error finalizing upload:`, error);
-            tempRow.querySelector('.status-cell-value').innerHTML = `<span class="job-status-badge status-failed">Finalization Failed</span>`;
+            const statusCell = tempRow.querySelector('.status-cell-value');
+            if (statusCell) {  // Check if element still exists
+                statusCell.innerHTML = `<span class="job-status-badge status-failed">Finalization Failed</span>`;
+            }
         }
     }
 
@@ -306,6 +445,7 @@ document.addEventListener('DOMContentLoaded', () => {
             options.output_format = selectedFormat;
         } else if (taskType === 'transcription') {
             options.model_size = transcriptionChoices.getValue(true);
+            options.generate_timestamps = document.getElementById('main-timestamps-checkbox').checked;
         } else if (taskType === 'tts') {
             const selectedModel = ttsChoices.getValue(true);
             if (!selectedModel) return alert('Please select a voice model.');
@@ -339,16 +479,47 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function showActionDialog() {
         dialogFileCount.textContent = stagedFiles.length;
-        dialogOutputFormatSelect.innerHTML = mainOutputFormatSelect.innerHTML;
-        if (dialogConversionChoices) dialogConversionChoices.destroy();
-        dialogConversionChoices = new Choices(dialogOutputFormatSelect, { searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a format...' });
-        if (dialogTtsChoices) dialogTtsChoices.destroy();
-        dialogTtsChoices = new Choices(dialogTtsModelSelect, { searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a voice...' });
-        dialogTtsChoices.setChoices(ttsModelsCache, 'value', 'label', true);
-        dialogInitialView.style.display = 'grid';
-        dialogConvertView.style.display = 'none';
-        dialogTtsView.style.display = 'none';
-        actionDialog.classList.add('visible');
+        
+        if (stagedFiles.length === 1) {
+            // If only one file is staged, update the format dropdown based on that file
+            updateFormatsForFile(stagedFiles[0]).then(() => {
+                // Initialize the dialog choices after updating formats
+                if (dialogConversionChoices) dialogConversionChoices.destroy();
+                dialogConversionChoices = new Choices(dialogOutputFormatSelect, { searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a format...' });
+                if (dialogTtsChoices) dialogTtsChoices.destroy();
+                dialogTtsChoices = new Choices(dialogTtsModelSelect, { searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a voice...' });
+                dialogTtsChoices.setChoices(ttsModelsCache, 'value', 'label', true);
+                dialogInitialView.style.display = 'grid';
+                dialogConvertView.style.display = 'none';
+                dialogTtsView.style.display = 'none';
+                actionDialog.classList.add('visible');
+            });
+        } else {
+            // If multiple files or no files, use all formats
+            if (dialogConversionChoices) dialogConversionChoices.destroy();
+            dialogConversionChoices = new Choices(dialogOutputFormatSelect, { searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a format...' });
+            // Set all available formats
+            const tools = window.APP_CONFIG.conversionTools || {};
+            const choicesArray = Object.keys(tools).map(toolKey => {
+                const tool = tools[toolKey];
+                return {
+                    label: tool.name,
+                    choices: Object.keys(tool.formats).map(formatKey => ({
+                        value: `${toolKey}_${formatKey}`,
+                        label: `${tool.name} - ${tool.formats[formatKey]}`
+                    }))
+                };
+            });
+            dialogConversionChoices.setChoices(choicesArray, 'value', 'label', true);
+            
+            if (dialogTtsChoices) dialogTtsChoices.destroy();
+            dialogTtsChoices = new Choices(dialogTtsModelSelect, { searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a voice...' });
+            dialogTtsChoices.setChoices(ttsModelsCache, 'value', 'label', true);
+            dialogInitialView.style.display = 'grid';
+            dialogConvertView.style.display = 'none';
+            dialogTtsView.style.display = 'none';
+            actionDialog.classList.add('visible');
+        }
     }
 
     function closeActionDialog() {
@@ -367,6 +538,7 @@ document.addEventListener('DOMContentLoaded', () => {
             options.output_format = selectedFormat;
         } else if (action === 'transcription') {
             options.model_size = mainModelSizeSelect.value;
+            options.generate_timestamps = document.getElementById('dialog-timestamps-checkbox').checked;
         } else if (action === 'tts') {
             const selectedModel = dialogTtsChoices.getValue(true);
             if (!selectedModel) return alert('Please select a voice model.');
@@ -431,10 +603,121 @@ function initializeSelectors() {
     loadTtsModels();
 }
 
+    function getFileExtension(filename) {
+        return '.' + filename.split('.').pop().toLowerCase();
+    }
+
+    async function updateFormatsForFile(file) {
+        if (!file) return;
+        
+        const fileExtension = getFileExtension(file.name);
+        try {
+            const response = await authFetch(`/api/v1/supported-formats/${encodeURIComponent(fileExtension)}`);
+            if (!response.ok) {
+                console.error(`Failed to fetch supported formats for ${fileExtension}:`, response.status);
+                return;
+            }
+            
+            const data = await response.json();
+            const formats = data.formats || [];
+            
+            // Update main output format select
+            if (conversionChoices) {
+                // Clear existing choices
+                conversionChoices.clearStore();
+                
+                // Group formats by tool name for better UI
+                const groupedFormats = formats.reduce((acc, format) => {
+                    if (!acc[format.tool]) {
+                        acc[format.tool] = {
+                            label: window.APP_CONFIG.conversionTools[format.tool]?.name || format.tool,
+                            choices: []
+                        };
+                    }
+                    acc[format.tool].choices.push({
+                        value: format.value,
+                        label: format.label
+                    });
+                    return acc;
+                }, {});
+                
+                // Convert grouped formats to choices array
+                const choicesArray = Object.keys(groupedFormats).map(toolKey => ({
+                    label: groupedFormats[toolKey].label,
+                    choices: groupedFormats[toolKey].choices
+                }));
+                
+                conversionChoices.setChoices(choicesArray, 'value', 'label', true);
+            }
+            
+            // Update dialog output format select
+            if (dialogConversionChoices) {
+                // Clear existing choices
+                dialogConversionChoices.clearStore();
+                
+                // Group formats by tool name for better UI
+                const dialogGroupedFormats = formats.reduce((acc, format) => {
+                    if (!acc[format.tool]) {
+                        acc[format.tool] = {
+                            label: window.APP_CONFIG.conversionTools[format.tool]?.name || format.tool,
+                            choices: []
+                        };
+                    }
+                    acc[format.tool].choices.push({
+                        value: format.value,
+                        label: format.label
+                    });
+                    return acc;
+                }, {});
+                
+                // Convert grouped formats to choices array
+                const dialogChoicesArray = Object.keys(dialogGroupedFormats).map(toolKey => ({
+                    label: dialogGroupedFormats[toolKey].label,
+                    choices: dialogGroupedFormats[toolKey].choices
+                }));
+                
+                dialogConversionChoices.setChoices(dialogChoicesArray, 'value', 'label', true);
+            }
+            
+        } catch (error) {
+            console.error(`Error fetching supported formats for ${fileExtension}:`, error);
+        }
+    }
+
     function updateFileName(input, nameDisplay) {
         const numFiles = input.files.length;
         nameDisplay.textContent = numFiles === 1 ? input.files[0].name : (numFiles > 1 ? `${numFiles} files selected` : 'No files chosen');
         nameDisplay.title = numFiles > 1 ? Array.from(input.files).map(f => f.name).join(', ') : nameDisplay.textContent;
+        
+        // Update format dropdowns if exactly one file is selected
+        if (numFiles === 1) {
+            updateFormatsForFile(input.files[0]);
+        } else if (numFiles === 0) {
+            // Reset to all formats when no file is selected
+            initializeSelectors();
+        }
+    }
+
+    async function updateFormatCounts() {
+        try {
+            const response = await authFetch('/api/formats/count');
+            if (!response.ok) {
+                console.error('Failed to fetch format counts');
+                return;
+            }
+            const data = await response.json();
+            const inputCountEl = document.getElementById('input-format-count');
+            const outputCountEl = document.getElementById('output-format-count');
+            const counterEl = document.getElementById('format-counter');
+
+            if (inputCountEl && outputCountEl && counterEl) {
+                inputCountEl.textContent = data.input_formats_count;
+                outputCountEl.textContent = data.output_formats_count;
+                counterEl.style.display = 'flex';
+            }
+        } catch (error) {
+            console.error('Error fetching format counts:', error);
+        }
     }
 
     async function handleCancelJob(jobId) {
@@ -503,6 +786,20 @@ function initializeSelectors() {
     }
 
     function initializeApp() {
+        // Check if required elements exist
+        const requiredElements = [
+            'app-container', 'main-file-input', 'job-list-body', 
+            'start-conversion-btn', 'start-ocr-btn', 'start-transcription-btn', 'start-tts-btn'
+        ];
+        
+        for (const id of requiredElements) {
+            const element = document.getElementById(id);
+            if (!element) {
+                console.error(`Required element with ID "${id}" not found`);
+                return;
+            }
+        }
+        
         if (appContainer) appContainer.style.display = 'block';
         if (loginContainer) loginContainer.style.display = 'none';
 
@@ -513,7 +810,13 @@ function initializeSelectors() {
         startTtsBtn.addEventListener('click', () => handleTaskRequest('tts'));
         mainFileInput.addEventListener('change', () => updateFileName(mainFileInput, mainFileName));
         downloadSelectedBtn.addEventListener('click', handleBatchDownload);
-        selectAllJobsCheckbox.addEventListener('change', handleSelectionChange);
+        selectAllJobsCheckbox.addEventListener('change', () => {
+            const checkboxes = jobListBody.querySelectorAll('.job-checkbox');
+            checkboxes.forEach(checkbox => {
+                checkbox.checked = selectAllJobsCheckbox.checked;
+            });
+            handleSelectionChange();
+        });
         jobListBody.addEventListener('change', e => e.target.classList.contains('job-checkbox') && handleSelectionChange());
         jobListBody.addEventListener('click', e => {
             if (e.target.classList.contains('cancel-button')) {
@@ -528,6 +831,129 @@ function initializeSelectors() {
                     .forEach(subJob => {
                         subJob.style.display = areVisible ? 'table-row' : 'none';
                     });
+            }
+            
+            // Handle details button click
+            if (e.target.classList.contains('details-button')) {
+                const row = e.target.closest('tr');
+                const jobId = row.id.replace('job-', '');
+                const jobElement = row; // Get the job element to access its data
+                let detailsRow = document.getElementById(`job-${jobId}-details`);
+                
+                // If details row doesn't exist, create it
+                if (!detailsRow) {
+                    // We need to get the job data - find it from the row's stored data or re-fetch
+                    // For now, we'll just create a placeholder and the row will be updated when job data is refreshed
+                    detailsRow = document.createElement('tr');
+                    detailsRow.id = `job-${jobId}-details`;
+                    detailsRow.className = 'job-details-row';
+                    detailsRow.style.display = 'none';
+                    
+                    detailsRow.innerHTML = `
+                        <td colspan="7" class="job-details-content">
+                            <div class="job-details-grid">
+                                <div class="detail-item">
+                                    <span class="detail-label">Details loading...</span>
+                                </div>
+                            </div>
+                        </td>
+                    `;
+                    
+                    // Insert details row after the main row
+                    row.parentNode.insertBefore(detailsRow, row.nextSibling);
+                    
+                    // Now we need to update the details with actual job data by finding the job object
+                    // We'll do this by looking for the job in the DOM or by re-rendering
+                    const jobData = Array.from(jobListBody.querySelectorAll('tr[id^="job-"]'))
+                        .filter(tr => tr.id !== `job-${jobId}-details`)  // Exclude details rows
+                        .map(tr => {
+                            const jobId = tr.id.replace('job-', '');
+                            // We need to get the job data - this is tricky without a lookup table
+                            // For now, we'll update all job rows which will update the details
+                            return jobId;
+                        });
+                    
+                    // Trigger a refresh of the job details by re-rendering the job
+                    // We'll need to get the job data from the server
+                    authFetch(`/job/${jobId}`)
+                        .then(response => response.json())
+                        .then(job => {
+                            const formattedDate = new Date(job.created_at).toLocaleString(USER_LOCALE, DATETIME_FORMAT_OPTIONS);
+                            let fileSizeHtml = job.input_filesize ? formatBytes(job.input_filesize) : '-';
+                            if (job.status === 'completed' && job.output_filesize) {
+                                fileSizeHtml += ` → ${formatBytes(job.output_filesize)}`;
+                            }
+                            
+                            // Sanitize values for details
+                            const escapedOriginalFilename = job.original_filename ? job.original_filename.replace(/[<>"'&]/g, function(match) {
+                                return {
+                                    '<': '&lt;',
+                                    '>': '&gt;',
+                                    '"': '&quot;',
+                                    "'": '&#x27;',
+                                    '&': '&amp;'
+                                }[match];
+                            }) : "No filename";
+                            const escapedProcessedFilepath = job.processed_filepath ? job.processed_filepath.split(/[\\\/]/).pop() : "Not available";
+                            
+                            detailsRow.innerHTML = `
+                                <td colspan="7" class="job-details-content">
+                                    <div class="job-details-grid">
+                                        <div class="detail-item">
+                                            <span class="detail-label">Full Filename:</span>
+                                            <span class="detail-value details-full-filename">${escapedOriginalFilename}</span>
+                                        </div>
+                                        <div class="detail-item">
+                                            <span class="detail-label">Submitted:</span>
+                                            <span class="detail-value details-submitted">${formattedDate}</span>
+                                        </div>
+                                        <div class="detail-item">
+                                            <span class="detail-label">File Size:</span>
+                                            <span class="detail-value details-file-size">${fileSizeHtml}</span>
+                                        </div>
+                                        <div class="detail-item">
+                                            <span class="detail-label">ID:</span>
+                                            <span class="detail-value details-id">${job.id.substring(0, 8)}</span>
+                                        </div>
+                                        <div class="detail-item">
+                                            <span class="detail-label">Processed File:</span>
+                                            <span class="detail-value">${escapedProcessedFilepath}</span>
+                                        </div>
+                                        ${job.processed_filepath && job.status === 'completed' && job.task_type !== 'unzip' ? 
+                                            `<div class="detail-item">
+                                                <span class="detail-label">Download:</span>
+                                                <a class="detail-value details-download-link" href="${apiUrl('/download')}/${encodeURIComponent(job.processed_filepath.split(/[\\\/]/).pop())}" download>
+                                                    ${job.processed_filepath.split(/[\\\/]/).pop()}
+                                                </a>
+                                            </div>` : ''}
+                                        ${job.error_message ? 
+                                            `<div class="detail-item">
+                                                <span class="detail-label">Error:</span>
+                                                <span class="detail-value error-text details-error" title="${job.error_message.replace(/"/g, '&quot;')}">${job.error_message.length > 50 ? job.error_message.substring(0, 50) + '...' : job.error_message}</span>
+                                            </div>` : ''}
+                                    </div>
+                                </td>
+                            `;
+                        })
+                        .catch(error => {
+                            console.error("Error fetching job details:", error);
+                            detailsRow.innerHTML = `
+                                <td colspan="7" class="job-details-content">
+                                    <div class="job-details-grid">
+                                        <div class="detail-item">
+                                            <span class="detail-label">Error loading details</span>
+                                        </div>
+                                    </div>
+                                </td>
+                            `;
+                        });
+                }
+                
+                if (detailsRow) {
+                    const isCurrentlyVisible = detailsRow.style.display !== 'none';
+                    detailsRow.style.display = isCurrentlyVisible ? 'none' : 'table-row';
+                    e.target.textContent = isCurrentlyVisible ? 'i' : '×';
+                }
             }
         });
 
@@ -546,6 +972,7 @@ function initializeSelectors() {
         initializeSelectors();
         loadInitialJobs();
         setupDragAndDropListeners();
+        updateFormatCounts();
     }
 
     function showLoginView() {
@@ -560,4 +987,168 @@ function initializeSelectors() {
     } else {
         showLoginView();
     }
-})
+    
+    // --- WebSocket Manager ---
+    const ENABLE_WEBSOCKETS = false;
+    let webSocket = null;
+    let webSocketConnected = false;
+    let isUsingPollingFallback = false;
+    let reconnectAttempts = 0;
+    const RECONNECT_INTERVAL = 3000; // 3 seconds
+
+    function initializeWebSocket() {
+        // Close existing connection if any
+        if (webSocket) {
+            webSocket.close();
+        }
+
+        // Construct WebSocket URL
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws/jobs`;
+        
+        // For authentication, add token if available (in a production setup)
+        const fullUrl = wsUrl; // For now, no token needed since we're in local mode
+
+        try {
+            webSocket = new WebSocket(fullUrl);
+            
+            webSocket.onopen = function(event) {
+                console.log('WebSocket connected');
+                webSocketConnected = true;
+                isUsingPollingFallback = false;
+                reconnectAttempts = 0; // Reset on successful connection
+                // Start a heartbeat to keep connection alive
+                startHeartbeat();
+                // Update polling behavior since WebSocket is connected
+                if (jobPollerInterval) {
+                    clearInterval(jobPollerInterval);
+                    jobPollerInterval = null;
+                    console.log('Stopped polling since WebSocket is connected');
+                }
+            };
+
+            webSocket.onmessage = function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    handleWebSocketMessage(data);
+                } catch (error) {
+                    console.error('Error parsing WebSocket message:', error);
+                }
+            };
+
+            webSocket.onclose = function(event) {
+                console.log('WebSocket disconnected:', event.code, event.reason);
+                webSocketConnected = false;
+                isUsingPollingFallback = true;
+                // Attempt to reconnect
+                attemptReconnect();
+                // Start polling as a fallback
+                startJobPolling();
+            };
+
+            webSocket.onerror = function(error) {
+                console.error('WebSocket error:', error);
+                webSocketConnected = false;
+            };
+        } catch (error) {
+            console.error('Failed to create WebSocket connection:', error);
+            attemptReconnect();
+        }
+    }
+
+    function handleWebSocketMessage(data) {
+        switch (data.type) {
+            case 'connection_established':
+                console.log('WebSocket connection established for user:', data.user_id);
+                updateConnectionStatus(true);
+                break;
+                
+            case 'job_update':
+                // Update a single job
+                if (data.job) {
+                    const jobId = data.job.id;
+                    console.log('Received job update:', jobId, data.job.status, data.job.progress);
+                    renderJobRow(data.job);
+                }
+                break;
+                
+            case 'batch_job_update':
+                // Update multiple jobs
+                if (data.jobs && Array.isArray(data.jobs)) {
+                    data.jobs.forEach(job => {
+                        renderJobRow(job);
+                    });
+                }
+                break;
+                
+            case 'pong':
+                // Heartbeat response
+                break;
+                
+            default:
+                console.log('Unknown WebSocket message type:', data.type);
+        }
+    }
+
+    function attemptReconnect() {
+        reconnectAttempts++;
+        const delay = Math.min(RECONNECT_INTERVAL * Math.pow(2, reconnectAttempts), 30000); // Exponential backoff up to 30 seconds
+        console.log(`Attempting to reconnect... (attempt ${reconnectAttempts}, next in ${delay / 1000}s)`);
+        setTimeout(initializeWebSocket, delay);
+    }
+
+    let heartbeatInterval;
+
+    function startHeartbeat() {
+        // Clear existing interval
+        if (heartbeatInterval) {
+            clearInterval(heartbeatInterval);
+        }
+        
+        // Send ping every 30 seconds to keep connection alive
+        heartbeatInterval = setInterval(() => {
+            if (webSocket && webSocket.readyState === WebSocket.OPEN) {
+                webSocket.send(JSON.stringify({ type: 'ping' }));
+            }
+        }, 30000); // 30 seconds
+    }
+
+    function stopHeartbeat() {
+        if (heartbeatInterval) {
+            clearInterval(heartbeatInterval);
+            heartbeatInterval = null;
+        }
+    }
+
+
+
+
+    // Connection status UI updates
+    function updateConnectionStatus(connected) {
+        const statusDot = document.getElementById('status-indicator');
+        const statusText = document.getElementById('status-text');
+        
+        if (statusDot && statusText) {
+            if (connected) {
+                statusDot.className = 'status-dot connected';
+                statusText.textContent = 'Real-time connection';
+            } else {
+                statusDot.className = 'status-dot disconnected';
+                statusText.textContent = 'Polling active';
+            }
+        }
+    }
+    
+    // Close WebSocket when page unloads
+    window.addEventListener('beforeunload', () => {
+        if (webSocket) {
+            stopHeartbeat();
+            webSocket.close();
+        }
+    });
+    
+    // Initialize WebSocket connection after UI is set up
+    if (ENABLE_WEBSOCKETS && window.APP_CONFIG && (window.APP_CONFIG.local_only_mode || window.APP_CONFIG.user)) {
+        initializeWebSocket();
+    }
+});
