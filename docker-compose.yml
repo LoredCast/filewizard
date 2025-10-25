@@ -1,10 +1,9 @@
 version: "3.9"
 services:
   web:
-    image: loredcast/filewizard:0.4-latest
+    image: loredcast/filewizard:latest
     build:
       context: .
-      # Set the target stage for the build. This is the crucial part.
       target: full-final # Change to 'full-final' or 'small-final' as needed
     #env_file:
     # - .env
