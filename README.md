@@ -6,9 +6,11 @@
 
 A self-hosted, browser-based utility for file conversion, OCR and audio transcription. It wraps common CLI and Python converters (FFmpeg, LibreOffice, Pandoc, ImageMagick, etc.), plus `faster-whisper` and Tesseract OCR.
 
-![Screenshot](swappy-20250920_155526.png)
+![Screenshot](screenshot.png)
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/loredcast)
+
+Consider spending 30 seconds on the [» usage survey «](https://app.youform.com/forms/sdlb6mto) to help improve the app and suggest changes!
 
 ## Features
 - Convert between many file formats; extendable via `settings.yml` to add any CLI tool.
