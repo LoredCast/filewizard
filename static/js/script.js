@@ -183,7 +183,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         let actionHtml = '<span>-</span>';
         if (['pending', 'processing', 'uploading'].includes(job.status)) {
-            actionHtml = `<button class="cancel-button" data-job-id="${job.id}">Cancel</button>`;
+            actionHtml = `<button class="cancel-button" data-job-id="${job.id}"><i class="fa">&#xf00d;</i></button>`;
         } else if (job.status === 'completed') {
             if (job.task_type === 'unzip') {
                 actionHtml = `<a href="${apiUrl('/download/zip-batch')}/${encodeURIComponent(job.id)}" class="download-button" download><i class="fa">&#xf019;</i> Batch</a>`;

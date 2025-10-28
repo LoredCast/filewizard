@@ -21,6 +21,11 @@
     --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 }
 
+::selection {
+    background-color: var(--primary-color);
+    color: var(--bg-color);
+}
+
 /* Page */
 html {
     box-sizing: border-box;
@@ -444,7 +449,6 @@ input[type="file"] {
 
 #job-table {
     width: 100%;
-    border-collapse: collapse;
     font-size: 0.9rem;
     margin-bottom: 2em;
 }
@@ -774,6 +778,36 @@ body.dragging .drag-overlay {
     margin: 0 auto;
 }
 
+
+.details-button {
+        display: inline-block !important;
+        margin-left: 0.1rem;
+        padding: 0.25rem 0.25rem; /* Small padding for square shape */
+        font-size: 0.5rem; /* Smaller font */
+        width: 2em; /* Square shape */
+        height: 2em;
+        font-family: serif;
+        font-weight: 600;
+        text-align: center;
+        line-height: 1.1em; /* Center the text vertically */
+        border-radius: 2em; /* Circular shape */
+        background-color: var(--primary-hover);
+        border: 1px solid var(--border-color);
+        color: var(--muted-text);
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+    
+    .details-button:hover {
+        background-color: var(--primary-color);
+        color: var(--bg-color);
+    }
+    
+    /* Show all details by default on mobile - hide the details row that was for desktop only */
+    .job-details-row {
+        display: none;
+    }
+
 @keyframes spin {
     0% { transform: rotate(0deg); }
     100% { transform: rotate(360deg); }
@@ -800,7 +834,7 @@ body.dragging .drag-overlay {
     #job-table {
         min-width: 400px; /* Reduced minimum width */
         font-size: 0.7rem; /* Smaller font size */
-        padding: 25px;
+        padding: 9px;
         margin-bottom: 0em;
     }
     
@@ -946,7 +980,6 @@ body.dragging .drag-overlay {
     
     #job-table th,
     #job-table td {
-        padding: 0.5rem;
         font-size: 0.75rem;
     }
     

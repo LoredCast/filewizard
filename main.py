@@ -2129,7 +2129,7 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
 
     if task_type == 'transcription':
         output_suffix = '.srt' if options.get('generate_timestamps', False) else '.txt'
-        processed_path = PATHS.PROCESSED_DIR / f"{Path(original_filename).stem}_{job_id[:8]}{output_suffix}"
+        processed_path = PATHS.PROCESSED_DIR / f"{Path(safe_filename).stem}_{job_id[:8]}{output_suffix}"
         job_data.processed_filepath = str(processed_path)
         create_job(db=db, job=job_data)
         run_transcription_task(job_data.id, str(final_path), str(processed_path), options.get("model_size", "base"), app_config.get("transcription_settings", {}).get("whisper", {}), app_config, base_url, generate_timestamps=options.get('generate_timestamps', False))
@@ -3593,8 +3593,7 @@ async def get_jobs_status(payload: JobStatusRequest, db: Session = Depends(get_d
 
 @app.get("/download/{filename}")
 async def download_file(filename: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
-    safe_filename = secure_filename(filename)
-    file_path = ensure_path_is_safe(PATHS.PROCESSED_DIR / safe_filename, [PATHS.PROCESSED_DIR])
+    file_path = ensure_path_is_safe(PATHS.PROCESSED_DIR / filename, [PATHS.PROCESSED_DIR])
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found.")
     # API users can download files they own via webhook URL. UI users need session.
