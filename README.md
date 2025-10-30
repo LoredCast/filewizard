@@ -28,18 +28,43 @@ A self-hosted, browser-based utility for file conversion, OCR and audio transcri
 FastAPI, vanilla HTML/JS/CSS frontend.
 
 ## Installation
-
 ### Recommended — Docker (pull from Docker Hub)
 Images available:
 - `loredcast/filewizard:latest` (newest full release without cuda)
 - `loredcast/filewizard:0.3-small` (omits TeX and other large tools)
 - `loredcast/filewizard:0.3-cuda` (CUDA-enabled)
 
-Copy `docker-compose.yml` from the repo, adjust as needed, then:
+```
+# docker-compose.yml
+version: "3.9"
+services:
+  web:
+    image: loredcast/filewizard:latest
+    environment:
+      - LOCAL_ONLY=True # False for Auth
+      - SECRET_KEY= # set if using auth
+      - UPLOADS_DIR=/app/uploads # inside the container
+      - PROCESSED_DIR=/app/processed # inside the container
+      - OMP_NUM_THREADS=1
+      - DOWNLOAD_KOKORO_ON_STARTUP=true
+    ports:
+      - "6969:8000"
+    volumes:
+      - ./config:/app/config # settings.yml will be here
+      - ./uploads_data:/app/uploads
+      - ./processed_data:/app/processed
+volumes:
+  uploads_data: {}
+  processed_data: {}
+```
+
+
+Copy `docker-compose.yml` from the repo or the above, adjust as needed, then:
 
 ```bash
 docker compose up -d
 ```
+FileWizard will be available at `localhost:6969`
 
 ### Build locally with Docker (new build types)
 
