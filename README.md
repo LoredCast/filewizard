@@ -24,8 +24,8 @@ A self-hosted, browser-based utility for file conversion, OCR and audio transcri
 ## Security
 **Warning:** exposing this app publicly without authentication risks arbitrary code execution. Intended for local use or behind a properly configured OAuth/OIDC provider.
 
-## Tech stack
-FastAPI backend, vanilla HTML/JS/CSS frontend (lightweight), Huey for task queuing, SQLite for storage.
+#### Tech stack
+FastAPI, vanilla HTML/JS/CSS frontend.
 
 ## Installation
 
