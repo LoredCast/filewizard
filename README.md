@@ -10,7 +10,7 @@ A self-hosted, browser-based utility for file conversion, OCR and audio transcri
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/loredcast)
 
-Consider spending 30 seconds on the [» usage survey «](https://app.youform.com/forms/sdlb6mto) to help improve the app and suggest changes!
+
 
 ## Features
 - Convert between many file formats; extendable via `settings.yml` to add any CLI tool.
@@ -142,5 +142,9 @@ https://github.com/LoredCast/filewizard/wiki
 | **SoX (Sound eXchange)** | `.wav`, `.aiff`, `.mp3` (if libmp3lame), `.flac`, `.ogg/.oga`, `.raw`, `.au`, `.voc`, `.w64`, `.gsm`, `.amr`, `.m4a` (if libs present) | `.wav`, `.aiff`, `.flac`, `.mp3`, `.ogg`, `.raw`, `.w64`, `.opus`, `.amr`, `.m4a` | Audio processing, normalization, effects; exact formats depend on linked libraries. |
 | **Tesseract OCR / ocrmypdf** | Image formats (`.png`, `.jpg`, `.jpeg`, `.tiff`), PDFs (image PDFs) | Plain text (`.txt`), searchable PDF (PDF with text layer), HOCR, ALTO XML | OCR engine; language/training data required for best accuracy. `ocrmypdf` is a wrapper for PDF workflows. |
 | **faster-whisper / OpenAI Whisper (local)** | Audio: `.mp3`, `.wav`, `.m4a`, `.flac`, `.ogg`, `.opus`, `.aac` | Plain text transcripts (`.txt`), `.srt`, `.vtt`, other subtitle formats | Local Whisper implementations for speech-to-text. Models and speed depend on CPU/GPU and model variant. |
+
+
+
+Consider spending 30 seconds on the [» usage survey «](https://app.youform.com/forms/sdlb6mto) to help improve the app and suggest changes!
 
 ---
