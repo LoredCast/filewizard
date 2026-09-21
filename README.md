@@ -27,6 +27,16 @@ A self-hosted, browser-based utility for file conversion, OCR and audio transcri
 FastAPI, vanilla HTML/JS/CSS frontend.
 
 ## Installation
+
+### Easypanel
+
+If you'd rather not manage the container yourself, [Easypanel](https://easypanel.io) is a self-hosted deployment platform with a one-click FileWizard template:
+
+[![Deploy on Easypanel][easypanel-btn]][easypanel-deploy]
+
+[easypanel-btn]: https://easypanel.io/img/deploy-on-easypanel-40.svg
+[easypanel-deploy]: https://easypanel.io/templates/filewizard
+
 ### Recommended — Docker (pull from Docker Hub)
 Images available:
 - `loredcast/filewizard:latest` (newest full release without cuda)
