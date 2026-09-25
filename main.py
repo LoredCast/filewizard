@@ -20,9 +20,13 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 import resource
+import fcntl
+import signal
+import tempfile
+import gc
 from threading import Semaphore
 from logging.handlers import RotatingFileHandler
-from urllib.parse import urljoin, urlparse, urlencode
+from urllib.parse import urljoin, urlparse, urlencode, quote
 from io import BytesIO
 import zipfile
 import sys
@@ -69,6 +73,10 @@ ENABLE_WEBSOCKETS = False
 
 
 load_dotenv()
+
+# Converters process untrusted documents. kpathsea reads texmf.cnf overrides from the
+# environment, so this disables TeX's \write18 shell escape for every child process.
+os.environ.setdefault("shell_escape", "f")
 
 # --- Optional Dependency Handling for Piper TTS ---
 try:
@@ -296,16 +304,69 @@ def get_supported_output_formats_for_file(filename: str, conversion_tools_config
     return supported_formats
 
 # --- Resource Limiting ---
+def _compute_child_rlimits() -> list:
+    """
+    Limits for converter processes, computed once in the parent and clamped to the
+    current hard limits (raising a hard limit fails without privileges).
+    CHILD_CPU_LIMIT_SECONDS (default 6000) and CHILD_MEMORY_LIMIT_MB (default 4096,
+    0 = no limit; tools embedding Chromium/QtWebEngine may need more address space).
+    """
+    wanted = [(resource.RLIMIT_CPU, int(os.environ.get("CHILD_CPU_LIMIT_SECONDS", "6000")))]
+    memory_mb = int(os.environ.get("CHILD_MEMORY_LIMIT_MB", "4096"))
+    if memory_mb > 0:
+        wanted.append((resource.RLIMIT_AS, memory_mb * 1024 * 1024))
+    limits = []
+    for res, value in wanted:
+        if value <= 0:
+            continue
+        try:
+            _soft, hard = resource.getrlimit(res)
+            if hard != resource.RLIM_INFINITY:
+                value = min(value, hard)
+            limits.append((res, value))
+        except (ValueError, OSError):
+            pass
+    return limits
+
+
+_CHILD_RLIMITS = _compute_child_rlimits()
+
+
 def _limit_resources_preexec():
-    """Set resource limits for child processes to prevent DoS attacks."""
+    """
+    Runs in the forked child before exec. The parent is multi-threaded (gunicorn/huey),
+    so this must not log or take locks, which could deadlock the child.
+    """
+    for res, value in _CHILD_RLIMITS:
+        try:
+            resource.setrlimit(res, (value, value))
+        except (ValueError, OSError):
+            pass
+
+
+def _kill_process_tree(proc: subprocess.Popen):
+    """Kills a child started with start_new_session=True together with everything it spawned."""
     try:
-        # 6000s CPU, 4GB address space
-        resource.setrlimit(resource.RLIMIT_CPU, (6000, 6000))
-        resource.setrlimit(resource.RLIMIT_AS, (4 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024))
-    except Exception as e:
-        # This may fail in some environments (e.g. Windows, some containers)
-        logging.getLogger(__name__).warning(f"Could not set resource limits: {e}")
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
         pass
+    except Exception:
+        proc.kill()
+    try:
+        proc.wait(timeout=10)  # reap, so no zombies are left behind
+    except subprocess.TimeoutExpired:
+        logger.warning("Process %s did not exit after SIGKILL.", proc.pid)
+
+
+def _read_tail(f, limit: int = 64 * 1024) -> str:
+    """Returns the last `limit` bytes written to a temp file as text."""
+    try:
+        f.flush()
+        size = f.seek(0, os.SEEK_END)
+        f.seek(max(0, size - limit))
+        return f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
 
 # --- Model concurrency semaphore (lazily initialized) ---
 _model_semaphore: Optional[Semaphore] = None
@@ -546,6 +607,25 @@ def initialize_settings_file():
             PATHS.SETTINGS_FILE.touch()
 
 _config_mtimes: Optional[tuple] = None
+# tool id -> executable that is missing on this server; such tools are hidden and rejected.
+UNAVAILABLE_TOOLS: Dict[str, str] = {}
+
+
+def _compute_unavailable_tools(conversion_tools: dict) -> Dict[str, str]:
+    missing = {}
+    for tool_id, tool_cfg in conversion_tools.items():
+        if not isinstance(tool_cfg, dict):
+            continue
+        try:
+            parts = shlex.split(str(tool_cfg.get("command_template") or ""))
+        except ValueError:
+            parts = []
+        executable = parts[0] if parts else ""
+        if not executable or shutil.which(executable) is None:
+            missing[tool_id] = executable or "(no command)"
+        elif tool_id == "mozjpeg" and shutil.which("vips") is None:
+            missing[tool_id] = "vips"
+    return missing
 
 
 def _settings_mtimes() -> tuple:
@@ -649,6 +729,12 @@ def load_app_config():
         allowed = []
     app_settings["allowed_all_extensions"] = set(allowed)
     config["app_settings"] = app_settings
+
+    global UNAVAILABLE_TOOLS
+    UNAVAILABLE_TOOLS = _compute_unavailable_tools(config.get("conversion_tools", {}) or {})
+    if UNAVAILABLE_TOOLS:
+        logger.info("Conversion tools hidden because their program is not installed: "
+                    + ", ".join(f"{t} ({exe})" for t, exe in sorted(UNAVAILABLE_TOOLS.items())))
 
     APP_CONFIG = config
     logger.info("Application configuration loaded.")
@@ -763,11 +849,12 @@ def get_job(db: Session, job_id: str):
     # return db.query(Job).filter(Job.id == job_id).first()
     return  db.query(Job).filter(Job.id == job_id).first()
 
-def get_jobs(db: Session, user_id: str | None = None, skip: int = 0, limit: int = 100):
+def get_jobs(db: Session, user_id: str | None = None, skip: int = 0, limit: int | None = 100):
     query = db.query(Job)
     if user_id:
         query = query.filter(Job.user_id == user_id)
-    return query.order_by(Job.created_at.desc()).offset(skip).limit(limit).all()
+    query = query.order_by(Job.created_at.desc()).offset(skip)
+    return (query.limit(limit) if limit else query).all()
 
 
 def create_job(db: Session, job: JobCreate):
@@ -780,8 +867,16 @@ def create_job(db: Session, job: JobCreate):
     return db_job
 
 def update_job_status(db: Session, job_id: str, status: str, progress: int = None, error: str = None):
+    # End the current transaction so the committed row is read (e.g. a cancellation by the web process).
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
     db_job = get_job(db, job_id)
     if db_job:
+        if db_job.status == "cancelled" and status != "cancelled":
+            # A cancelled job stays cancelled even if its task later finishes or fails.
+            return db_job
         old_status = db_job.status
         old_progress = db_job.progress
 
@@ -798,7 +893,8 @@ def update_job_status(db: Session, job_id: str, status: str, progress: int = Non
 
         job_schema = JobSchema.model_validate(db_job)
 
-        if (status_changed or progress_changed) and db_job.user_id:
+        # Notifications are only consumed by the WebSocket processor; without it they piled up forever.
+        if ENABLE_WEBSOCKETS and (status_changed or progress_changed) and db_job.user_id:
             manager.sync_broadcast_job_status_update(db_job.user_id, job_schema.model_dump())
     return db_job
 
@@ -1436,46 +1532,44 @@ def list_kokoro_languages_cli(timeout: int = 60) -> List[str]:
 
 def run_command(
     argv: List[str],
-    timeout: int = 300
+    timeout: int = 300,
+    cwd: Optional[Path] = None,
 ) -> subprocess.CompletedProcess:
     """
-    Executes a command, captures its output, and handles timeouts and errors.
-    Uses resource limits for child processes. This is a simplified, more robust
-    implementation using subprocess.run.
+    Executes a command with resource limits and a timeout. Output goes to temp files, not
+    pipes (a chatty tool can't block on a full pipe), and on timeout the whole process
+    group is killed. Returns the tail of stdout/stderr; raises Exception on failure.
     """
-    logger.debug("Executing command: %s with timeout=%ss", " ".join(shlex.quote(s) for s in argv), timeout)
-
-    preexec = globals().get("_limit_resources_preexec", None)
-
-    try:
-        # subprocess.run handles timeout, output capturing, and error checking.
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=True,  # Raises CalledProcessError on non-zero exit
-            preexec_fn=preexec
-        )
-        logger.debug("Command completed successfully: %s", " ".join(shlex.quote(s) for s in argv))
-        return result
-    except FileNotFoundError:
-        msg = f"Command not found: {argv[0]}"
+    printable = " ".join(shlex.quote(s) for s in argv)
+    logger.debug("Executing command: %s with timeout=%ss", printable, timeout)
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        try:
+            proc = subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f, cwd=cwd,
+                preexec_fn=_limit_resources_preexec, start_new_session=True,
+            )
+        except FileNotFoundError:
+            msg = f"Command not found: {argv[0]}"
+            logger.error(msg)
+            raise Exception(msg) from None
+        except Exception as e:
+            msg = f"Unexpected error launching command: {e}"
+            logger.exception(msg)
+            raise Exception(msg) from e
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            msg = f"Command timed out after {timeout}s: {printable}"
+            logger.error(msg)
+            raise Exception(msg) from None
+        stdout, stderr = _read_tail(out_f), _read_tail(err_f)
+    if returncode != 0:
+        msg = f"Command failed with exit code {returncode}. Stderr: {stderr[-1000:]}"
         logger.error(msg)
-        raise Exception(msg) from None
-    except subprocess.TimeoutExpired as e:
-        msg = f"Command timed out after {timeout}s: {' '.join(shlex.quote(s) for s in argv)}"
-        logger.error(msg)
-        raise Exception(msg) from e
-    except subprocess.CalledProcessError as e:
-        snippet = (e.stderr or "")[:1000]
-        msg = f"Command failed with exit code {e.returncode}. Stderr: {snippet}"
-        logger.error(msg)
-        raise Exception(msg) from e
-    except Exception as e:
-        msg = f"Unexpected error launching command: {e}"
-        logger.exception(msg)
-        raise Exception(msg) from e
+        raise Exception(msg)
+    logger.debug("Command completed successfully: %s", printable)
+    return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr=stderr)
 
 def validate_and_build_command(template_str: str, mapping: Dict[str, str]) -> TypingList[str]:
     fmt = Formatter()
@@ -1590,8 +1684,7 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
 
                     if current_time - last_update_time > DB_POLL_INTERVAL_SECONDS:
                         last_update_time = current_time
-                        job_check = get_job(db, job_id)
-                        if job_check and job_check.status == 'cancelled':
+                        if _current_job_status(db, job_id) == 'cancelled':
                             logger.info(f"Job {job_id} cancelled during transcription. Stopping.")
                             return
                         if info.duration > 0:
@@ -1614,8 +1707,7 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
 
                     if current_time - last_update_time > DB_POLL_INTERVAL_SECONDS:
                         last_update_time = current_time
-                        job_check = get_job(db, job_id)
-                        if job_check and job_check.status == 'cancelled':
+                        if _current_job_status(db, job_id) == 'cancelled':
                             logger.info(f"Job {job_id} cancelled during transcription. Stopping.")
                             return
                         if info.duration > 0:
@@ -1951,6 +2043,39 @@ def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, a
             logger.exception("Failed to send webhook notification after Image OCR.")
 
 
+# Executables of LibreOffice; each conversion gets a private profile (see run_conversion_task).
+LIBREOFFICE_BINARIES = {"libreoffice", "soffice", "lowriter", "localc", "loimpress", "lodraw"}
+# Output keys in the default config whose pandoc writer has a different name.
+PANDOC_WRITERS = {"txt": "plain", "md": "markdown", "tex": "latex"}
+GHOSTSCRIPT_PDF_PRESETS = {"screen", "ebook", "printer", "prepress", "default"}
+SOX_SAMPLE_RATES = {"11k": "11025", "22k": "22050", "44k": "44100", "88k": "88200", "176k": "176400"}
+
+
+def _find_tool_output(out_dir: Path, input_stem: str, output_ext: str) -> Optional[Path]:
+    """Finds the result of a tool that picks its own output file name inside out_dir."""
+    files = [p for p in out_dir.rglob("*") if p.is_file()]
+    exact = [p for p in files if p.name == f"{input_stem}.{output_ext}"]
+    if exact:
+        return exact[0]
+    same_ext = [p for p in files if p.suffix.lower() == f".{output_ext}".lower()]
+    if len(same_ext) == 1:
+        return same_ext[0]
+    if len(files) == 1:
+        return files[0]
+    return None
+
+
+def _current_job_status(db: Session, job_id: str) -> Optional[str]:
+    """
+    Reads the job's status as currently committed. Ending the session's transaction first
+    matters: inside one SQLite read transaction (and SQLAlchemy's identity map) a
+    cancellation written by the web process would never become visible.
+    """
+    db.rollback()
+    job = get_job(db, job_id)
+    return job.status if job else None
+
+
 @huey.task()
 def run_conversion_task(job_id: str,
                         input_path_str: str,
@@ -1961,31 +2086,34 @@ def run_conversion_task(job_id: str,
                         app_config: dict,
                         base_url: str):
     """
-    Drop-in replacement for conversion task.
-    - Uses improved run_command for short operations (resource-limited).
-    - Uses cancellable Popen runner for long-running conversion to respond to DB cancellations.
+    Runs a configured conversion tool for a job.
+    - The tool runs in its own process group with resource limits; cancel/timeout kill the whole group.
+    - Output is written to temp files instead of pipes, so verbose tools can't block on a full pipe.
+    - Tools that ignore {output} and write into {output_dir} (LibreOffice, docling) get a private
+      directory whose result is moved into place.
     """
     db = SessionLocal()
     input_path = Path(input_path_str)
     output_path = Path(output_path_str)
 
-    # localize helpers for speed
-    _get_job = get_job
-    _update_job_status = update_job_status
-    _validate_build = validate_and_build_command
-    _mark_completed = mark_job_as_completed
-    _ensure_safe = ensure_path_is_safe
-    _send_webhook = send_webhook_notification
-
     temp_input_file: Optional[Path] = None
     temp_output_file: Optional[Path] = None
+    job_output_dir: Optional[Path] = None
+    lo_profile_dir: Optional[Path] = None
 
     POLL_INTERVAL = 1.0
     STDERR_SNIPPET = 4000
 
     def _parse_task_key(tool_name: str, tk: str, tool_cfg: dict, mapping: dict):
         try:
-            if tool_name.startswith("ghostscript"):
+            if tool_name == "ghostscript_pdf":
+                preset = ""
+                if tk in GHOSTSCRIPT_PDF_PRESETS:
+                    preset = f"-dPDFSETTINGS=/{tk}"
+                elif tk == "pdfa":
+                    preset = "-dPDFA=2"
+                mapping.update({"preset": preset})
+            elif tool_name.startswith("ghostscript"):
                 parts = tk.split("_", 1)
                 device = parts[0] if parts and parts[0] else ""
                 setting = parts[1] if len(parts) > 1 else ""
@@ -2008,7 +2136,7 @@ def run_conversion_task(job_id: str,
                 else:
                     rate_token = ""
                     depth_token = ""
-                rate_val = rate_token.replace("k", "000") if rate_token else ""
+                rate_val = SOX_SAMPLE_RATES.get(rate_token) or (rate_token.replace("k", "000") if rate_token else "")
                 if depth_token:
                     depth_val = ('-b' + depth_token.replace('b', '')) if 'b' in depth_token else depth_token
                 else:
@@ -2025,83 +2153,45 @@ def run_conversion_task(job_id: str,
                 if not filter_val:
                     filter_val = target_ext
                 mapping["filter"] = filter_val
+            elif tool_name == "pandoc":
+                mapping["output_ext"] = PANDOC_WRITERS.get(mapping["output_ext"], mapping["output_ext"])
         except Exception:
             logger.exception("Failed to parse task_key for tool %s; continuing with defaults.", tool_name)
 
-    def _run_cancellable_command(command: List[str], timeout: int):
-        """
-        Run command with Popen and poll the DB for cancellation. Enforce timeout.
-        Returns CompletedProcess-like on success. Raises Exception on failure/timeout/cancel.
-        """
-        preexec = globals().get("_limit_resources_preexec", None)
+    def _run_cancellable_command(command: List[str], timeout: int) -> subprocess.CompletedProcess:
+        """Runs the tool, polling the DB for cancellation. Raises Exception on failure/timeout/cancel."""
         logger.debug("Launching conversion subprocess: %s", " ".join(shlex.quote(c) for c in command))
-        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, preexec_fn=preexec)
-
-        start = time.monotonic()
-        stderr_accum = []
-        stderr_len = 0
-        STDERR_LIMIT = STDERR_SNIPPET
-
-        try:
+        with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+            proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f,
+                                    preexec_fn=_limit_resources_preexec, start_new_session=True)
+            start = time.monotonic()
             while True:
-                ret = proc.poll()
-                # Check job status
-                job_check = _get_job(db, job_id)
-                if job_check is None:
-                    logger.warning("Job %s disappeared; killing conversion process.", job_id)
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    raise Exception("Job disappeared during conversion")
-                if job_check.status == "cancelled":
-                    logger.info("Job %s cancelled; terminating conversion process.", job_id)
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    raise Exception("Conversion cancelled")
-
+                try:
+                    ret = proc.wait(timeout=POLL_INTERVAL)
+                except subprocess.TimeoutExpired:
+                    ret = None
                 if ret is not None:
-                    # process done - read remaining stderr/stdout safely
-                    try:
-                        out, err = proc.communicate(timeout=2)
-                    except Exception:
-                        out, err = "", ""
-                        try:
-                            if proc.stderr:
-                                err = proc.stderr.read(STDERR_LIMIT)
-                        except Exception:
-                            pass
-                    if err and len(err) > STDERR_LIMIT:
-                        err = err[-STDERR_LIMIT:]
+                    err = _read_tail(err_f, STDERR_SNIPPET)
                     if ret != 0:
-                        msg = (err or "")[:STDERR_LIMIT]
-                        raise Exception(f"Conversion command failed (rc={ret}): {msg}")
-                    return subprocess.CompletedProcess(args=command, returncode=ret, stdout=out, stderr=err)
+                        raise Exception(f"Conversion command failed (rc={ret}): {err}")
+                    return subprocess.CompletedProcess(args=command, returncode=ret, stdout=_read_tail(out_f, STDERR_SNIPPET), stderr=err)
 
-                # timeout check
-                elapsed = time.monotonic() - start
-                if timeout and elapsed > timeout:
+                job_status = _current_job_status(db, job_id)
+                if job_status is None:
+                    logger.warning("Job %s disappeared; killing conversion process.", job_id)
+                    _kill_process_tree(proc)
+                    raise Exception("Job disappeared during conversion")
+                if job_status == "cancelled":
+                    logger.info("Job %s cancelled; terminating conversion process.", job_id)
+                    _kill_process_tree(proc)
+                    raise Exception("Conversion cancelled")
+                if timeout and time.monotonic() - start > timeout:
                     logger.warning("Conversion command timed out after %ss; terminating.", timeout)
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    raise Exception("Conversion command timed out")
-
-                time.sleep(POLL_INTERVAL)
-        finally:
-            try:
-                if proc.stdout:
-                    proc.stdout.close()
-                if proc.stderr:
-                    proc.stderr.close()
-            except Exception:
-                pass
+                    _kill_process_tree(proc)
+                    raise Exception(f"Conversion command timed out after {timeout}s")
 
     try:
-        job = _get_job(db, job_id)
+        job = get_job(db, job_id)
         if not job:
             logger.warning("Job %s not found; aborting conversion.", job_id)
             return
@@ -2109,7 +2199,7 @@ def run_conversion_task(job_id: str,
             logger.info("Job %s already cancelled; aborting conversion.", job_id)
             return
 
-        _update_job_status(db, job_id, "processing", progress=25)
+        update_job_status(db, job_id, "processing", progress=25)
         logger.info("Starting conversion for job %s using %s with task %s", job_id, tool, task_key)
 
         tool_config = conversion_tools_config.get(tool)
@@ -2118,7 +2208,7 @@ def run_conversion_task(job_id: str,
 
         current_input_path = input_path
 
-        # Pre-conversion step for mozjpeg uses improved run_command (resource-limited)
+        # Pre-conversion step for mozjpeg uses run_command (resource-limited)
         if tool == "mozjpeg":
             temp_input_file = input_path.with_suffix('.temp.ppm')
             logger.info("Pre-converting for MozJPEG: %s -> %s", input_path, temp_input_file)
@@ -2127,22 +2217,24 @@ def run_conversion_task(job_id: str,
             try:
                 run_command(pre_conv_cmd, timeout=int(tool_config.get("timeout", 300)))
             except Exception as ex:
-                err_msg = str(ex)
-                short_err = (err_msg or "")[:STDERR_SNIPPET]
+                short_err = (str(ex) or "")[:STDERR_SNIPPET]
                 logger.exception("MozJPEG pre-conversion failed: %s", short_err)
                 raise Exception(f"MozJPEG pre-conversion to PPM failed: {short_err}")
             current_input_path = temp_input_file
 
-        _update_job_status(db, job_id, "processing", progress=50)
+        update_job_status(db, job_id, "processing", progress=50)
 
         # Prepare atomic temp output on same FS
         output_path.parent.mkdir(parents=True, exist_ok=True)
         temp_output_file = output_path.with_name(f"{output_path.stem}.tmp-{uuid.uuid4().hex}{output_path.suffix}")
+        job_output_dir = PATHS.PROCESSED_DIR / f".tmp-{job_id}"
+        shutil.rmtree(job_output_dir, ignore_errors=True)
+        job_output_dir.mkdir(parents=True)
 
         mapping = {
             "input": str(current_input_path),
             "output": str(temp_output_file),
-            "output_dir": str(current_input_path.parent),
+            "output_dir": str(job_output_dir),
             "output_ext": output_path.suffix.lstrip('.'),
         }
 
@@ -2151,77 +2243,56 @@ def run_conversion_task(job_id: str,
         command_template_str = tool_config.get("command_template")
         if not command_template_str:
             raise ValueError(f"Tool '{tool}' missing 'command_template' in configuration.")
-        command = _validate_build(command_template_str, mapping)
+        command = validate_and_build_command(command_template_str, mapping)
         if not isinstance(command, (list, tuple)) or not command:
             raise ValueError("validate_and_build_command must return a non-empty list/tuple command.")
         command = [str(x) for x in command]
 
+        # LibreOffice instances sharing a profile hand documents to whichever instance is already
+        # running and exit without converting, so concurrent jobs silently failed.
+        if Path(command[0]).name in LIBREOFFICE_BINARIES and not any(a.startswith("-env:UserInstallation=") for a in command):
+            lo_profile_dir = Path(tempfile.mkdtemp(prefix="filewizard-lo-"))
+            command.insert(1, f"-env:UserInstallation={lo_profile_dir.as_uri()}")
+
         logger.info("Executing command: %s", " ".join(shlex.quote(c) for c in command))
+        _run_cancellable_command(command, timeout=int(tool_config.get("timeout", 300)))
 
-        # Run main conversion in cancellable manner
-        timeout_val = int(tool_config.get("timeout", 300))
-
-        result = _run_cancellable_command(command, timeout=timeout_val)
-
-        # Wait for output file to be created and non-empty, with retry for long-running operations
-        max_wait_time = 30  # seconds
-        wait_interval = 0.5  # seconds
-        elapsed_time = 0
-        
-        while elapsed_time < max_wait_time:
-            if temp_output_file.exists() and temp_output_file.stat().st_size > 0:
-                break
-            time.sleep(wait_interval)
-            elapsed_time += wait_interval
-            
-            # Check if job was cancelled during wait
-            job_check = _get_job(db, job_id)
-            if job_check is None:
-                raise Exception("Job disappeared during file creation wait")
-            if job_check.status == "cancelled":
-                raise Exception("Conversion cancelled during file creation wait")
-
-        # Final check after waiting
+        if not (temp_output_file.exists() and temp_output_file.stat().st_size > 0):
+            produced = _find_tool_output(job_output_dir, current_input_path.stem, output_path.suffix.lstrip('.'))
+            if produced:
+                produced.replace(temp_output_file)
         if not temp_output_file.exists() or temp_output_file.stat().st_size == 0:
-            raise Exception("Conversion failed: The tool produced an empty or missing output file after waiting.")
+            raise Exception("Conversion failed: The tool produced an empty or missing output file.")
 
-        # If successful and temp output exists, move it into place atomically
-        if temp_output_file and temp_output_file.exists():
-            temp_output_file.replace(output_path)
-
-        _mark_completed(db, job_id, output_filepath_str=str(output_path), preview="Successfully converted file.")
+        temp_output_file.replace(output_path)
+        mark_job_as_completed(db, job_id, output_filepath_str=str(output_path), preview="Successfully converted file.")
         logger.info("Conversion for job %s completed.", job_id)
 
     except Exception as e:
         logger.exception("ERROR during conversion for job %s: %s", job_id, e)
         try:
-            _update_job_status(db, job_id, "failed", error=f"Conversion failed: {e}")
+            update_job_status(db, job_id, "failed", error=f"Conversion failed: {e}")
         except Exception:
             logger.exception("Failed to update job status to failed after conversion error.")
     finally:
         # clean main input
         try:
-            _ensure_safe(input_path, [PATHS.UPLOADS_DIR, PATHS.CHUNK_TMP_DIR])
+            ensure_path_is_safe(input_path, [PATHS.UPLOADS_DIR, PATHS.CHUNK_TMP_DIR])
             input_path.unlink(missing_ok=True)
         except Exception:
             logger.exception("Failed to cleanup main input file after conversion.")
 
-        # cleanup temp input
-        if temp_input_file:
-            try:
-                temp_input_file_path = Path(temp_input_file)
-                _ensure_safe(temp_input_file_path, [PATHS.UPLOADS_DIR, PATHS.PROCESSED_DIR])
-                temp_input_file_path.unlink(missing_ok=True)
-            except Exception:
-                logger.exception("Failed to cleanup temp input file after conversion.")
+        for temp_file in (temp_input_file, temp_output_file):
+            if temp_file:
+                try:
+                    ensure_path_is_safe(Path(temp_file), [PATHS.UPLOADS_DIR, PATHS.PROCESSED_DIR])
+                    Path(temp_file).unlink(missing_ok=True)
+                except Exception:
+                    logger.exception("Failed to cleanup temp file %s after conversion.", temp_file)
 
-        if temp_output_file:
-            try:
-                temp_output_file_path = Path(temp_output_file)
-                _ensure_safe(temp_output_file_path, [PATHS.UPLOADS_DIR, PATHS.PROCESSED_DIR])
-                temp_output_file_path.unlink(missing_ok=True)
-            except Exception:
-                logger.exception("Failed to cleanup temp output file after conversion.")
+        for temp_dir in (job_output_dir, lo_profile_dir):
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
         try:
             db.close()
@@ -2237,13 +2308,10 @@ def run_conversion_task(job_id: str,
         finally:
             db_for_check.close()
 
-        try:
-            gc.collect()
-        except Exception:
-            pass
+        gc.collect()
 
         try:
-            _send_webhook(job_id, app_config, base_url)
+            send_webhook_notification(job_id, app_config, base_url)
         except Exception:
             logger.exception("Failed to send webhook notification after conversion.")
 
@@ -2424,23 +2492,11 @@ def run_academic_pandoc_task(job_id: str, input_path_str: str, output_path_str: 
         update_job_status(db, job_id, "processing", progress=50)
         logger.info(f"Executing Pandoc command for job {job_id}: {' '.join(command)}")
 
-        # 4. Execute command directly to control working directory and error capture
+        # 4. Run pandoc in the unzipped directory so relative resources resolve
         try:
-            process = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                check=True,  # Raise CalledProcessError on non-zero exit
-                cwd=unzip_dir, # Run pandoc in the unzipped directory
-                preexec_fn=globals().get("_limit_resources_preexec", None)
-            )
-        except subprocess.CalledProcessError as e:
-            # Capture the full, detailed error log from pandoc/latex
-            error_log = e.stderr or "No stderr output."
-            logger.error(f"Pandoc compilation failed. Full log:\n{error_log}")
-            # Raise a more informative exception for the user
-            raise Exception(f"Pandoc compilation failed. Please check your document for errors. Log: {error_log[:2000]}") from e
+            run_command(command, timeout=300, cwd=unzip_dir)
+        except Exception as e:
+            raise Exception(f"Pandoc compilation failed. Please check your document for errors. {str(e)[:2000]}") from e
 
         # 5. Verify output
         if not output_path.exists() or output_path.stat().st_size == 0:
@@ -2570,6 +2626,27 @@ def unzip_and_dispatch_task(job_id: str, input_path_str: str, sub_task_type: str
 
 
 
+_huey_startup_lock = threading.Lock()
+
+
+@huey.on_startup()
+def _init_huey_worker():
+    """
+    The huey consumer is a separate process that never runs the FastAPI lifespan: load the
+    settings there and run the Whisper cache eviction where the models are actually loaded.
+    """
+    global _cache_cleanup_thread
+    with _huey_startup_lock:
+        if not APP_CONFIG:
+            try:
+                load_app_config()
+            except Exception:
+                logger.exception("Huey worker could not load settings.")
+        if _cache_cleanup_thread is None:
+            _cache_cleanup_thread = threading.Thread(target=_whisper_cache_cleanup_worker, daemon=True)
+            _cache_cleanup_thread.start()
+
+
 STALE_UPLOAD_HOURS = float(os.environ.get("STALE_UPLOAD_HOURS", "6"))
 
 
@@ -2580,7 +2657,8 @@ def cleanup_stale_uploads():
     removed = 0
     db = SessionLocal()
     try:
-        candidates = [p for p in PATHS.CHUNK_TMP_DIR.iterdir()] + list(PATHS.UPLOADS_DIR.glob("unzipped_*"))
+        candidates = ([p for p in PATHS.CHUNK_TMP_DIR.iterdir()] + list(PATHS.UPLOADS_DIR.glob("unzipped_*"))
+                      + list(PATHS.PROCESSED_DIR.glob(".tmp-*")))
         for entry in candidates:
             try:
                 if not entry.is_dir() or entry.is_symlink() or entry.stat().st_mtime >= cutoff:
@@ -2628,6 +2706,21 @@ async def download_kokoro_models_if_missing():
             "size": 26124436
         }
     }
+    # All gunicorn workers run this at startup; only one may download, and files appear atomically.
+    lock_file = open(PATHS.KOKORO_TTS_MODELS_DIR / ".download.lock", "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        logger.info("Another worker is checking/downloading the Kokoro TTS models.")
+        return
+    try:
+        await _download_kokoro_files(files_to_download)
+    finally:
+        lock_file.close()
+
+
+async def _download_kokoro_files(files_to_download: dict):
     async with httpx.AsyncClient() as client:
         for name, details in files_to_download.items():
             path, url, expected_size = details["path"], details["url"], details["size"]
@@ -2639,25 +2732,26 @@ async def download_kokoro_models_if_missing():
                 else:
                     logger.info(f"Kokoro TTS {name} file missing. Downloading from {url}...")
 
+                partial_path = path.with_name(path.name + ".part")
                 for attempt in range(3):
                     try:
-                        with path.open("wb") as f:
+                        with partial_path.open("wb") as f:
                             async with client.stream("GET", url, follow_redirects=True, timeout=300) as response:
                                 response.raise_for_status()
                                 total_downloaded = 0
                                 async for chunk in response.aiter_bytes():
                                     f.write(chunk)
                                     total_downloaded += len(chunk)
-                        
+
                         if total_downloaded == expected_size:
+                            partial_path.replace(path)
                             logger.info(f"Successfully downloaded Kokoro TTS {name} file to {path}.")
                             break
                         else:
                             logger.warning(f"Kokoro TTS {name} download incomplete. Expected {expected_size}, got {total_downloaded}. Retrying...")
                     except Exception as e:
                         logger.error(f"Failed to download Kokoro TTS {name} file (attempt {attempt + 1}): {e}")
-                        if path.exists():
-                            path.unlink(missing_ok=True)
+                        partial_path.unlink(missing_ok=True)
                         await asyncio.sleep(5)
                 else:
                     logger.critical(f"Failed to download Kokoro TTS {name} file after 3 attempts. TTS will not be available.")
@@ -3232,6 +3326,12 @@ async def _stitch_chunks(temp_dir: Path, final_path: Path, total_chunks: int):
 UPLOAD_TASK_TYPES = {"conversion", "ocr", "transcription", "tts"}
 
 
+def _require_tool_available(tool: str):
+    if tool in UNAVAILABLE_TOOLS:
+        name = APP_CONFIG.get("conversion_tools", {}).get(tool, {}).get("name", tool)
+        raise HTTPException(status_code=400, detail=f"{name} is not installed on this server ('{UNAVAILABLE_TOOLS[tool]}' not found).")
+
+
 def _validate_task_options(task_type: str, options: dict, is_zip: bool) -> Optional[tuple]:
     """
     Validates a processing request before any file is written. Returns (tool, task_key)
@@ -3247,7 +3347,9 @@ def _validate_task_options(task_type: str, options: dict, is_zip: bool) -> Optio
             validate_tts_model_name(options.get("model_name"))
         elif task_type == "conversion":
             all_tools = APP_CONFIG.get("conversion_tools", {}).keys()
-            return _parse_tool_and_task_key(options.get("output_format") or "", all_tools)
+            tool, task_key = _parse_tool_and_task_key(options.get("output_format") or "", all_tools)
+            _require_tool_available(tool)
+            return tool, task_key
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return None
@@ -3363,6 +3465,7 @@ async def submit_file_conversion(request: Request, file: UploadFile = File(...),
         tool, task_key = _parse_tool_and_task_key(output_format, conversion_tools.keys())
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid output format selected.")
+    _require_tool_available(tool)
 
     job_id, safe_name = uuid.uuid4().hex, safe_basename(file.filename)
     original_stem = Path(safe_name).stem
@@ -3536,6 +3639,7 @@ async def api_process_file(
             tool, task_key = _parse_tool_and_task_key(output_format, conversion_tools.keys())
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid output_format selected.")
+        _require_tool_available(tool)
         target_ext = task_key.split('_')[0]
         if tool == "ghostscript_pdf": target_ext = "pdf"
         processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.{target_ext}"
@@ -3699,7 +3803,7 @@ async def get_index(request: Request):
     conversion_tools = {
         tool_id: {"name": tool.get("name", tool_id), "formats": tool.get("formats") or {}}
         for tool_id, tool in APP_CONFIG.get("conversion_tools", {}).items()
-        if isinstance(tool, dict)
+        if isinstance(tool, dict) and tool_id not in UNAVAILABLE_TOOLS
     }
     return templates.TemplateResponse(request, "index.html", {
         "user": user, "is_admin": admin_status,
@@ -3829,7 +3933,8 @@ async def get_settings_page(request: Request):
         return RedirectResponse(url="/", status_code=302)
     admin_status = is_admin(request)
     context = {"config": {}, "config_source": "", "secrets_set": {}, "user": user, "is_admin": admin_status,
-               "local_only_mode": LOCAL_ONLY_MODE, "allow_command_edits": ALLOW_COMMAND_EDITS}
+               "local_only_mode": LOCAL_ONLY_MODE, "allow_command_edits": ALLOW_COMMAND_EDITS,
+               "unavailable_tools": UNAVAILABLE_TOOLS}
     if not admin_status:
         return templates.TemplateResponse(request, "settings.html", context)
 
@@ -4077,22 +4182,10 @@ async def websocket_job_updates(websocket: WebSocket,
 # --------------------------------------------------------------------------------
 # --- JOB MANAGEMENT & UTILITY ROUTES
 # --------------------------------------------------------------------------------
-@app.post("/settings/clear-history")
-async def clear_job_history(db: Session = Depends(get_db), user: dict = Depends(require_user)):
-    try:
-        num_deleted = db.query(Job).filter(Job.user_id == user['sub']).delete()
-        db.commit()
-        logger.info(f"Cleared {num_deleted} jobs for user {user['sub']}.")
-        return {"deleted_count": num_deleted}
-    except Exception:
-        db.rollback()
-        logger.exception("Failed to clear job history")
-        raise HTTPException(status_code=500, detail="Database error while clearing history.")
-
-@app.post("/settings/delete-files")
-async def delete_processed_files(db: Session = Depends(get_db), user: dict = Depends(require_user)):
+def _delete_job_files(jobs) -> tuple[int, list]:
+    """Deletes the processed files of the given jobs. Returns (deleted_count, failed_names)."""
     deleted_count, errors = 0, []
-    for job in get_jobs(db, user_id=user['sub']):
+    for job in jobs:
         if job.processed_filepath:
             try:
                 p = ensure_path_is_safe(Path(job.processed_filepath), [PATHS.PROCESSED_DIR])
@@ -4102,6 +4195,27 @@ async def delete_processed_files(db: Session = Depends(get_db), user: dict = Dep
             except Exception:
                 errors.append(Path(job.processed_filepath).name)
                 logger.exception(f"Could not delete file {Path(job.processed_filepath).name}")
+    return deleted_count, errors
+
+
+@app.post("/settings/clear-history")
+async def clear_job_history(db: Session = Depends(get_db), user: dict = Depends(require_user)):
+    """Deletes the user's job records together with their processed files (they'd be unreachable otherwise)."""
+    try:
+        files_deleted, _errors = _delete_job_files(get_jobs(db, user_id=user['sub'], limit=None))
+        num_deleted = db.query(Job).filter(Job.user_id == user['sub']).delete()
+        db.commit()
+        logger.info(f"Cleared {num_deleted} jobs and {files_deleted} files for user {user['sub']}.")
+        return {"deleted_count": num_deleted, "files_deleted": files_deleted}
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to clear job history")
+        raise HTTPException(status_code=500, detail="Database error while clearing history.")
+
+@app.post("/settings/delete-files")
+async def delete_processed_files(db: Session = Depends(get_db), user: dict = Depends(require_user)):
+    # All of the user's jobs, not just the 100 most recent ones.
+    deleted_count, errors = _delete_job_files(get_jobs(db, user_id=user['sub'], limit=None))
     if errors:
         raise HTTPException(status_code=500, detail=f"Could not delete some files: {', '.join(errors)}")
     logger.info(f"Deleted {deleted_count} files for user {user['sub']}.")
@@ -4161,26 +4275,55 @@ async def download_file(filename: str, db: Session = Depends(get_db), user: dict
     download_filename = Path(job.original_filename).stem + Path(job.processed_filepath).suffix
     return FileResponse(path=file_path, filename=download_filename, media_type="application/octet-stream")
 
+def _content_disposition(filename: str) -> str:
+    """Attachment header with an ASCII fallback and an RFC 5987 UTF-8 name."""
+    fallback = safe_basename(filename)
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
+
+
+def _zip_files_response(entries: List[tuple], download_name: str) -> StreamingResponse:
+    """
+    Builds a ZIP of (path, archive_name) entries in a spooled temp file (memory up to 32 MB,
+    disk beyond) and streams it. Call via run_in_threadpool: zipping blocks.
+    """
+    spool = tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024)
+    used_names = set()
+    with zipfile.ZipFile(spool, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for file_path, arcname in entries:
+            stem, suffix = Path(arcname).stem, Path(arcname).suffix
+            unique_name, counter = arcname, 1
+            while unique_name in used_names:
+                counter += 1
+                unique_name = f"{stem} ({counter}){suffix}"
+            used_names.add(unique_name)
+            zip_file.write(file_path, arcname=unique_name)
+    spool.seek(0)
+
+    def iter_file():
+        try:
+            while chunk := spool.read(1024 * 1024):
+                yield chunk
+        finally:
+            spool.close()
+
+    return StreamingResponse(iter_file(), media_type="application/zip",
+                             headers={"Content-Disposition": _content_disposition(download_name)})
+
+
 @app.post("/download/batch", response_class=StreamingResponse)
 async def download_batch(payload: JobSelection, db: Session = Depends(get_db), user: dict = Depends(require_user)):
     job_ids = payload.job_ids
     if not job_ids:
         raise HTTPException(status_code=400, detail="No job IDs provided.")
 
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-        for job_id in job_ids:
-            job = get_job(db, job_id)
-            if job and job.user_id == user['sub'] and job.status == 'completed' and job.processed_filepath:
-                file_path = ensure_path_is_safe(Path(job.processed_filepath), [PATHS.PROCESSED_DIR])
-                if file_path.exists():
-                    download_filename = f"{Path(job.original_filename).stem}_{job_id}{file_path.suffix}"
-                    zip_file.write(file_path, arcname=download_filename)
+    entries = []
+    for job in db.query(Job).filter(Job.id.in_(job_ids), Job.user_id == user['sub'], Job.status == 'completed').all():
+        if job.processed_filepath:
+            file_path = ensure_path_is_safe(Path(job.processed_filepath), [PATHS.PROCESSED_DIR])
+            if file_path.exists():
+                entries.append((file_path, f"{Path(safe_basename(job.original_filename)).stem}_{job.id}{file_path.suffix}"))
 
-    zip_buffer.seek(0)
-    return StreamingResponse(zip_buffer, media_type="application/x-zip-compressed", headers={
-        'Content-Disposition': f'attachment; filename="file-wizard-batch-{uuid.uuid4().hex[:8]}.zip"'
-    })
+    return await run_in_threadpool(_zip_files_response, entries, f"file-wizard-batch-{uuid.uuid4().hex[:8]}.zip")
 
 @app.get("/download/zip-batch/{job_id}", response_class=StreamingResponse)
 async def download_zip_batch(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
@@ -4195,29 +4338,19 @@ async def download_zip_batch(job_id: str, db: Session = Depends(get_db), user: d
     if not child_jobs:
         raise HTTPException(status_code=404, detail="No completed sub-jobs found for this batch.")
 
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-        files_added = 0
-        for job in child_jobs:
-            if job.processed_filepath:
-                file_path = ensure_path_is_safe(Path(job.processed_filepath), [PATHS.PROCESSED_DIR])
-                if file_path.exists():
-                    # Create a more user-friendly name inside the zip
-                    download_filename = f"{Path(job.original_filename).stem}{file_path.suffix}"
-                    zip_file.write(file_path, arcname=download_filename)
-                    files_added += 1
+    entries = []
+    for job in child_jobs:
+        if job.processed_filepath:
+            file_path = ensure_path_is_safe(Path(job.processed_filepath), [PATHS.PROCESSED_DIR])
+            if file_path.exists():
+                # Create a more user-friendly name inside the zip
+                entries.append((file_path, f"{Path(safe_basename(job.original_filename)).stem}{file_path.suffix}"))
 
-    if files_added == 0:
+    if not entries:
          raise HTTPException(status_code=404, detail="No processed files found for the completed sub-jobs.")
 
-    zip_buffer.seek(0)
-
-    # Generate a filename for the download
     batch_filename = f"{Path(parent_job.original_filename).stem}_processed.zip"
-
-    return StreamingResponse(zip_buffer, media_type="application/x-zip-compressed", headers={
-        'Content-Disposition': f'attachment; filename="{batch_filename}"'
-    })
+    return await run_in_threadpool(_zip_files_response, entries, batch_filename)
 
 @app.get("/api/v1/supported-formats/{file_extension}")
 async def get_supported_formats_for_file_type(file_extension: str, user: dict = Depends(require_user)):
@@ -4235,6 +4368,8 @@ async def get_supported_formats_for_file_type(file_extension: str, user: dict = 
     # Find tools that support this input extension
     supported_formats = []
     for tool_name, tool_config in conversion_tools.items():
+        if tool_name in UNAVAILABLE_TOOLS:
+            continue
         supported_inputs = tool_config.get("supported_input", [])
         # Convert supported inputs to lowercase for comparison
         supported_inputs_lower = [ext.lower() for ext in supported_inputs]
@@ -4256,30 +4391,19 @@ async def get_supported_formats_for_file_type(file_extension: str, user: dict = 
 @app.get("/api/formats/count")
 async def get_formats_count():
     """
-    Returns the number of supported input and output formats.
+    Returns the number of supported input and output formats of the installed tools.
     """
-    try:
-        with open(PATHS.DEFAULT_SETTINGS_FILE, 'r') as f:
-            settings = yaml.safe_load(f)
-
-        input_formats = set()
-        output_formats = set()
-
-        for tool, config in settings.get('conversion_tools', {}).items():
-            if 'supported_input' in config:
-                for fmt in config['supported_input']:
-                    input_formats.add(fmt)
-            if 'formats' in config:
-                for fmt in config['formats']:
-                    output_formats.add(fmt)
-
-        return {
-            "input_formats_count": len(input_formats),
-            "output_formats_count": len(output_formats)
-        }
-    except Exception as e:
-        logger.error(f"Error counting formats: {e}")
-        raise HTTPException(status_code=500, detail="Error counting formats")
+    input_formats = set()
+    output_formats = set()
+    for tool, config in APP_CONFIG.get('conversion_tools', {}).items():
+        if not isinstance(config, dict) or tool in UNAVAILABLE_TOOLS:
+            continue
+        input_formats.update(config.get('supported_input') or [])
+        output_formats.update((config.get('formats') or {}).keys())
+    return {
+        "input_formats_count": len(input_formats),
+        "output_formats_count": len(output_formats)
+    }
 
 @app.get("/health")
 async def health():

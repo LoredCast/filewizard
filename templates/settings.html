@@ -175,6 +175,9 @@
                     <div class="tool-grid">
                         {% for tool_id, tool in config.conversion_tools.items() %}
                         <div class="tool-card">
+                            {% if tool_id in unavailable_tools %}
+                            <p class="field-description">Not installed: <code>{{ unavailable_tools[tool_id] }}</code> was not found, so this tool is hidden from the converter.</p>
+                            {% endif %}
                             <div class="form-control">
                                 <label for="tool-{{ tool_id }}-name">Tool Name</label>
                                 <input type="text" id="tool-{{ tool_id }}-name" name="conversion_tools.{{ tool_id }}.name" value="{{ tool.name }}" class="form-input">
@@ -215,14 +218,14 @@
                    <div class="danger-action">
                         <div>
                             <strong>Clear Job History</strong>
-                            <p>Deletes all job records from the database. Files remain in the filesystem but cannot be deleted through the app anymore.</p>
+                            <p>Deletes all your job records and their processed files.</p>
                         </div>
                         <button id="clear-history-btn" class="button-danger">Clear History</button>
                    </div>
                    <div class="danger-action">
                         <div>
                             <strong>Delete Processed Files</strong>
-                            <p>Deletes all files from the 'processed' directory. Database records will remain but download links will be broken.</p>
+                            <p>Deletes the processed files of all your jobs. The job records remain, but their download links will stop working.</p>
                         </div>
                         <button id="delete-files-btn" class="button-danger">Delete Files</button>
                    </div>

@@ -102,14 +102,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- Clear History --- 
     clearHistoryBtn.addEventListener('click', async () => {
-        if (!confirm('ARE YOU SURE?\n\nThis will permanently delete all job history records from the database.')) {
+        if (!confirm('ARE YOU SURE?\n\nThis will permanently delete all your job history records and their processed files.')) {
             return;
         }
         try {
             const response = await fetch('/settings/clear-history', { method: 'POST' });
             if (!response.ok) throw new Error('Server responded with an error.');
             const result = await response.json();
-            alert(`Success: ${result.deleted_count} job records have been deleted.`);
+            alert(`Success: ${result.deleted_count} job records and ${result.files_deleted ?? 0} files have been deleted.`);
         } catch (error) {
             alert('An error occurred while clearing history.');
             console.error(error);
@@ -118,7 +118,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- Delete Files --- 
     deleteFilesBtn.addEventListener('click', async () => {
-        if (!confirm('ARE YOU SURE?\n\nThis will permanently delete all files in the "processed" folder.')) {
+        if (!confirm('ARE YOU SURE?\n\nThis will permanently delete the processed files of all your jobs.')) {
             return;
         }
         try {
