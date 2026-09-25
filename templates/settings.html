@@ -91,7 +91,7 @@
                     <div class="form-control">
                         <label for="whisper-compute-type">Compute Type</label>
                         <select id="whisper-compute-type" name="transcription_settings.whisper.compute_type" class="form-select">
-                            {% for ctype in ["default", "int8", "int8_float16", "int16", "float16", "float32"] %}
+                            {% for ctype in ["auto", "default", "int8", "int8_float16", "int16", "float16", "float32"] %}
                                 <option value="{{ ctype }}" {% if config.transcription_settings.whisper.compute_type == ctype %}selected{% endif %}>{{ ctype }}</option>
                             {% endfor %}
                         </select>

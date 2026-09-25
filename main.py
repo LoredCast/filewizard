@@ -60,7 +60,12 @@ from typing import List as TypingList
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.datastructures import Headers, MutableHeaders
-from authlib.integrations.starlette_client import OAuth
+import warnings
+import authlib.deprecate  # installs Authlib's "always show" filter, which ours has to come after
+with warnings.catch_warnings():
+    # Authlib 1.8 deprecates its httpx integration, which its own Starlette client still imports.
+    warnings.filterwarnings("ignore", message="The httpx module is deprecated")
+    from authlib.integrations.starlette_client import OAuth
 from dotenv import load_dotenv
 from piper import PiperVoice
 import wave

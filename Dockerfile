@@ -130,7 +130,6 @@ FROM runtime AS variant-cuda
 ENV LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/nvidia/cublas/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-    TRANSCRIPTION_DEVICE=auto \
-    TRANSCRIPTION_COMPUTE_TYPE=auto
+    TRANSCRIPTION_DEVICE=auto
 
 FROM variant-${VARIANT}

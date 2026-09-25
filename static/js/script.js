@@ -412,8 +412,8 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 const response = await authFetch('/upload/chunk', { method: 'POST', body: formData });
                 if (!response.ok) {
-                    const errorText = await response.text();
-                    throw new Error(`Chunk upload failed: ${response.status} - ${errorText}`);
+                    const errorData = await response.json().catch(() => ({}));
+                    throw new Error(errorData.detail || `Chunk upload failed (HTTP ${response.status})`);
                 }
                 const progress = Math.round(((chunkNumber + 1) / totalChunks) * 100);
                 const progressBar = tempRow.querySelector('.progress-bar');
@@ -424,7 +424,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 console.error(`Error uploading chunk ${chunkNumber}:`, error);
                 const statusCell = tempRow.querySelector('.status-cell-value');
                 if (statusCell) {  // Check if element still exists
-                    statusCell.innerHTML = `<span class="job-status-badge status-failed">Upload Failed</span>`;
+                    statusCell.innerHTML = `<span class="job-status-badge status-failed" title="${escapeHtml(error.message)}">Upload Failed</span>`;
                 }
                 return; // Stop the upload process
             }
@@ -450,7 +450,7 @@ document.addEventListener('DOMContentLoaded', () => {
             console.error(`Error finalizing upload:`, error);
             const statusCell = tempRow.querySelector('.status-cell-value');
             if (statusCell) {  // Check if element still exists
-                statusCell.innerHTML = `<span class="job-status-badge status-failed">Finalization Failed</span>`;
+                statusCell.innerHTML = `<span class="job-status-badge status-failed" title="${escapeHtml(error.message)}">Finalization Failed</span>`;
             }
         }
     }

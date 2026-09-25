@@ -241,7 +241,8 @@ academic_settings:
       chicago-fullnote: https://www.zotero.org/styles/chicago-fullnote-bibliography
 transcription_settings:
   whisper:
-    compute_type: int8
+    # auto: the fastest type the device supports (int8 on CPUs, float16/int8_float16 on GPUs)
+    compute_type: auto
     # device: cuda
     # device_index: 0
     allowed_models:
