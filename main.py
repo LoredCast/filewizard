@@ -421,10 +421,6 @@ def get_model_semaphore() -> Semaphore:
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-_log_handler = RotatingFileHandler("app.log", maxBytes=10*1024*1024, backupCount=1)
-_log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s')
-_log_handler.setFormatter(_log_formatter)
-logging.getLogger().addHandler(_log_handler)
 logger = logging.getLogger(__name__)
 
 # --- Environment Mode ---
@@ -437,12 +433,14 @@ class AppPaths(BaseModel):
     UPLOADS_DIR: Path = UPLOADS_BASE
     PROCESSED_DIR: Path = PROCESSED_BASE
     CHUNK_TMP_DIR: Path = CHUNK_TMP_BASE
+    # Job database, task queue and log. Defaults to the app directory; the Docker image uses a volume.
+    DATA_DIR: Path = Path(os.environ.get("DATA_DIR") or BASE_DIR).resolve()
     TTS_MODELS_DIR: Path = BASE_DIR / "models" / "tts"
     KOKORO_TTS_MODELS_DIR: Path = BASE_DIR / "models" / "tts" / "kokoro"
     KOKORO_MODEL_FILE: Path = KOKORO_TTS_MODELS_DIR / "kokoro-v1.0.onnx"
     KOKORO_VOICES_FILE: Path = KOKORO_TTS_MODELS_DIR / "voices-v1.0.bin"
-    DATABASE_URL: str = f"sqlite:///{BASE_DIR / 'jobs.db'}"
-    HUEY_DB_PATH: str = str(BASE_DIR / "huey.db")
+    DATABASE_URL: str = f"sqlite:///{DATA_DIR / 'jobs.db'}"
+    HUEY_DB_PATH: str = str(DATA_DIR / "huey.db")
     CONFIG_DIR: Path = BASE_DIR / "config"
     SETTINGS_FILE: Path = CONFIG_DIR / "settings.yml"
     DEFAULT_SETTINGS_FILE: Path = BASE_DIR / "settings.default.yml"
@@ -453,8 +451,16 @@ PATHS.UPLOADS_DIR.mkdir(exist_ok=True, parents=True)
 PATHS.PROCESSED_DIR.mkdir(exist_ok=True, parents=True)
 PATHS.CHUNK_TMP_DIR.mkdir(exist_ok=True, parents=True)
 PATHS.CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+PATHS.DATA_DIR.mkdir(exist_ok=True, parents=True)
 PATHS.TTS_MODELS_DIR.mkdir(exist_ok=True, parents=True)
 PATHS.KOKORO_TTS_MODELS_DIR.mkdir(exist_ok=True, parents=True)
+
+try:
+    _log_handler = RotatingFileHandler(PATHS.DATA_DIR / "app.log", maxBytes=10*1024*1024, backupCount=1)
+    _log_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
+    logging.getLogger().addHandler(_log_handler)
+except OSError as e:
+    logger.warning(f"File logging disabled: {e}")
 
 # --- WebSocket Connection Manager ---
 import json
