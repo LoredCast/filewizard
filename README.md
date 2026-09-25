@@ -21,7 +21,25 @@ A self-hosted, browser-based utility for file conversion, OCR and audio transcri
 - CPU-only by default; a `-cuda` image is available for GPU use.
 
 ## Security
-**Warning:** exposing this app publicly without authentication risks arbitrary code execution. Intended for local use or behind a properly configured OAuth/OIDC provider.
+**Warning:** in `LOCAL_ONLY` mode there is no login: everyone who can reach the port can use the app and change its settings. Keep it on a trusted network or enable OIDC authentication (`LOCAL_ONLY=False`). The converters process untrusted files, so run the container with only the volumes it needs.
+
+Built-in protections:
+- Requests that change state (uploads, settings, deletions) are only accepted from the app's own origin, so other websites you visit cannot drive your instance.
+- Conversion command templates are read-only on the settings page. Edit `config/settings.yml`, or set `ALLOW_COMMAND_EDITS=true` to edit them in the browser.
+- Secrets (OIDC client secret, webhook token) are never sent to the browser; leave the field empty to keep the stored value.
+- `auth_settings.allowed_users` / `allowed_domains` restrict which accounts of your identity provider may log in (both empty = everyone the provider accepts).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SECRET_KEY` | generated, stored in `config/.secret_key` | Signs session cookies. |
+| `SESSION_COOKIE_SECURE` | `false` | Set `true` when served over HTTPS. |
+| `CSRF_TRUSTED_ORIGINS` | – | Extra origins (e.g. `https://files.example.com`) allowed to submit requests. Needed when a reverse proxy rewrites the `Host` header; setting `app_public_url` works too. |
+| `ALLOWED_ORIGINS` | – | Origins granted CORS access (only needed for browser apps on other origins). |
+| `ALLOWED_HOSTS` | – | Comma-separated host names the app answers to (protects `LOCAL_ONLY` instances against DNS rebinding). Include every name/IP you use, e.g. `localhost,127.0.0.1,nas.lan`. |
+| `FRAME_ANCESTORS` | `'self'` | Who may embed the UI in a frame, e.g. `'self' https://dashboard.example.com`. |
+| `ALLOW_COMMAND_EDITS` | `false` | Allow editing/adding conversion command templates on the settings page. |
+| `CHILD_CPU_LIMIT_SECONDS` / `CHILD_MEMORY_LIMIT_MB` | `6000` / `4096` | Resource limits for converter processes (`0` disables the memory limit). |
+| `STALE_UPLOAD_HOURS` | `6` | Abandoned chunked uploads are removed after this time. |
 
 #### Tech stack
 FastAPI, vanilla HTML/JS/CSS frontend.

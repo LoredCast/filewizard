@@ -14,11 +14,17 @@ services:
       - PROCESSED_DIR=/app/processed
       - OMP_NUM_THREADS=1
       - DOWNLOAD_KOKORO_ON_STARTUP=true
+      #- SESSION_COOKIE_SECURE=true # when served over HTTPS
+      #- CSRF_TRUSTED_ORIGINS=https://files.example.com # if your reverse proxy rewrites the Host header
+      #- ALLOWED_HOSTS=localhost,127.0.0.1,files.example.com # only answer to these host names
+      #- ALLOW_COMMAND_EDITS=true # allow editing conversion commands on the settings page
       #- TRANSCRIPTION_DEVICE=cpu  # change to 'cuda' if GPU available
       #- TRANSCRIPTION_COMPUTE_TYPE=int8 # change to 'float16' or 'int8_float16' if GPU available
       #- TRANSCRIPTION_DEVICE_INDEX=0 # change if multiple GPUs available
     #user: "1000:1000"
     ports:
+      # Reachable from your whole network. In LOCAL_ONLY mode there is no login, so use
+      # "127.0.0.1:6969:8000" to restrict it to this machine.
       - "6969:8000"
     volumes:
       # Mount local directories and files into the container for persistence
