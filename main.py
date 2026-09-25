@@ -3253,8 +3253,8 @@ async def get_index(request: Request):
     admin_status = is_admin(request)
     whisper_models = APP_CONFIG.get("transcription_settings", {}).get("whisper", {}).get("allowed_models", [])
     conversion_tools = APP_CONFIG.get("conversion_tools", {})
-    return templates.TemplateResponse("index.html", {
-        "request": request, "user": user, "is_admin": admin_status,
+    return templates.TemplateResponse(request, "index.html", {
+        "user": user, "is_admin": admin_status,
         "whisper_models": sorted(list(whisper_models)),
         "conversion_tools": conversion_tools, "local_only_mode": LOCAL_ONLY_MODE
     })
@@ -3312,8 +3312,8 @@ async def get_settings_page(request: Request):
         config_source = str(PATHS.DEFAULT_SETTINGS_FILE.name)
 
     return templates.TemplateResponse(
-        "settings.html",
-        {"request": request, "config": current_config, "config_source": config_source,
+        request, "settings.html",
+        {"config": current_config, "config_source": config_source,
          "user": user, "is_admin": admin_status, "local_only_mode": LOCAL_ONLY_MODE}
     )
 
