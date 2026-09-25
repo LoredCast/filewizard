@@ -141,6 +141,111 @@ def sanitize_filename(filename: str) -> str:
     # Sanitize for HTML output
     return html.escape(safe_name)
 
+_SAFE_SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,10}$")
+
+
+def safe_basename(filename: Optional[str]) -> str:
+    """
+    Filesystem-safe version of a user supplied file name that keeps a usable extension.
+    secure_filename() alone drops non-ASCII characters, so "文件.pdf" became "pdf" and
+    lost its extension; here the stem falls back to "file" instead.
+    """
+    name = re.split(r"[\\/]", filename or "")[-1]
+    suffix = Path(name).suffix.lower()
+    if not _SAFE_SUFFIX_RE.fullmatch(suffix):
+        suffix = ""
+    stem = secure_filename(name[: len(name) - len(suffix)] if suffix else name)[:100].strip("._") or "file"
+    return f"{stem}{suffix}"
+
+
+# --- Upload sessions ---
+UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+MAX_UPLOAD_CHUNKS = 100_000
+
+
+def chunk_dir_for(user: dict, upload_id: str) -> Path:
+    """
+    Temp directory for a chunked upload, namespaced per user so one user can neither
+    write into nor finalize another user's upload. Upload ids are validated strictly:
+    an id that sanitized to "" used to resolve to the shared chunk root itself.
+    """
+    if not isinstance(upload_id, str) or not UPLOAD_ID_RE.fullmatch(upload_id):
+        raise HTTPException(status_code=400, detail="Invalid upload_id (8-128 letters, digits, '-' or '_').")
+    user_key = hashlib.sha256(str(user.get("sub", "")).encode()).hexdigest()[:16]
+    path = PATHS.CHUNK_TMP_DIR / f"{user_key}_{upload_id}"
+    ensure_path_is_safe(path, [PATHS.CHUNK_TMP_DIR])
+    return path
+
+
+# --- ZIP archives ---
+ZIP_JUNK_RE = re.compile(r"(^|/)(__MACOSX/|\._|\.DS_Store$|Thumbs\.db$)")
+
+
+def safe_extract_zip(zip_path: Path, dest: Path, app_settings: dict) -> List[Path]:
+    """
+    Extracts regular files from an uploaded ZIP with limits on member count and total
+    uncompressed size (zip bombs). Directory, symlink and OS metadata entries are skipped.
+    zipfile.extract() already strips absolute paths and '..' components.
+    """
+    max_members = int(app_settings.get("max_zip_members") or 500)
+    max_file_mb = float(app_settings.get("max_file_size_bytes", 100 * 1024 * 1024)) / (1024 * 1024)
+    max_total_mb = float(app_settings.get("max_zip_uncompressed_mb") or max(4 * max_file_mb, 1024))
+    with zipfile.ZipFile(zip_path) as zf:
+        members = [
+            info for info in zf.infolist()
+            if not info.is_dir()
+            and not ZIP_JUNK_RE.search(info.filename)
+            and (info.external_attr >> 16) & 0o170000 != 0o120000  # symlink entries
+        ]
+        if len(members) > max_members:
+            raise ValueError(f"ZIP archive has {len(members)} files; the limit is {max_members} (app_settings.max_zip_members).")
+        total_mb = sum(info.file_size for info in members) / (1024 * 1024)
+        if total_mb > max_total_mb:
+            raise ValueError(f"ZIP archive would extract to {total_mb:.0f} MB; the limit is {max_total_mb:.0f} MB "
+                             "(app_settings.max_zip_uncompressed_mb).")
+        dest.mkdir(parents=True, exist_ok=True)
+        extracted = []
+        for info in members:
+            target = Path(zf.extract(info, dest))
+            ensure_path_is_safe(target, [dest])
+            extracted.append(target)
+    return extracted
+
+
+# --- Model / voice names coming from requests ---
+_TTS_NAME_PART_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def resolve_whisper_model(model_size: Optional[str], whisper_settings: dict) -> str:
+    """
+    Only models listed in transcription_settings.whisper.allowed_models may be used.
+    faster-whisper also accepts local paths and arbitrary Hugging Face repo ids, which
+    must not be reachable from a request.
+    """
+    allowed = [str(m) for m in (whisper_settings.get("allowed_models") or [])]
+    if not model_size:
+        if "base" in allowed:
+            return "base"
+        if allowed:
+            return allowed[0]
+        raise ValueError("No Whisper models are allowed (transcription_settings.whisper.allowed_models).")
+    if model_size not in allowed:
+        raise ValueError(f"Invalid model size '{model_size}'. Allowed: {', '.join(allowed)}")
+    return model_size
+
+
+def validate_tts_model_name(model_name: Optional[str]) -> str:
+    """Accepts 'piper/<voice>', '<voice>' (Piper) or 'kokoro/<lang>/<voice>'."""
+    if not isinstance(model_name, str) or not model_name:
+        raise ValueError("A TTS voice (model_name) is required.")
+    parts = model_name.split("/")
+    engine, names = (parts[0], parts[1:]) if len(parts) > 1 else ("piper", parts)
+    expected = {"piper": 1, "kokoro": 2}.get(engine)
+    if expected != len(names) or not all(_TTS_NAME_PART_RE.fullmatch(n) and ".." not in n for n in names):
+        raise ValueError(f"Invalid TTS voice '{model_name}'.")
+    return model_name
+
+
 def sanitize_output(output: str) -> str:
     """Sanitize output to prevent XSS"""
     if not output:
@@ -1434,6 +1539,9 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
         if job.status == 'cancelled':
             logger.info(f"Job {job_id} was already cancelled before starting. Aborting.")
             return
+        allowed_models = whisper_settings.get("allowed_models")
+        if allowed_models is not None and model_size not in allowed_models:
+            raise ValueError(f"Whisper model '{model_size}' is not in allowed_models.")
 
         update_job_status(db, job_id, "processing", progress=0)
 
@@ -1573,6 +1681,7 @@ def run_tts_task(job_id: str, input_path_str: str, output_path_str: str, model_n
         if not job or job.status == 'cancelled':
             return
 
+        validate_tts_model_name(model_name)
         update_job_status(db, job_id, "processing")
 
         engine, actual_model_name = "piper", model_name
@@ -2138,8 +2247,8 @@ def run_conversion_task(job_id: str,
         except Exception:
             logger.exception("Failed to send webhook notification after conversion.")
 
-def dispatch_single_file_job(original_filename: str, input_filepath: str, task_type: str, user: dict, db: Session, app_config: Dict, base_url: str, job_id: str | None = None, options: Dict = None, parent_job_id: str | None = None):
-    """Helper to create and dispatch a job for a single file."""
+def dispatch_single_file_job(original_filename: str, input_filepath: str, task_type: str, user: dict, db: Session, app_config: Dict, base_url: str, job_id: str | None = None, options: Dict = None, parent_job_id: str | None = None) -> Optional[str]:
+    """Helper to create and dispatch a job for a single file. Returns the job id, or None if no job was created."""
     if options is None:
         options = {}
 
@@ -2147,28 +2256,41 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
     if job_id is None:
         job_id = uuid.uuid4().hex
 
-    safe_filename = secure_filename(original_filename)
+    safe_filename = safe_basename(original_filename)
     final_path = Path(input_filepath)
 
     # Ensure the input file exists before creating a job
     if not final_path.exists():
         logger.error(f"Input file does not exist, cannot dispatch job: {input_filepath}")
-        return
+        return None
 
     job_data = JobCreate(
         id=job_id, user_id=user['sub'], task_type=task_type,
         original_filename=original_filename, input_filepath=str(final_path),
         input_filesize=final_path.stat().st_size,
-        parent_job_id=parent_job_id
+        parent_job_id=parent_job_id, callback_url=options.get("callback_url")
     )
 
     if task_type == 'transcription':
+        whisper_settings = app_config.get("transcription_settings", {}).get("whisper", {})
+        try:
+            model_size = resolve_whisper_model(options.get("model_size"), whisper_settings)
+        except ValueError as e:
+            logger.warning(f"Not dispatching transcription for '{original_filename}': {e}")
+            final_path.unlink(missing_ok=True)
+            return None
         output_suffix = '.srt' if options.get('generate_timestamps', False) else '.txt'
         processed_path = PATHS.PROCESSED_DIR / f"{Path(safe_filename).stem}_{job_id[:8]}{output_suffix}"
         job_data.processed_filepath = str(processed_path)
         create_job(db=db, job=job_data)
-        run_transcription_task(job_data.id, str(final_path), str(processed_path), options.get("model_size", "base"), app_config.get("transcription_settings", {}).get("whisper", {}), app_config, base_url, generate_timestamps=options.get('generate_timestamps', False))
+        run_transcription_task(job_data.id, str(final_path), str(processed_path), model_size, whisper_settings, app_config, base_url, generate_timestamps=options.get('generate_timestamps', False))
     elif task_type == "tts":
+        try:
+            validate_tts_model_name(options.get("model_name"))
+        except ValueError as e:
+            logger.warning(f"Not dispatching TTS for '{original_filename}': {e}")
+            final_path.unlink(missing_ok=True)
+            return None
         tts_config = app_config.get("tts_settings", {})
         stem = Path(safe_filename).stem
         processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.wav"
@@ -2182,7 +2304,7 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
             logger.warning(f"Skipping unsupported file type for OCR: {original_filename}")
             # Clean up the orphaned file from the zip extraction
             final_path.unlink(missing_ok=True)
-            return
+            return None
         processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.pdf"
         job_data.processed_filepath = str(processed_path)
         create_job(db=db, job=job_data)
@@ -2201,11 +2323,11 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
             if parent_job_id:
                 logger.warning(f"Skipping file '{original_filename}' from batch job '{parent_job_id}' as it is not applicable for the selected conversion format '{options.get('output_format')}'.")
                 final_path.unlink(missing_ok=True)
-                return
+                return None
             else:
                 logger.error(f"Invalid or missing output_format for conversion of {original_filename}")
                 final_path.unlink(missing_ok=True)
-                return
+                return None
 
         original_stem = Path(safe_filename).stem
 
@@ -2225,6 +2347,8 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
     else:
         logger.error(f"Invalid task type '{task_type}' for file {original_filename}")
         final_path.unlink(missing_ok=True)
+        return None
+    return job_id
 
 @huey.task()
 def run_academic_pandoc_task(job_id: str, input_path_str: str, output_path_str: str, task_key: str, app_config: dict, base_url: str):
@@ -2256,8 +2380,7 @@ def run_academic_pandoc_task(job_id: str, input_path_str: str, output_path_str: 
         if not zipfile.is_zipfile(input_path):
             raise ValueError("Input is not a valid ZIP archive.")
         unzip_dir.mkdir()
-        with zipfile.ZipFile(input_path, 'r') as zip_ref:
-            zip_ref.extractall(unzip_dir)
+        safe_extract_zip(input_path, unzip_dir, app_config.get("app_settings", {}))
 
         update_job_status(db, job_id, "processing", progress=25)
 
@@ -2360,8 +2483,10 @@ def _update_parent_zip_job_progress(parent_job_id: str):
     db = SessionLocal()
     try:
         parent_job = get_job(db, parent_job_id)
-        if not parent_job or parent_job.status not in ['processing', 'pending']:
-            return # Job is already finalized or doesn't exist
+        # The parent stays 'pending' while its sub-jobs are being dispatched; judging completion
+        # before all of them exist would finish it early (or get overwritten back to 'processing').
+        if not parent_job or parent_job.status != 'processing':
+            return # Job is still dispatching, already finalized, or doesn't exist
 
         child_jobs = db.query(Job).filter(Job.parent_job_id == parent_job.id).all()
         total_children = len(child_jobs)
@@ -2404,30 +2529,28 @@ def unzip_and_dispatch_task(job_id: str, input_path_str: str, sub_task_type: str
         if not zipfile.is_zipfile(input_path):
             raise ValueError("Uploaded file is not a valid ZIP archive.")
         unzip_dir.mkdir()
-        with zipfile.ZipFile(input_path, 'r') as zip_ref:
-            zip_ref.extractall(unzip_dir)
-        
-        file_count = 0
-        for extracted_file_path in unzip_dir.rglob('*'):
-            if extracted_file_path.is_file():
-                file_count += 1
-                dispatch_single_file_job(
-                    original_filename=extracted_file_path.name,
-                    input_filepath=str(extracted_file_path),
-                    task_type=sub_task_type,
-                    options=sub_task_options,
-                    user=user,
-                    db=db,
-                    app_config=app_config,
-                    base_url=base_url,
-                    parent_job_id=job_id
-                )
-        if file_count > 0:
-            # Mark parent job as processing, to be completed by the periodic task
+        extracted_files = safe_extract_zip(input_path, unzip_dir, app_config.get("app_settings", {}))
+
+        created_jobs = 0
+        for extracted_file_path in extracted_files:
+            if dispatch_single_file_job(
+                original_filename=extracted_file_path.name,
+                input_filepath=str(extracted_file_path),
+                task_type=sub_task_type,
+                options=sub_task_options,
+                user=user,
+                db=db,
+                app_config=app_config,
+                base_url=base_url,
+                parent_job_id=job_id
+            ):
+                created_jobs += 1
+        if created_jobs > 0:
+            # All sub-jobs exist now; from here on their completion drives the parent's progress.
             update_job_status(db, job_id, "processing", progress=0)
+            _update_parent_zip_job_progress(job_id)
         else:
-            # No files found, mark as completed with a note
-            mark_job_as_completed(db, job_id, preview="ZIP archive was empty. No sub-jobs created.")
+            mark_job_as_completed(db, job_id, preview="No files in the ZIP archive could be processed with the selected task.")
 
     except Exception as e:
         logger.exception(f"ERROR during ZIP processing for job {job_id}")
@@ -2445,6 +2568,35 @@ def unzip_and_dispatch_task(job_id: str, input_path_str: str, sub_task_type: str
             logger.exception("Failed to cleanup original ZIP file.")
         db.close()
 
+
+
+STALE_UPLOAD_HOURS = float(os.environ.get("STALE_UPLOAD_HOURS", "6"))
+
+
+@huey.periodic_task(crontab(minute="*/30"))
+def cleanup_stale_uploads():
+    """Removes abandoned chunked uploads and ZIP extraction directories of finished batches."""
+    cutoff = time.time() - STALE_UPLOAD_HOURS * 3600
+    removed = 0
+    db = SessionLocal()
+    try:
+        candidates = [p for p in PATHS.CHUNK_TMP_DIR.iterdir()] + list(PATHS.UPLOADS_DIR.glob("unzipped_*"))
+        for entry in candidates:
+            try:
+                if not entry.is_dir() or entry.is_symlink() or entry.stat().st_mtime >= cutoff:
+                    continue
+                if entry.name.startswith("unzipped_"):
+                    parent = get_job(db, entry.name[len("unzipped_"):])
+                    if parent and parent.status in ("pending", "processing"):
+                        continue  # sub-jobs may still need their input files
+                shutil.rmtree(entry)
+                removed += 1
+            except OSError:
+                logger.exception(f"Could not remove stale upload directory {entry}")
+    finally:
+        db.close()
+    if removed:
+        logger.info(f"Removed {removed} stale upload directories.")
 
 
 # --------------------------------------------------------------------------------
@@ -2998,6 +3150,10 @@ def is_allowed_file(filename: str, allowed_extensions: set) -> bool:
     return Path(filename).suffix.lower() in allowed_extensions
 
 # --- CHUNKED UPLOADS (for UI) ---
+def _max_upload_bytes() -> int:
+    return int(APP_CONFIG.get("app_settings", {}).get("max_file_size_bytes", 100 * 1024 * 1024))
+
+
 @app.post("/upload/chunk")
 async def upload_chunk(
     chunk: UploadFile = File(...),
@@ -3005,36 +3161,57 @@ async def upload_chunk(
     chunk_number: int = Form(...),
     user: dict = Depends(require_user)
 ):
-    safe_upload_id = secure_filename(upload_id)
-    temp_dir = ensure_path_is_safe(PATHS.CHUNK_TMP_DIR / safe_upload_id, [PATHS.CHUNK_TMP_DIR])
-    temp_dir.mkdir(exist_ok=True)
+    temp_dir = chunk_dir_for(user, upload_id)
+    if not 0 <= chunk_number < MAX_UPLOAD_CHUNKS:
+        raise HTTPException(status_code=400, detail="Invalid chunk_number.")
     chunk_path = temp_dir / f"{chunk_number}.chunk"
+    max_size = _max_upload_bytes()
 
     def save_chunk_sync():
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        # The size limit applies to the whole file, i.e. all chunks received so far.
+        received = sum(p.stat().st_size for p in temp_dir.glob("*.chunk") if p.name != chunk_path.name)
+        partial_path = temp_dir / f"{chunk_number}.part"
         try:
-            with open(chunk_path, "wb") as buffer:
-                shutil.copyfileobj(chunk.file, buffer)
+            with open(partial_path, "wb") as buffer:
+                while True:
+                    block = chunk.file.read(1024 * 1024)
+                    if not block:
+                        break
+                    received += len(block)
+                    if received > max_size:
+                        raise HTTPException(status_code=413, detail=f"File exceeds {max_size / 1024 / 1024:.0f} MB limit")
+                    buffer.write(block)
+            partial_path.replace(chunk_path)  # only complete chunks are ever stitched
+        except HTTPException:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
         finally:
             chunk.file.close()
+            partial_path.unlink(missing_ok=True)
 
     await run_in_threadpool(save_chunk_sync)
 
-    return JSONResponse({"message": f"Chunk {chunk_number} for {safe_upload_id} uploaded."})
+    return JSONResponse({"message": f"Chunk {chunk_number} for {upload_id} uploaded."})
 
 
 async def _stitch_chunks(temp_dir: Path, final_path: Path, total_chunks: int):
     """Stitches chunks together memory-efficiently and cleans up."""
     ensure_path_is_safe(temp_dir, [PATHS.CHUNK_TMP_DIR])
     ensure_path_is_safe(final_path, [PATHS.UPLOADS_DIR])
+    max_size = _max_upload_bytes()
 
     # This is a blocking function that will be run in a threadpool
     def do_stitch():
+        chunk_paths = [temp_dir / f"{i}.chunk" for i in range(total_chunks)]
+        for i, chunk_path in enumerate(chunk_paths):
+            if not chunk_path.exists():
+                # Raise an exception that can be caught and handled
+                raise FileNotFoundError(f"Upload failed: missing chunk {i}")
+        if sum(p.stat().st_size for p in chunk_paths) > max_size:
+            raise HTTPException(status_code=413, detail=f"File exceeds {max_size / 1024 / 1024:.0f} MB limit")
         with open(final_path, "wb") as final_file:
-            for i in range(total_chunks):
-                chunk_path = temp_dir / f"{i}.chunk"
-                if not chunk_path.exists():
-                    # Raise an exception that can be caught and handled
-                    raise FileNotFoundError(f"Upload failed: missing chunk {i}")
+            for chunk_path in chunk_paths:
                 with open(chunk_path, "rb") as chunk_file:
                     # Use copyfileobj for memory efficiency
                     shutil.copyfileobj(chunk_file, final_file)
@@ -3043,15 +3220,38 @@ async def _stitch_chunks(temp_dir: Path, final_path: Path, total_chunks: int):
         await run_in_threadpool(do_stitch)
     except FileNotFoundError as e:
         # If a chunk was missing, clean up and re-raise as HTTPException
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        final_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        # For any other error during stitching, clean up and re-raise
+    except Exception:
+        final_path.unlink(missing_ok=True)
+        raise
+    finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
-        raise e # Re-raise the original exception
-    else:
-        # If successful, clean up the temp directory
-        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+UPLOAD_TASK_TYPES = {"conversion", "ocr", "transcription", "tts"}
+
+
+def _validate_task_options(task_type: str, options: dict, is_zip: bool) -> Optional[tuple]:
+    """
+    Validates a processing request before any file is written. Returns (tool, task_key)
+    for conversions. Raises HTTPException(400) for invalid input.
+    """
+    if task_type not in UPLOAD_TASK_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid task_type: '{task_type}'")
+    try:
+        if task_type == "transcription":
+            whisper_settings = APP_CONFIG.get("transcription_settings", {}).get("whisper", {})
+            options["model_size"] = resolve_whisper_model(options.get("model_size"), whisper_settings)
+        elif task_type == "tts":
+            validate_tts_model_name(options.get("model_name"))
+        elif task_type == "conversion":
+            all_tools = APP_CONFIG.get("conversion_tools", {}).keys()
+            return _parse_tool_and_task_key(options.get("output_format") or "", all_tools)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return None
+
 
 def _parse_tool_and_task_key(output_format: str, all_tool_keys: list) -> (str, str):
     """Robustly parses an output_format string to find the matching tool and task key."""
@@ -3064,76 +3264,63 @@ def _parse_tool_and_task_key(output_format: str, all_tool_keys: list) -> (str, s
 
 @app.post("/upload/finalize", response_model=JobSchema, status_code=status.HTTP_202_ACCEPTED)
 async def finalize_upload(request: Request, payload: FinalizeUploadPayload, user: dict = Depends(require_user), db: Session = Depends(get_db)):
-    safe_upload_id = secure_filename(payload.upload_id)
-    temp_dir = ensure_path_is_safe(PATHS.CHUNK_TMP_DIR / safe_upload_id, [PATHS.CHUNK_TMP_DIR])
+    temp_dir = chunk_dir_for(user, payload.upload_id)
     if not temp_dir.is_dir():
         raise HTTPException(status_code=404, detail="Upload session not found or already finalized.")
 
-    webhook_config = APP_CONFIG.get("webhook_settings", {})
-    if payload.callback_url and not is_allowed_callback_url(payload.callback_url, webhook_config.get("allowed_callback_urls", [])):
-        raise HTTPException(status_code=400, detail="Provided callback_url is not allowed.")
+    # Validate everything before stitching, so a rejected request leaves no files behind.
+    try:
+        if not 1 <= payload.total_chunks <= MAX_UPLOAD_CHUNKS:
+            raise HTTPException(status_code=400, detail="Invalid total_chunks.")
 
-    # Validate file type before processing
-    allowed_extensions = APP_CONFIG.get("app_settings", {}).get("allowed_all_extensions", set())
-    if not validate_file_type(payload.original_filename, allowed_extensions):
-        raise HTTPException(status_code=400, detail=f"File type '{Path(payload.original_filename).suffix}' not allowed.")
+        webhook_config = APP_CONFIG.get("webhook_settings", {})
+        if payload.callback_url and not is_allowed_callback_url(payload.callback_url, webhook_config.get("allowed_callback_urls", [])):
+            raise HTTPException(status_code=400, detail="Provided callback_url is not allowed.")
+
+        # Validate file type before processing
+        allowed_extensions = APP_CONFIG.get("app_settings", {}).get("allowed_all_extensions", set())
+        if not validate_file_type(payload.original_filename, allowed_extensions):
+            raise HTTPException(status_code=400, detail=f"File type '{Path(payload.original_filename).suffix}' not allowed.")
+
+        safe_filename = safe_basename(payload.original_filename)
+        is_zip = Path(safe_filename).suffix == '.zip'
+        options = {"model_size": payload.model_size, "model_name": payload.model_name,
+                   "output_format": payload.output_format, "generate_timestamps": payload.generate_timestamps,
+                   "callback_url": payload.callback_url}
+        tool, task_key = _validate_task_options(payload.task_type, options, is_zip) or (None, None)
+    except HTTPException:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
 
     job_id = uuid.uuid4().hex
-    safe_filename = secure_filename(payload.original_filename)
     final_path = PATHS.UPLOADS_DIR / f"{Path(safe_filename).stem}_{job_id}{Path(safe_filename).suffix}"
     await _stitch_chunks(temp_dir, final_path, payload.total_chunks)
 
     base_url = str(request.base_url)
 
-    # Check if the selected conversion is the new academic pandoc task
-    tool, task_key = None, None
-    if payload.task_type == 'conversion':
-        try:
-            all_tools = APP_CONFIG.get("conversion_tools", {}).keys()
-            tool, task_key = _parse_tool_and_task_key(payload.output_format, all_tools)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid or missing output_format for conversion.")
-
     if tool == 'pandoc_academic':
         # This is a single job that processes a ZIP file as a project.
-        options = {"output_format": payload.output_format}
         dispatch_single_file_job(payload.original_filename, str(final_path), "conversion", user, db, APP_CONFIG, base_url, job_id=job_id, options=options)
 
-    elif Path(safe_filename).suffix.lower() == '.zip':
-        # This is the original batch processing logic for ZIP files.
+    elif is_zip:
+        # Batch processing: every file in the archive becomes a sub-job.
         job_data = JobCreate(
             id=job_id, user_id=user['sub'], task_type="unzip",
             original_filename=payload.original_filename, input_filepath=str(final_path),
-            input_filesize=final_path.stat().st_size
+            input_filesize=final_path.stat().st_size, callback_url=payload.callback_url
         )
         create_job(db=db, job=job_data)
-        sub_task_options = {
-            "model_size": payload.model_size,
-            "model_name": payload.model_name,
-            "output_format": payload.output_format
-        }
-        unzip_and_dispatch_task(job_id, str(final_path), payload.task_type, sub_task_options, user, APP_CONFIG, base_url)
+        unzip_and_dispatch_task(job_id, str(final_path), payload.task_type, options, user, APP_CONFIG, base_url)
     else:
         # This is the logic for all other single-file uploads.
-        options = {"model_size": payload.model_size, "model_name": payload.model_name, "output_format": payload.output_format, "generate_timestamps": payload.generate_timestamps}
         dispatch_single_file_job(payload.original_filename, str(final_path), payload.task_type, user, db, APP_CONFIG, base_url, job_id=job_id, options=options)
 
-    # --- FIX STARTS HERE ---
-    # Instead of returning a minimal object, fetch the newly created job
-    # from the database and return the full serialized object. This ensures
-    # the frontend has all the data it needs to correctly update the UI row.
-    db.flush() # Ensure the job is available to be queried
+    # Return the full job so the frontend can render its row immediately.
+    db.expire_all()
     db_job = get_job(db, job_id)
     if not db_job:
-        # This is an unlikely race condition but we handle it just in case.
-        # The SSE event will still create the row correctly.
-        raise HTTPException(status_code=500, detail="Job was created but could not be retrieved for an immediate response.")
-    
-    # Also, update the function signature to use the response_model
-    # from: @app.post("/upload/finalize", status_code=status.HTTP_202_ACCEPTED)
-    # to:   @app.post("/upload/finalize", response_model=JobSchema, status_code=status.HTTP_202_ACCEPTED)
+        raise HTTPException(status_code=400, detail="This file type is not supported for the selected task.")
     return db_job
-    # --- FIX ENDS HERE ---
 
 
 # --- LEGACY DIRECT-UPLOAD ROUTES (kept for compatibility) ---
@@ -3151,8 +3338,8 @@ async def submit_audio_transcription(
     if model_size not in whisper_config.get("allowed_models", []):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid model size: {model_size}.")
 
-    job_id, safe_basename = uuid.uuid4().hex, secure_filename(file.filename)
-    stem, suffix = Path(safe_basename).stem, Path(safe_basename).suffix
+    job_id, safe_name = uuid.uuid4().hex, safe_basename(file.filename)
+    stem, suffix = Path(safe_name).stem, Path(safe_name).suffix
     upload_path = PATHS.UPLOADS_DIR / f"{stem}_{job_id}{suffix}"
     output_suffix = '.srt' if generate_timestamps else '.txt'
     processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}{output_suffix}"
@@ -3172,16 +3359,16 @@ async def submit_file_conversion(request: Request, file: UploadFile = File(...),
         raise HTTPException(status_code=400, detail=f"File type '{Path(file.filename).suffix}' not allowed.")
     conversion_tools = APP_CONFIG.get("conversion_tools", {})
     try:
-        tool, task_key = output_format.split('_', 1)
-        if tool not in conversion_tools: raise ValueError()
+        # Tool ids may contain '_' (ghostscript_pdf, ffmpeg_audio, ...), so match against the known ids.
+        tool, task_key = _parse_tool_and_task_key(output_format, conversion_tools.keys())
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid output format selected.")
 
-    job_id, safe_basename = uuid.uuid4().hex, secure_filename(file.filename)
-    original_stem = Path(safe_basename).stem
+    job_id, safe_name = uuid.uuid4().hex, safe_basename(file.filename)
+    original_stem = Path(safe_name).stem
     target_ext = task_key.split('_')[0]
     if tool == "ghostscript_pdf": target_ext = "pdf"
-    upload_path = PATHS.UPLOADS_DIR / f"{original_stem}_{job_id}{Path(safe_basename).suffix}"
+    upload_path = PATHS.UPLOADS_DIR / f"{original_stem}_{job_id}{Path(safe_name).suffix}"
     processed_path = PATHS.PROCESSED_DIR / f"{original_stem}_{job_id}.{target_ext}"
     input_size = await save_upload_file(file, upload_path)
     base_url = str(request.base_url)
@@ -3196,8 +3383,8 @@ async def submit_file_conversion(request: Request, file: UploadFile = File(...),
 async def submit_pdf_ocr(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db), user: dict = Depends(require_user)):
     if not is_allowed_file(file.filename, {".pdf"}):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file type. Please upload a PDF.")
-    job_id, safe_basename = uuid.uuid4().hex, secure_filename(file.filename)
-    unique_filename = f"{Path(safe_basename).stem}_{job_id}{Path(safe_basename).suffix}"
+    job_id, safe_name = uuid.uuid4().hex, safe_basename(file.filename)
+    unique_filename = f"{Path(safe_name).stem}_{job_id}{Path(safe_name).suffix}"
     upload_path = PATHS.UPLOADS_DIR / unique_filename
     processed_path = PATHS.PROCESSED_DIR / unique_filename
     input_size = await save_upload_file(file, upload_path)
@@ -3215,11 +3402,11 @@ async def submit_image_ocr(request: Request, file: UploadFile = File(...), db: S
     allowed_exts = {".png", ".jpg", ".jpeg", ".tiff", ".tif"}
     if not is_allowed_file(file.filename, allowed_exts):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file type. Please upload a PNG, JPG, or TIFF.")
-    job_id, safe_basename = uuid.uuid4().hex, secure_filename(file.filename)
-    file_ext = Path(safe_basename).suffix
-    unique_filename = f"{Path(safe_basename).stem}_{job_id}{file_ext}"
+    job_id, safe_name = uuid.uuid4().hex, safe_basename(file.filename)
+    file_ext = Path(safe_name).suffix
+    unique_filename = f"{Path(safe_name).stem}_{job_id}{file_ext}"
     upload_path = PATHS.UPLOADS_DIR / unique_filename
-    processed_path = PATHS.PROCESSED_DIR / f"{Path(safe_basename).stem}_{job_id}.pdf"
+    processed_path = PATHS.PROCESSED_DIR / f"{Path(safe_name).stem}_{job_id}.pdf"
     input_size = await save_upload_file(file, upload_path)
     base_url = str(request.base_url)
 
@@ -3322,12 +3509,49 @@ async def api_process_file(
         logger.warning(f"Rejected webhook from user '{user.get('email')}' with disallowed callback URL: {callback_url}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Provided callback_url is not in the list of allowed URLs.")
 
+    # Validate the request before anything is written to disk.
     job_id = uuid.uuid4().hex
-    safe_basename = secure_filename(file.filename)
-    stem, suffix = Path(safe_basename).stem, Path(safe_basename).suffix
-    upload_filename = f"{stem}_{job_id}{suffix}"
-    upload_path = PATHS.UPLOADS_DIR / upload_filename
+    safe_name = safe_basename(file.filename)
+    stem, suffix = Path(safe_name).stem, Path(safe_name).suffix
+    if task_type == "transcription":
+        whisper_config = APP_CONFIG.get("transcription_settings", {}).get("whisper", {})
+        try:
+            model_size = resolve_whisper_model(model_size, whisper_config)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}{'.srt' if generate_timestamps else '.txt'}"
+    elif task_type == "tts":
+        if not is_allowed_file(file.filename, {".txt"}):
+            raise HTTPException(status_code=400, detail="Invalid file type for TTS, requires .txt")
+        try:
+            validate_tts_model_name(model_name)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.wav"
+    elif task_type == "conversion":
+        if not output_format:
+            raise HTTPException(status_code=400, detail="output_format is required for conversion task.")
+        conversion_tools = APP_CONFIG.get("conversion_tools", {})
+        try:
+            tool, task_key = _parse_tool_and_task_key(output_format, conversion_tools.keys())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid output_format selected.")
+        target_ext = task_key.split('_')[0]
+        if tool == "ghostscript_pdf": target_ext = "pdf"
+        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.{target_ext}"
+    elif task_type == "ocr":
+        if not is_allowed_file(file.filename, {".pdf"}):
+            raise HTTPException(status_code=400, detail="Invalid file type for ocr, requires .pdf")
+        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}{suffix}"
+    elif task_type == "ocr-image":
+        if not is_allowed_file(file.filename, {".png", ".jpg", ".jpeg", ".tiff", ".tif"}):
+            raise HTTPException(status_code=400, detail="Invalid file type for ocr-image.")
+        # Image OCR produces a searchable PDF.
+        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.pdf"
+    else:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid task_type: '{task_type}'")
 
+    upload_path = PATHS.UPLOADS_DIR / f"{stem}_{job_id}{suffix}"
     try:
         input_size = await save_upload_file(file, upload_path)
     except HTTPException as e:
@@ -3337,69 +3561,23 @@ async def api_process_file(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to save file: {e}")
 
     base_url = str(request.base_url)
-    job_data_args = {
-        "id": job_id, "user_id": user['sub'], "original_filename": file.filename,
-        "input_filepath": str(upload_path), "input_filesize": input_size,
-        "callback_url": callback_url, "task_type": task_type,
-    }
+    create_job(db=db, job=JobCreate(
+        id=job_id, user_id=user['sub'], original_filename=file.filename,
+        input_filepath=str(upload_path), input_filesize=input_size,
+        callback_url=callback_url, task_type=task_type, processed_filepath=str(processed_path),
+    ))
 
     # --- API Task Dispatching Logic ---
     if task_type == "transcription":
-        whisper_config = APP_CONFIG.get("transcription_settings", {}).get("whisper", {})
-        if model_size not in whisper_config.get("allowed_models", []):
-            raise HTTPException(status_code=400, detail=f"Invalid model_size '{model_size}'")
-        output_suffix = '.srt' if generate_timestamps else '.txt'
-        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}{output_suffix}"
-        job_data_args["processed_filepath"] = str(processed_path)
-        create_job(db=db, job=JobCreate(**job_data_args))
         run_transcription_task(job_id, str(upload_path), str(processed_path), model_size, whisper_config, APP_CONFIG, base_url, generate_timestamps=generate_timestamps)
-
     elif task_type == "tts":
-        if not is_allowed_file(file.filename, {".txt"}):
-            raise HTTPException(status_code=400, detail="Invalid file type for TTS, requires .txt")
-        if not model_name:
-            raise HTTPException(status_code=400, detail="model_name is required for TTS task.")
-        tts_config = APP_CONFIG.get("tts_settings", {})
-        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.wav"
-        job_data_args["processed_filepath"] = str(processed_path)
-        create_job(db=db, job=JobCreate(**job_data_args))
-        run_tts_task(job_id, str(upload_path), str(processed_path), model_name, tts_config, APP_CONFIG, base_url)
-
+        run_tts_task(job_id, str(upload_path), str(processed_path), model_name, APP_CONFIG.get("tts_settings", {}), APP_CONFIG, base_url)
     elif task_type == "conversion":
-        if not output_format:
-            raise HTTPException(status_code=400, detail="output_format is required for conversion task.")
-        conversion_tools = APP_CONFIG.get("conversion_tools", {})
-        try:
-            tool, task_key = output_format.split('_', 1)
-            if tool not in conversion_tools: raise ValueError("Invalid tool")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid output_format selected.")
-        target_ext = task_key.split('_')[0]
-        if tool == "ghostscript_pdf": target_ext = "pdf"
-        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.{target_ext}"
-        job_data_args["processed_filepath"] = str(processed_path)
-        create_job(db=db, job=JobCreate(**job_data_args))
         run_conversion_task(job_id, str(upload_path), str(processed_path), tool, task_key, conversion_tools, APP_CONFIG, base_url)
-
     elif task_type == "ocr":
-        if not is_allowed_file(file.filename, {".pdf"}):
-            raise HTTPException(status_code=400, detail="Invalid file type for ocr, requires .pdf")
-        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}{suffix}"
-        job_data_args["processed_filepath"] = str(processed_path)
-        create_job(db=db, job=JobCreate(**job_data_args))
         run_pdf_ocr_task(job_id, str(upload_path), str(processed_path), APP_CONFIG.get("ocr_settings", {}).get("ocrmypdf", {}), APP_CONFIG, base_url)
-
     elif task_type == "ocr-image":
-        if not is_allowed_file(file.filename, {".png", ".jpg", ".jpeg", ".tiff", ".tif"}):
-             raise HTTPException(status_code=400, detail="Invalid file type for ocr-image.")
-        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.txt"
-        job_data_args["processed_filepath"] = str(processed_path)
-        create_job(db=db, job=JobCreate(**job_data_args))
         run_image_ocr_task(job_id, str(upload_path), str(processed_path), APP_CONFIG, base_url)
-
-    else:
-        upload_path.unlink(missing_ok=True) # Cleanup orphaned file
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid task_type: '{task_type}'")
 
     return {"job_id": job_id, "status": "pending"}
 
