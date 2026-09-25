@@ -430,6 +430,13 @@ input[type="file"] {
     text-align: left;
 }
 
+.history-actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
 .history-header {
     display: flex;
     justify-content: space-between;
@@ -590,9 +597,11 @@ input[type="file"] {
     cursor: pointer;
 }
 
-#download-selected-btn {
+#download-selected-btn,
+#delete-selected-btn {
     width: auto;
     white-space: nowrap;
+    margin-top: 0;
  }
 
 .download-button {

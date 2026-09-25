@@ -254,6 +254,42 @@ def validate_tts_model_name(model_name: Optional[str]) -> str:
     return model_name
 
 
+# --- OCR languages ---
+_OCR_LANG_RE = re.compile(r"^[A-Za-z0-9_]{2,32}$")
+_ocr_languages_cache: Optional[List[str]] = None
+
+
+def installed_ocr_languages() -> List[str]:
+    """Tesseract languages installed on this server (cached; empty if tesseract is unavailable)."""
+    global _ocr_languages_cache
+    if _ocr_languages_cache is None:
+        try:
+            languages = pytesseract.get_languages(config="")
+        except Exception as e:
+            logger.warning(f"Could not list Tesseract languages: {e}")
+            return []
+        _ocr_languages_cache = sorted(l for l in languages if l != "osd" and _OCR_LANG_RE.fullmatch(l))
+    return _ocr_languages_cache
+
+
+def resolve_ocr_language(requested: Optional[str], ocr_settings: dict) -> str:
+    """
+    Returns a validated Tesseract language spec such as 'eng' or 'eng+spa'. Falls back to
+    ocr_settings.language (default 'eng') and rejects languages that are not installed.
+    """
+    spec = requested or ocr_settings.get("language") or "eng"
+    if isinstance(spec, (list, tuple)):
+        spec = "+".join(str(part) for part in spec)
+    parts = [part.strip() for part in str(spec).split("+") if part.strip()]
+    if not parts or len(parts) > 8 or not all(_OCR_LANG_RE.fullmatch(part) for part in parts):
+        raise ValueError(f"Invalid OCR language '{spec}'.")
+    installed = installed_ocr_languages()
+    missing = [part for part in parts if installed and part not in installed]
+    if missing:
+        raise ValueError(f"OCR language(s) not installed: {', '.join(missing)}. Installed: {', '.join(installed)}")
+    return "+".join(parts)
+
+
 def sanitize_output(output: str) -> str:
     """Sanitize output to prevent XSS"""
     if not output:
@@ -670,7 +706,7 @@ def load_app_config():
             "kokoro": {"model_dir": str(PATHS.KOKORO_TTS_MODELS_DIR), "command_template": "kokoro-tts {input} {output} --model {model_path} --voices {voices_path} --lang {lang} --voice {model_name}"}
         },
         "conversion_tools": {},
-        "ocr_settings": {"ocrmypdf": {}},
+        "ocr_settings": {"ocrmypdf": {"language": "eng"}},
         "auth_settings": {"oidc_client_id": "", "oidc_client_secret": "", "oidc_server_metadata_url": "", "admin_users": []},
         "webhook_settings": {"enabled": False, "allow_chunked_api_uploads": False, "allowed_callback_urls": [], "callback_bearer_token": ""}
     }
@@ -824,6 +860,7 @@ class FinalizeUploadPayload(BaseModel):
     model_name: str = ""
     output_format: str = ""
     generate_timestamps: bool = False
+    ocr_language: str = ""  # e.g. "eng" or "eng+spa"; defaults to ocr_settings.ocrmypdf.language
     callback_url: Optional[str] = None # For API chunked uploads
 
 class JobSelection(BaseModel):
@@ -1683,8 +1720,8 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
 
                     if current_time - last_update_time > DB_POLL_INTERVAL_SECONDS:
                         last_update_time = current_time
-                        if _current_job_status(db, job_id) == 'cancelled':
-                            logger.info(f"Job {job_id} cancelled during transcription. Stopping.")
+                        if _current_job_status(db, job_id) in (None, 'cancelled'):
+                            logger.info(f"Job {job_id} cancelled or deleted during transcription. Stopping.")
                             return
                         if info.duration > 0:
                             progress = int((segment.end / info.duration) * 100)
@@ -1706,8 +1743,8 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
 
                     if current_time - last_update_time > DB_POLL_INTERVAL_SECONDS:
                         last_update_time = current_time
-                        if _current_job_status(db, job_id) == 'cancelled':
-                            logger.info(f"Job {job_id} cancelled during transcription. Stopping.")
+                        if _current_job_status(db, job_id) in (None, 'cancelled'):
+                            logger.info(f"Job {job_id} cancelled or deleted during transcription. Stopping.")
                             return
                         if info.duration > 0:
                             progress = int((segment.end / info.duration) * 100)
@@ -1874,6 +1911,7 @@ def run_pdf_ocr_task(job_id: str, input_path_str: str, output_path_str: str, ocr
         update_job_status(db, job_id, "processing")
         logger.info(f"Starting PDF OCR for job {job_id}")
         ocrmypdf.ocr(str(input_path), str(output_path_str),
+                     language=resolve_ocr_language(None, ocr_settings).split('+'),
                      deskew=ocr_settings.get('deskew', True),
                      force_ocr=ocr_settings.get('force_ocr', True),
                      clean=ocr_settings.get('clean', True),
@@ -1907,7 +1945,7 @@ def run_pdf_ocr_task(job_id: str, input_path_str: str, output_path_str: str, ocr
         send_webhook_notification(job_id, app_config, base_url)
 
 @huey.task()
-def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, app_config: dict, base_url: str):
+def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, app_config: dict, base_url: str, ocr_language: Optional[str] = None):
     db = SessionLocal()
     input_path = Path(input_path_str)
     out_path = Path(output_path_str)
@@ -1923,7 +1961,8 @@ def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, a
             return
 
         update_job_status(db, job_id, "processing", progress=10)
-        logger.info(f"Starting Image OCR for job {job_id} - {input_path}")
+        lang = resolve_ocr_language(ocr_language, app_config.get("ocr_settings", {}).get("ocrmypdf", {}))
+        logger.info(f"Starting Image OCR for job {job_id} ({lang}) - {input_path}")
 
         # open image and gather frames (support multi-frame TIFF)
         try:
@@ -1950,7 +1989,7 @@ def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, a
         for idx, frame in enumerate(frames):
             # produce searchable PDF bytes for the frame and plain text as well
             try:
-                pdf_bytes = pytesseract.image_to_pdf_or_hocr(frame, extension="pdf")
+                pdf_bytes = pytesseract.image_to_pdf_or_hocr(frame, extension="pdf", lang=lang)
             except TesseractNotFoundError as e:
                 raise RuntimeError("Tesseract not found. Ensure Tesseract OCR is installed and in PATH.") from e
             except Exception as e:
@@ -1960,7 +1999,7 @@ def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, a
 
             # also extract plain text for preview and possible fallback
             try:
-                page_text = pytesseract.image_to_string(frame)
+                page_text = pytesseract.image_to_string(frame, lang=lang)
             except Exception:
                 page_text = ""
             text_parts.append(page_text)
@@ -2372,13 +2411,20 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
             # Clean up the orphaned file from the zip extraction
             final_path.unlink(missing_ok=True)
             return None
+        ocr_settings = app_config.get("ocr_settings", {}).get("ocrmypdf", {})
+        try:
+            ocr_language = resolve_ocr_language(options.get("ocr_language"), ocr_settings)
+        except ValueError as e:
+            logger.warning(f"Not dispatching OCR for '{original_filename}': {e}")
+            final_path.unlink(missing_ok=True)
+            return None
         processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.pdf"
         job_data.processed_filepath = str(processed_path)
         create_job(db=db, job=job_data)
         if suffix in IMAGE_EXTENSIONS:
-            run_image_ocr_task(job_data.id, str(final_path), str(processed_path), app_config, base_url)
+            run_image_ocr_task(job_data.id, str(final_path), str(processed_path), app_config, base_url, ocr_language)
         else:
-            run_pdf_ocr_task(job_data.id, str(final_path), str(processed_path), app_config.get("ocr_settings", {}).get("ocrmypdf", {}), app_config, base_url)
+            run_pdf_ocr_task(job_data.id, str(final_path), str(processed_path), dict(ocr_settings, language=ocr_language), app_config, base_url)
     elif task_type == "conversion":
         try:
             logger.info(f"Preparing to dispatch conversion job for file '{original_filename}' with requested format '{options.get('output_format')}'")
@@ -2644,6 +2690,31 @@ def _init_huey_worker():
         if _cache_cleanup_thread is None:
             _cache_cleanup_thread = threading.Thread(target=_whisper_cache_cleanup_worker, daemon=True)
             _cache_cleanup_thread.start()
+
+
+@huey.periodic_task(crontab(minute="15"))
+def apply_retention_policy():
+    """
+    Deletes finished jobs (and their files) older than app_settings.retention_days.
+    0 or unset keeps everything.
+    """
+    reload_app_config_if_changed()
+    try:
+        days = float(APP_CONFIG.get("app_settings", {}).get("retention_days") or 0)
+    except (TypeError, ValueError):
+        days = 0
+    if days <= 0:
+        return
+    # created_at/updated_at are stored as naive UTC
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None)
+    db = SessionLocal()
+    try:
+        jobs = db.query(Job).filter(Job.status.in_(FINAL_JOB_STATES), Job.updated_at < cutoff).all()
+        if jobs:
+            deleted_ids, files_deleted = delete_jobs_and_files(db, jobs)
+            logger.info(f"Retention: deleted {len(deleted_ids)} jobs older than {days:g} days and {files_deleted} files.")
+    finally:
+        db.close()
 
 
 STALE_UPLOAD_HOURS = float(os.environ.get("STALE_UPLOAD_HOURS", "6"))
@@ -3344,6 +3415,9 @@ def _validate_task_options(task_type: str, options: dict, is_zip: bool) -> Optio
             options["model_size"] = resolve_whisper_model(options.get("model_size"), whisper_settings)
         elif task_type == "tts":
             validate_tts_model_name(options.get("model_name"))
+        elif task_type == "ocr":
+            ocr_settings = APP_CONFIG.get("ocr_settings", {}).get("ocrmypdf", {})
+            options["ocr_language"] = resolve_ocr_language(options.get("ocr_language"), ocr_settings)
         elif task_type == "conversion":
             all_tools = APP_CONFIG.get("conversion_tools", {}).keys()
             tool, task_key = _parse_tool_and_task_key(options.get("output_format") or "", all_tools)
@@ -3387,7 +3461,7 @@ async def finalize_upload(request: Request, payload: FinalizeUploadPayload, user
         is_zip = Path(safe_filename).suffix == '.zip'
         options = {"model_size": payload.model_size, "model_name": payload.model_name,
                    "output_format": payload.output_format, "generate_timestamps": payload.generate_timestamps,
-                   "callback_url": payload.callback_url}
+                   "ocr_language": payload.ocr_language, "callback_url": payload.callback_url}
         tool, task_key = _validate_task_options(payload.task_type, options, is_zip) or (None, None)
     except HTTPException:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -3541,6 +3615,14 @@ def is_allowed_callback_url(url: str, allowed: List[str]) -> bool:
     except Exception:
         return False
 
+@app.get("/api/v1/ocr-languages")
+async def get_ocr_languages(user: dict = Depends(require_user_or_api)):
+    """Installed Tesseract languages and the configured default."""
+    languages = await run_in_threadpool(installed_ocr_languages)
+    default = APP_CONFIG.get("ocr_settings", {}).get("ocrmypdf", {}).get("language") or "eng"
+    return {"languages": languages, "default": default}
+
+
 @app.get("/api/v1/tts-voices")
 async def get_tts_voices_list(user: dict = Depends(require_user)):
     global AVAILABLE_TTS_VOICES_CACHE
@@ -3596,6 +3678,7 @@ async def api_process_file(
     model_size: Optional[str] = Form("base"), model_name: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
     generate_timestamps: bool = Form(False),
+    ocr_language: Optional[str] = Form(None),
     db: Session = Depends(get_db), user: dict = Depends(require_api_user)
 ):
     """
@@ -3642,14 +3725,17 @@ async def api_process_file(
         target_ext = task_key.split('_')[0]
         if tool == "ghostscript_pdf": target_ext = "pdf"
         processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.{target_ext}"
-    elif task_type == "ocr":
-        if not is_allowed_file(file.filename, {".pdf"}):
+    elif task_type in ("ocr", "ocr-image"):
+        if task_type == "ocr" and not is_allowed_file(file.filename, {".pdf"}):
             raise HTTPException(status_code=400, detail="Invalid file type for ocr, requires .pdf")
-        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}{suffix}"
-    elif task_type == "ocr-image":
-        if not is_allowed_file(file.filename, {".png", ".jpg", ".jpeg", ".tiff", ".tif"}):
+        if task_type == "ocr-image" and not is_allowed_file(file.filename, {".png", ".jpg", ".jpeg", ".tiff", ".tif"}):
             raise HTTPException(status_code=400, detail="Invalid file type for ocr-image.")
-        # Image OCR produces a searchable PDF.
+        ocr_settings = APP_CONFIG.get("ocr_settings", {}).get("ocrmypdf", {})
+        try:
+            ocr_language = resolve_ocr_language(ocr_language, ocr_settings)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        # Both produce a searchable PDF.
         processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.pdf"
     else:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid task_type: '{task_type}'")
@@ -3678,9 +3764,9 @@ async def api_process_file(
     elif task_type == "conversion":
         run_conversion_task(job_id, str(upload_path), str(processed_path), tool, task_key, conversion_tools, APP_CONFIG, base_url)
     elif task_type == "ocr":
-        run_pdf_ocr_task(job_id, str(upload_path), str(processed_path), APP_CONFIG.get("ocr_settings", {}).get("ocrmypdf", {}), APP_CONFIG, base_url)
+        run_pdf_ocr_task(job_id, str(upload_path), str(processed_path), dict(ocr_settings, language=ocr_language), APP_CONFIG, base_url)
     elif task_type == "ocr-image":
-        run_image_ocr_task(job_id, str(upload_path), str(processed_path), APP_CONFIG, base_url)
+        run_image_ocr_task(job_id, str(upload_path), str(processed_path), APP_CONFIG, base_url, ocr_language)
 
     return {"job_id": job_id, "status": "pending"}
 
@@ -3826,15 +3912,16 @@ def _leaves(*names: str) -> dict:
 # can only be edited in settings.yml.
 EDITABLE_SETTINGS = {
     "app_settings": _leaves("app_public_url", "max_file_size_mb", "allowed_all_extensions",
-                            "model_concurrency", "model_inactivity_timeout", "cache_check_interval"),
-    "ocr_settings": {"ocrmypdf": _leaves("deskew", "clean", "force_ocr")},
+                            "model_concurrency", "model_inactivity_timeout", "cache_check_interval",
+                            "retention_days"),
+    "ocr_settings": {"ocrmypdf": _leaves("deskew", "clean", "force_ocr", "language")},
     "transcription_settings": {"whisper": _leaves("compute_type")},
     "auth_settings": _leaves("oidc_client_id", "oidc_client_secret", "oidc_server_metadata_url",
                              "admin_users", "allowed_users", "allowed_domains"),
     "webhook_settings": _leaves("enabled", "allow_chunked_api_uploads", "allowed_callback_urls", "callback_bearer_token"),
     "tts_settings": {"piper": {"use_cuda": None, "synthesis_config": _leaves("length_scale", "noise_scale", "noise_w")}},
 }
-EDITABLE_TOOL_KEYS = {"name", "command_template", "supported_input", "formats"}
+EDITABLE_TOOL_KEYS = {"name", "command_template", "supported_input", "formats", "timeout"}
 POSITIVE_NUMBER_SETTINGS = (("app_settings", "max_file_size_mb"), ("app_settings", "model_concurrency"),
                             ("app_settings", "model_inactivity_timeout"), ("app_settings", "cache_check_interval"))
 
@@ -3873,6 +3960,22 @@ def _validate_settings_payload(payload: dict) -> List[str]:
             if not valid:
                 errors.append(f"'{section}.{key}' must be a positive number.")
 
+    app_section = payload.get("app_settings")
+    if isinstance(app_section, dict) and "retention_days" in app_section:
+        try:
+            valid = app_section["retention_days"] is None or float(app_section["retention_days"]) >= 0
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            errors.append("'app_settings.retention_days' must be 0 (keep forever) or a positive number.")
+
+    ocr_language = (payload.get("ocr_settings") or {}).get("ocrmypdf", {}) if isinstance(payload.get("ocr_settings"), dict) else {}
+    if isinstance(ocr_language, dict) and "language" in ocr_language:
+        try:
+            resolve_ocr_language(str(ocr_language["language"] or ""), {})
+        except ValueError as e:
+            errors.append(f"'ocr_settings.ocrmypdf.language': {e}")
+
     tools = payload.get("conversion_tools")
     if tools is None:
         return errors
@@ -3889,6 +3992,13 @@ def _validate_settings_payload(payload: dict) -> List[str]:
             continue
         for key in sorted(set(tool) - EDITABLE_TOOL_KEYS):
             errors.append(f"'conversion_tools.{tool_id}.{key}' cannot be changed from the web UI; edit settings.yml instead.")
+        if "timeout" in tool:
+            try:
+                valid_timeout = 0 < float(tool["timeout"]) <= 7 * 24 * 3600
+            except (TypeError, ValueError):
+                valid_timeout = False
+            if not valid_timeout:
+                errors.append(f"'conversion_tools.{tool_id}.timeout' must be a positive number of seconds.")
         current = current_tools.get(tool_id)
         if current is None and not ALLOW_COMMAND_EDITS:
             errors.append(f"Adding conversion tools ('{tool_id}') from the web UI is disabled. "
@@ -3933,7 +4043,7 @@ async def get_settings_page(request: Request):
     admin_status = is_admin(request)
     context = {"config": {}, "config_source": "", "secrets_set": {}, "user": user, "is_admin": admin_status,
                "local_only_mode": LOCAL_ONLY_MODE, "allow_command_edits": ALLOW_COMMAND_EDITS,
-               "unavailable_tools": UNAVAILABLE_TOOLS}
+               "unavailable_tools": UNAVAILABLE_TOOLS, "ocr_languages": installed_ocr_languages()}
     if not admin_status:
         return templates.TemplateResponse(request, "settings.html", context)
 
@@ -4195,6 +4305,51 @@ def _delete_job_files(jobs) -> tuple[int, list]:
                 errors.append(Path(job.processed_filepath).name)
                 logger.exception(f"Could not delete file {Path(job.processed_filepath).name}")
     return deleted_count, errors
+
+
+FINAL_JOB_STATES = ("completed", "failed", "cancelled")
+MAX_JOBS_PER_DELETE = 1000
+
+
+def delete_jobs_and_files(db: Session, jobs: list) -> tuple[list, int]:
+    """
+    Deletes jobs with their processed files (and the inputs of jobs that never started).
+    Active jobs are cancelled first so running tools get killed. Returns (deleted_ids, files_deleted).
+    """
+    active_ids = [job.id for job in jobs if job.status in ("pending", "processing")]
+    if active_ids:
+        db.query(Job).filter(Job.id.in_(active_ids)).update({"status": "cancelled"}, synchronize_session=False)
+        db.commit()
+    files_deleted, _errors = _delete_job_files(jobs)
+    for job in jobs:
+        if job.id in active_ids and job.input_filepath:
+            try:
+                input_path = ensure_path_is_safe(Path(job.input_filepath), [PATHS.UPLOADS_DIR, PATHS.CHUNK_TMP_DIR])
+                input_path.unlink(missing_ok=True)
+            except Exception:
+                logger.debug(f"Could not remove input of deleted job {job.id}", exc_info=True)
+    deleted_ids = [job.id for job in jobs]
+    for start in range(0, len(deleted_ids), 500):
+        db.query(Job).filter(Job.id.in_(deleted_ids[start:start + 500])).delete(synchronize_session=False)
+    db.commit()
+    return deleted_ids, files_deleted
+
+
+@app.post("/jobs/delete")
+async def delete_selected_jobs(payload: JobSelection, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
+    """Deletes the selected jobs of the current user, their files and, for ZIP batches, their sub-jobs."""
+    job_ids = list(dict.fromkeys(payload.job_ids))[:MAX_JOBS_PER_DELETE]
+    if not job_ids:
+        raise HTTPException(status_code=400, detail="No job IDs provided.")
+    jobs = db.query(Job).filter(Job.id.in_(job_ids), Job.user_id == user['sub']).all()
+    batch_ids = [job.id for job in jobs if job.task_type == "unzip"]
+    if batch_ids:
+        known = {job.id for job in jobs}
+        jobs += [child for child in db.query(Job).filter(Job.parent_job_id.in_(batch_ids), Job.user_id == user['sub']).all()
+                 if child.id not in known]
+    deleted_ids, files_deleted = delete_jobs_and_files(db, jobs)
+    logger.info(f"User {user['sub']} deleted {len(deleted_ids)} jobs and {files_deleted} files.")
+    return {"deleted": deleted_ids, "files_deleted": files_deleted}
 
 
 @app.post("/settings/clear-history")

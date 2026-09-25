@@ -42,6 +42,11 @@
                     <fieldset class="settings-group">
                         <legend><h2>Performance Tuning</h2></legend>
                          <div class="form-control">
+                            <label for="app-retention-days">Delete Finished Jobs After (days)</label>
+                            <p class="field-description">Finished jobs and their files are deleted automatically after this many days. 0 keeps everything.</p>
+                            <input type="number" min="0" step="1" id="app-retention-days" name="app_settings.retention_days" value="{{ config.app_settings.get('retention_days', 0) or 0 }}" class="form-input">
+                        </div>
+                         <div class="form-control">
                             <label for="perf-model-concurrency">Model Concurrency Limit</label>
                             <p class="field-description">Maximum number of AI models (e.g., Piper TTS) that can run in parallel. Helps prevent CPU/GPU overload.</p>
                             <input type="number" id="perf-model-concurrency" name="app_settings.model_concurrency" value="{{ config.app_settings.get('model_concurrency', 1) }}" class="form-input">
@@ -61,6 +66,11 @@
                 
                 <fieldset class="settings-group">
                     <legend><h2>OCR (ocrmypdf)</h2></legend>
+                    <div class="form-control">
+                        <label for="ocr-language">Default Language</label>
+                        <p class="field-description">Tesseract language code(s) used when a job doesn't choose one, e.g. <code>eng</code> or <code>eng+spa</code>.{% if ocr_languages %} Installed: {{ ocr_languages | join(', ') }}.{% endif %}</p>
+                        <input type="text" id="ocr-language" name="ocr_settings.ocrmypdf.language" value="{{ config.ocr_settings.ocrmypdf.get('language', 'eng') }}" class="form-input">
+                    </div>
                      <div class="form-control checkbox-group">
                         <input type="checkbox" id="ocr-deskew" name="ocr_settings.ocrmypdf.deskew" {% if config.ocr_settings.ocrmypdf.deskew %}checked{% endif %}>
                         <label for="ocr-deskew">Deskew (correct tilted pages)</label>
@@ -185,6 +195,10 @@
                             <div class="form-control">
                                 <label for="tool-{{ tool_id }}-cmd">Command Template</label>
                                 <textarea id="tool-{{ tool_id }}-cmd" name="conversion_tools.{{ tool_id }}.command_template" class="form-textarea" rows="3"{% if not allow_command_edits %} readonly{% endif %}>{{ tool.command_template }}</textarea>
+                            </div>
+                            <div class="form-control">
+                                <label for="tool-{{ tool_id }}-timeout">Timeout (seconds)</label>
+                                <input type="number" min="1" id="tool-{{ tool_id }}-timeout" name="conversion_tools.{{ tool_id }}.timeout" value="{{ tool.get('timeout', 300) }}" class="form-input">
                             </div>
                             <div class="form-control">
                                 <label for="tool-{{ tool_id }}-supported-input">Accepted File Formats (comma-separated)</label>

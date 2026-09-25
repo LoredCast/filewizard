@@ -225,6 +225,8 @@ app_settings:
     - .zimwiki
 ocr_settings:
   ocrmypdf:
+    # Default Tesseract language(s), e.g. "eng" or "eng+spa". Users can pick others per job.
+    language: eng
     deskew: true
     clean: true
     optimize: 1

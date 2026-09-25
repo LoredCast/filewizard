@@ -40,12 +40,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const mainOutputFormatSelect = document.getElementById('main-output-format-select');
     const mainModelSizeSelect = document.getElementById('main-model-size-select');
     const mainTtsModelSelect = document.getElementById('main-tts-model-select');
+    const mainOcrLanguageSelect = document.getElementById('main-ocr-language-select');
     const startConversionBtn = document.getElementById('start-conversion-btn');
     const startOcrBtn = document.getElementById('start-ocr-btn');
     const startTranscriptionBtn = document.getElementById('start-transcription-btn');
     const startTtsBtn = document.getElementById('start-tts-btn');
 
     const downloadSelectedBtn = document.getElementById('download-selected-btn');
+    const deleteSelectedBtn = document.getElementById('delete-selected-btn');
     const selectAllJobsCheckbox = document.getElementById('select-all-jobs');
     const jobListBody = document.getElementById('job-list-body');
 
@@ -72,6 +74,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let conversionChoices = null;
     let transcriptionChoices = null;
     let ttsChoices = null;
+    let ocrLanguageChoices = null;
     let dialogConversionChoices = null;
     let dialogTtsChoices = null;
     let ttsModelsCache = [];
@@ -287,9 +290,11 @@ document.addEventListener('DOMContentLoaded', () => {
             actionHtml = `<span>Cancelled</span>`;
         }
         const fileSizeHtml = escapeHtml(formatJobFileSize(job));
+        // Every finished job can be selected (for deletion); only jobs with a result file can be downloaded.
         let checkboxHtml = '';
-        if (job.status === 'completed' && job.processed_filepath && job.task_type !== 'unzip') {
-            checkboxHtml = `<input type="checkbox" class="job-checkbox" value="${jobId}">`;
+        if (['completed', 'failed', 'cancelled'].includes(job.status)) {
+            const downloadable = job.status === 'completed' && job.processed_filepath && job.task_type !== 'unzip';
+            checkboxHtml = `<input type="checkbox" class="job-checkbox" value="${jobId}"${downloadable ? ' data-downloadable="1"' : ''}>`;
         }
 
         // Truncate filename for mobile view (truncate first, then escape, so entities are never cut in half)
@@ -307,7 +312,13 @@ document.addEventListener('DOMContentLoaded', () => {
             const statusCell = row.querySelector('td[data-label="Status"] .cell-value');
             const actionCell = row.querySelector('td[data-label="Action"] .cell-value');
 
-            if (selectCell) selectCell.innerHTML = checkboxHtml;
+            if (selectCell) {
+                // Keep the selection when a row is re-rendered by polling.
+                const wasChecked = selectCell.querySelector('.job-checkbox')?.checked;
+                selectCell.innerHTML = checkboxHtml;
+                const checkbox = selectCell.querySelector('.job-checkbox');
+                if (checkbox && wasChecked) checkbox.checked = true;
+            }
             if (fileCell) {
                 fileCell.innerHTML = `<span class="file-cell-content" title="${escapedFilename}">${expanderHtml}${truncatedFilename}</span><button class="details-button" style="display: none;" title="Show details">i</button>`;
             }
@@ -460,6 +471,8 @@ document.addEventListener('DOMContentLoaded', () => {
             const selectedModel = ttsChoices.getValue(true);
             if (!selectedModel) return alert('Please select a voice model.');
             options.model_name = selectedModel;
+        } else if (taskType === 'ocr') {
+            options.ocr_language = selectedOcrLanguage();
         }
 
         [startConversionBtn, startOcrBtn, startTranscriptionBtn, startTtsBtn].forEach(btn => btn.disabled = true);
@@ -544,9 +557,28 @@ document.addEventListener('DOMContentLoaded', () => {
             const selectedModel = dialogTtsChoices.getValue(true);
             if (!selectedModel) return alert('Please select a voice model.');
             options.model_name = selectedModel;
+        } else if (action === 'ocr') {
+            options.ocr_language = selectedOcrLanguage();
         }
         Array.from(stagedFiles).forEach(file => uploadFileInChunks(file, action, options));
         closeActionDialog();
+    }
+
+    // "eng+spa" style Tesseract spec from the language picker ("" = server default).
+    function selectedOcrLanguage() {
+        const values = ocrLanguageChoices ? ocrLanguageChoices.getValue(true) : [];
+        return (Array.isArray(values) ? values : [values]).filter(Boolean).join('+');
+    }
+
+    async function loadOcrLanguages() {
+        try {
+            const data = await authFetch('/api/v1/ocr-languages').then(res => res.json());
+            const defaults = String(data.default || 'eng').split('+');
+            const choices = (data.languages || []).map(lang => ({ value: lang, label: lang, selected: defaults.includes(lang) }));
+            if (ocrLanguageChoices) ocrLanguageChoices.setChoices(choices, 'value', 'label', true);
+        } catch (error) {
+            console.error("Couldn't load OCR languages:", error);
+        }
     }
 
     async function loadTtsModels() {
@@ -590,6 +622,11 @@ function initializeSelectors() {
     if (ttsChoices) ttsChoices.destroy();
     ttsChoices = new Choices(mainTtsModelSelect, { searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select voice...' });
     loadTtsModels();
+
+    if (!ocrLanguageChoices && mainOcrLanguageSelect) {
+        ocrLanguageChoices = new Choices(mainOcrLanguageSelect, { removeItemButton: true, searchEnabled: true, itemSelectText: '', shouldSort: true, placeholder: true, placeholderValue: 'Server default' });
+        loadOcrLanguages();
+    }
 }
 
     function getFileExtension(filename) {
@@ -699,12 +736,39 @@ function initializeSelectors() {
 
     function handleSelectionChange() {
         const selectedCheckboxes = jobListBody.querySelectorAll('.job-checkbox:checked');
-        downloadSelectedBtn.disabled = selectedCheckboxes.length === 0;
+        downloadSelectedBtn.disabled = jobListBody.querySelectorAll('.job-checkbox[data-downloadable]:checked').length === 0;
+        deleteSelectedBtn.disabled = selectedCheckboxes.length === 0;
         selectAllJobsCheckbox.checked = jobListBody.querySelectorAll('.job-checkbox').length > 0 && selectedCheckboxes.length === jobListBody.querySelectorAll('.job-checkbox').length;
     }
 
-    async function handleBatchDownload() {
+    function removeJobRows(jobId) {
+        document.getElementById(`job-${jobId}`)?.remove();
+        document.getElementById(`job-${jobId}-details`)?.remove();
+    }
+
+    async function handleBatchDelete() {
         const selectedIds = Array.from(jobListBody.querySelectorAll('.job-checkbox:checked')).map(cb => cb.value);
+        if (selectedIds.length === 0) return;
+        if (!confirm(`Delete ${selectedIds.length} job(s) and their files? ZIP batches are deleted with all their files.`)) return;
+        deleteSelectedBtn.disabled = true;
+        try {
+            const response = await authFetch('/jobs/delete', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_ids: selectedIds })
+            });
+            if (!response.ok) throw new Error('Delete failed.');
+            const result = await response.json();
+            (result.deleted || []).forEach(removeJobRows);
+        } catch (error) {
+            console.error("Batch delete error:", error);
+            if (error.message !== 'Session expired') alert("Could not delete the selected jobs. Please try again.");
+        } finally {
+            selectAllJobsCheckbox.checked = false;
+            handleSelectionChange();
+        }
+    }
+
+    async function handleBatchDownload() {
+        const selectedIds = Array.from(jobListBody.querySelectorAll('.job-checkbox[data-downloadable]:checked')).map(cb => cb.value);
         if (selectedIds.length === 0) return;
         downloadSelectedBtn.disabled = true;
         downloadSelectedBtn.textContent = 'Zipping...';
@@ -772,6 +836,7 @@ function initializeSelectors() {
         startTtsBtn.addEventListener('click', () => handleTaskRequest('tts'));
         mainFileInput.addEventListener('change', () => updateFileName(mainFileInput, mainFileName));
         downloadSelectedBtn.addEventListener('click', handleBatchDownload);
+        deleteSelectedBtn.addEventListener('click', handleBatchDelete);
         selectAllJobsCheckbox.addEventListener('change', () => {
             const checkboxes = jobListBody.querySelectorAll('.job-checkbox');
             checkboxes.forEach(checkbox => {

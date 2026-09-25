@@ -65,7 +65,10 @@
 
                             <fieldset class="action-fieldset">
                                 <legend><h2>OCR PDF/Image</h2></legend>
-                                <p class="action-description">Extract text from scanned documents and images.</p>
+                                <div class="form-control">
+                                    <label for="main-ocr-language-select">Document Language</label>
+                                    <select name="ocr_language" id="main-ocr-language-select" multiple></select>
+                                </div>
                                 <button type="button" id="start-ocr-btn" class="main-action-button">Start OCR</button>
                             </fieldset>
 
@@ -103,7 +106,10 @@
                 <section id="job-history">
                     <div class="history-header">
                         <h2>History</h2>
-                        <button id="download-selected-btn" class="main-action-button" disabled>Download Selected as ZIP</button>
+                        <div class="history-actions">
+                            <button id="delete-selected-btn" class="main-action-button" disabled>Delete Selected</button>
+                            <button id="download-selected-btn" class="main-action-button" disabled>Download Selected as ZIP</button>
+                        </div>
                     </div>
                     <div class="table-wrapper">
                         <table id="job-table">
