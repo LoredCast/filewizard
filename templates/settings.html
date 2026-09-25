@@ -18,6 +18,7 @@
         </header>
 
         <main>
+            {% if is_admin %}
             <form id="settings-form">
                 <div class="settings-main-grid">
                     <fieldset class="settings-group">
@@ -96,7 +97,7 @@
                     </div>
                     <div class="form-control">
                         <label for="auth-client-secret">Client Secret</label>
-                        <input type="password" id="auth-client-secret" name="auth_settings.oidc_client_secret" value="{{ config.auth_settings.get('oidc_client_secret', '') }}" class="form-input">
+                        <input type="password" id="auth-client-secret" name="auth_settings.oidc_client_secret" value="" autocomplete="new-password" placeholder="{{ 'Stored – leave empty to keep the current secret' if secrets_set.get('oidc_client_secret') else 'Not set' }}" class="form-input">
                     </div>
                     <div class="form-control">
                         <label for="auth-metadata-url">Server Metadata URL</label>
@@ -106,6 +107,16 @@
                         <label for="auth-admin-users">Admin User Emails</label>
                         <p class="field-description">Comma-separated list of email addresses for users who should have admin rights.</p>
                         <textarea id="auth-admin-users" name="auth_settings.admin_users" class="form-textarea" rows="2">{{ config.auth_settings.get('admin_users', []) | join(', ') }}</textarea>
+                    </div>
+                    <div class="form-control">
+                        <label for="auth-allowed-users">Allowed User Emails</label>
+                        <p class="field-description">Comma-separated. If this and "Allowed Email Domains" are both empty, every account your identity provider accepts can use FileWizard. Admins are always allowed.</p>
+                        <textarea id="auth-allowed-users" name="auth_settings.allowed_users" class="form-textarea" rows="2">{{ config.auth_settings.get('allowed_users', []) | join(', ') }}</textarea>
+                    </div>
+                    <div class="form-control">
+                        <label for="auth-allowed-domains">Allowed Email Domains</label>
+                        <p class="field-description">Comma-separated, e.g. example.com. Users with a verified email address in one of these domains can log in.</p>
+                        <textarea id="auth-allowed-domains" name="auth_settings.allowed_domains" class="form-textarea" rows="2">{{ config.auth_settings.get('allowed_domains', []) | join(', ') }}</textarea>
                     </div>
                 </fieldset>
 
@@ -128,7 +139,7 @@
                     <div class="form-control">
                         <label for="webhook-token">Callback Bearer Token</label>
                         <p class="field-description">If set, this token will be sent in the `Authorization` header for all callback requests.</p>
-                        <input type="password" id="webhook-token" name="webhook_settings.callback_bearer_token" value="{{ config.webhook_settings.get('callback_bearer_token', '') }}" class="form-input">
+                        <input type="password" id="webhook-token" name="webhook_settings.callback_bearer_token" value="" autocomplete="new-password" placeholder="{{ 'Stored – leave empty to keep the current token' if secrets_set.get('callback_bearer_token') else 'Not set' }}" class="form-input">
                     </div>
                 </fieldset>
 
@@ -158,6 +169,9 @@
                         Edit the command line templates for each conversion tool. The following placeholders are available: <code>{input}</code>, <code>{output}</code>, <code>{output_dir}</code>, <code>{output_ext}</code>.
                         Some tools may have additional placeholders; refer to the sourcecode or documentation for details.
                     </p>
+                    {% if not allow_command_edits %}
+                    <p class="field-description">Command templates are read-only here because they decide which programs the server runs. Edit <code>config/settings.yml</code>, or start the app with <code>ALLOW_COMMAND_EDITS=true</code> to edit them in this page.</p>
+                    {% endif %}
                     <div class="tool-grid">
                         {% for tool_id, tool in config.conversion_tools.items() %}
                         <div class="tool-card">
@@ -167,7 +181,7 @@
                             </div>
                             <div class="form-control">
                                 <label for="tool-{{ tool_id }}-cmd">Command Template</label>
-                                <textarea id="tool-{{ tool_id }}-cmd" name="conversion_tools.{{ tool_id }}.command_template" class="form-textarea" rows="3">{{ tool.command_template }}</textarea>
+                                <textarea id="tool-{{ tool_id }}-cmd" name="conversion_tools.{{ tool_id }}.command_template" class="form-textarea" rows="3"{% if not allow_command_edits %} readonly{% endif %}>{{ tool.command_template }}</textarea>
                             </div>
                             <div class="form-control">
                                 <label for="tool-{{ tool_id }}-supported-input">Accepted File Formats (comma-separated)</label>
@@ -188,8 +202,11 @@
                      <div id="save-status" class="save-status"></div>
                 </div>
             </form>
-            
+
             <hr class="divider">
+            {% else %}
+            <p class="field-description">Only administrators can view or change the application configuration.</p>
+            {% endif %}
 
             <div id="history-management" class="settings-group">
                 <h2>History Management</h2>

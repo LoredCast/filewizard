@@ -22,13 +22,14 @@ from typing import Dict, List, Any, Optional
 import resource
 from threading import Semaphore
 from logging.handlers import RotatingFileHandler
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlencode
 from io import BytesIO
 import zipfile
 import sys
 import re
 import importlib
 import collections.abc
+import copy
 import time
 import ocrmypdf
 import pypdf
@@ -439,13 +440,41 @@ def initialize_settings_file():
             logger.error(f"CRITICAL: Failed to copy default settings file: {e}")
             PATHS.SETTINGS_FILE.touch()
 
+_config_mtimes: Optional[tuple] = None
+
+
+def _settings_mtimes() -> tuple:
+    result = []
+    for settings_path in (PATHS.SETTINGS_FILE, PATHS.DEFAULT_SETTINGS_FILE):
+        try:
+            result.append(settings_path.stat().st_mtime_ns)
+        except OSError:
+            result.append(None)
+    return tuple(result)
+
+
+def reload_app_config_if_changed():
+    """
+    Each gunicorn worker (and the huey consumer) holds its own APP_CONFIG. Settings saved
+    through one worker, or edited on disk, are picked up by the others on their next request.
+    """
+    if _settings_mtimes() == _config_mtimes:
+        return
+    try:
+        load_app_config()
+    except Exception:
+        logger.exception("Could not reload settings; keeping the previous configuration.")
+
+
 def load_app_config():
     """
     Loads configuration by deeply merging settings from hardcoded defaults,
     settings.default.yml, and settings.yml, then applies environment variable
     overrides.
     """
-    global APP_CONFIG
+    global APP_CONFIG, _config_mtimes
+    # Recorded before reading, so a write that races with this load triggers another reload.
+    _config_mtimes = _settings_mtimes()
 
     # --- 1. Hardcoded Defaults ---
     hardcoded_defaults = {
@@ -504,8 +533,12 @@ def load_app_config():
 
     # --- 5. Final Processing & Assignment ---
     app_settings = config.get("app_settings", {})
-    max_mb = app_settings.get("max_file_size_mb", 100)
-    app_settings["max_file_size_bytes"] = int(max_mb) * 1024 * 1024
+    try:
+        max_mb = float(app_settings.get("max_file_size_mb", 100))
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid max_file_size_mb {app_settings.get('max_file_size_mb')!r}; using 100.")
+        max_mb = 100
+    app_settings["max_file_size_bytes"] = int(max_mb * 1024 * 1024)
     allowed = app_settings.get("allowed_all_extensions", [])
     if not isinstance(allowed, (list, set)):
         allowed = []
@@ -2624,17 +2657,54 @@ def _env_list(name: str) -> List[str]:
     return [v.strip() for v in os.environ.get(name, '').split(',') if v.strip()]
 
 
+def _load_or_create_secret_key() -> str:
+    """
+    Returns a session signing key shared by all workers. A key generated per process
+    would differ between the gunicorn workers, so a login started on one worker would
+    fail its OAuth state check on another. The generated key is persisted next to
+    settings.yml (mode 0600) so sessions also survive restarts.
+    """
+    key_file = PATHS.CONFIG_DIR / ".secret_key"
+    try:
+        existing = key_file.read_text(encoding="utf8").strip()
+        if existing:
+            return existing
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning(f"Could not read {key_file}: {e}")
+
+    new_key = secrets.token_hex(32)
+    try:
+        fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf8") as f:
+            f.write(new_key)
+        logger.info(f"SECRET_KEY is not set; generated a persistent session key in {key_file}.")
+        return new_key
+    except FileExistsError:
+        # Another worker is creating the file right now; wait for its content.
+        for _ in range(50):
+            existing = key_file.read_text(encoding="utf8").strip()
+            if existing:
+                return existing
+            time.sleep(0.1)
+    except OSError as e:
+        logger.warning(f"Could not persist a session key to {key_file}: {e}")
+    logger.warning("Using a temporary per-process session key. Set SECRET_KEY so logins work across workers and restarts.")
+    return new_key
+
+
 SECRET_KEY = os.environ.get('SECRET_KEY')
 if not SECRET_KEY and not LOCAL_ONLY_MODE and ENV != 'dev':
     raise RuntimeError('SECRET_KEY must be set in production when authentication is enabled.')
 if not SECRET_KEY:
-    logger.warning('SECRET_KEY is not set. Generating a temporary key. Sessions will not persist across restarts.')
-    SECRET_KEY = os.urandom(24).hex()
+    SECRET_KEY = _load_or_create_secret_key()
 
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
-    https_only=False, # Set to True if behind HTTPS proxy
+    # Set SESSION_COOKIE_SECURE=true when the app is served over HTTPS (e.g. behind a TLS reverse proxy).
+    https_only=_env_flag('SESSION_COOKIE_SECURE', False),
     same_site='lax',
     max_age=14 * 24 * 60 * 60  # 14 days
 )
@@ -2726,6 +2796,7 @@ class SecurityMiddleware:
             await self.app(scope, receive, send)
             return
 
+        reload_app_config_if_changed()
         headers = Headers(scope=scope)
         if not _is_csrf_safe(scope["method"], headers):
             logger.warning(
@@ -2768,37 +2839,97 @@ templates = Jinja2Templates(directory=str(PATHS.BASE_DIR / "templates"))
 # --- AUTH & USER HELPERS ---
 http_bearer = HTTPBearer()
 
+LOCAL_USER = {'sub': 'local_user', 'email': 'local@user.com', 'name': 'Local User'}
+
+
+def _normalized_email_set(values) -> set:
+    if not isinstance(values, (list, tuple, set)):
+        return set()
+    return {v.strip().lower() for v in values if isinstance(v, str) and v.strip()}
+
+
+def _verified_email(user: dict | None) -> str | None:
+    """The user's email, unless the identity provider explicitly marked it as unverified."""
+    if not user:
+        return None
+    email = user.get('email')
+    if not isinstance(email, str) or not email.strip() or user.get('email_verified') is False:
+        return None
+    return email.strip().lower()
+
+
+def is_user_allowed(user: dict | None) -> bool:
+    """
+    Authorization for OIDC users. With auth_settings.allowed_users and allowed_domains both
+    empty, every account the identity provider authenticates may use the app.
+    """
+    if LOCAL_ONLY_MODE:
+        return True
+    if not user:
+        return False
+    auth_settings = APP_CONFIG.get("auth_settings", {})
+    allowed_users = _normalized_email_set(auth_settings.get("allowed_users"))
+    allowed_domains = {d.lstrip('@') for d in _normalized_email_set(auth_settings.get("allowed_domains"))}
+    if not allowed_users and not allowed_domains:
+        return True
+    email = _verified_email(user)
+    if not email:
+        return False
+    if email in allowed_users or email in _normalized_email_set(auth_settings.get("admin_users")):
+        return True
+    return email.rsplit('@', 1)[-1] in allowed_domains
+
+
 def get_current_user(request: Request):
     if LOCAL_ONLY_MODE:
-        return {'sub': 'local_user', 'email': 'local@user.com', 'name': 'Local User'}
-    return request.session.get('user')
+        return LOCAL_USER
+    user = request.session.get('user')
+    # Re-checked on every request so removing someone from the allowlist takes effect immediately.
+    if user and not is_user_allowed(user):
+        return None
+    return user
+
+
+async def _user_from_bearer_token(token: str) -> dict:
+    if not check_oidc_availability():
+        logger.warning("OIDC not available for API authentication")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication system is not properly configured")
+    try:
+        user = dict(await oauth.oidc.userinfo(token={'access_token': token}))
+    except Exception as e:
+        logger.error(f"API token validation failed: {e}")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+    if not user.get('sub') or not is_user_allowed(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This account is not allowed to use this service.")
+    return user
+
 
 async def require_api_user(request: Request, creds: HTTPAuthorizationCredentials = Depends(http_bearer)):
     """Dependency for API routes requiring OIDC bearer token authentication."""
     if LOCAL_ONLY_MODE:
-        return {'sub': 'local_api_user', 'email': 'local@api.user.com', 'name': 'Local API User'}
-
+        # Same identity as the UI, so API jobs show up in the history and their downloads work.
+        return LOCAL_USER
     if not creds:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-    
-    if not check_oidc_availability():
-        logger.warning("OIDC not available for API authentication")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication system is not properly configured")
-    
-    token = creds.credentials
-    try:
-        user = await oauth.oidc.userinfo(token={'access_token': token})
-        return dict(user)
-    except Exception as e:
-        logger.error(f"API token validation failed: {e}")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+    return await _user_from_bearer_token(creds.credentials)
+
+
+async def require_user_or_api(request: Request):
+    """Accepts a browser session or, for API clients, an OIDC bearer token."""
+    user = get_current_user(request)
+    if user:
+        return user
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() == "bearer" and token.strip():
+        return await _user_from_bearer_token(token.strip())
+    raise HTTPException(status_code=401, detail="Not authenticated")
+
 
 def is_admin(request: Request) -> bool:
     if LOCAL_ONLY_MODE: return True
-    user = get_current_user(request)
-    if not user: return False
-    admin_users = APP_CONFIG.get("auth_settings", {}).get("admin_users", [])
-    return user.get('email') in admin_users
+    email = _verified_email(get_current_user(request))
+    if not email: return False
+    return email in _normalized_email_set(APP_CONFIG.get("auth_settings", {}).get("admin_users", []))
 
 def require_user(request: Request):
     user = get_current_user(request)
@@ -3323,12 +3454,16 @@ if not LOCAL_ONLY_MODE:
         
         try:
             token = await oauth.oidc.authorize_access_token(request)
-            user = await oauth.oidc.userinfo(token=token)
-            request.session['user'] = dict(user)
-            request.session['id_token'] = token.get('id_token')
+            user = dict(await oauth.oidc.userinfo(token=token))
         except Exception as e:
             logger.error(f"Authentication failed: {e}")
             raise HTTPException(status_code=401, detail="Authentication failed")
+        if not is_user_allowed(user):
+            logger.warning(f"Login rejected for '{user.get('email')}': not in auth_settings.allowed_users/allowed_domains.")
+            request.session.clear()
+            raise HTTPException(status_code=403, detail="This account is not allowed to use this service.")
+        request.session['user'] = user
+        request.session['id_token'] = token.get('id_token')
         return RedirectResponse(url='/')
 
     @app.get("/logout")
@@ -3338,14 +3473,26 @@ if not LOCAL_ONLY_MODE:
             return RedirectResponse(url="/", status_code=302)
             
         try:
-            logout_endpoint = oauth.oidc.server_metadata.get("end_session_endpoint")
+            # The metadata is fetched lazily; this worker may not have loaded it yet.
+            await oauth.oidc.load_server_metadata()
+            logout_endpoint = (oauth.oidc.server_metadata.get("end_session_endpoint")
+                               or APP_CONFIG.get("auth_settings", {}).get("oidc_end_session_endpoint"))
             if not logout_endpoint:
                 request.session.clear()
                 logger.warning("OIDC 'end_session_endpoint' not found. Performing local-only logout.")
                 return RedirectResponse(url="/", status_code=302)
 
-            post_logout_redirect_uri = str(request.url_for("get_index"))
-            logout_url = f"{logout_endpoint}?post_logout_redirect_uri={post_logout_redirect_uri}"
+            # RP-initiated logout: providers such as Keycloak require id_token_hint (or client_id)
+            # alongside post_logout_redirect_uri.
+            params = {"post_logout_redirect_uri": str(request.url_for("get_index"))}
+            id_token = request.session.get("id_token")
+            if id_token:
+                params["id_token_hint"] = id_token
+            client_id = APP_CONFIG.get("auth_settings", {}).get("oidc_client_id")
+            if client_id:
+                params["client_id"] = client_id
+            separator = "&" if "?" in logout_endpoint else "?"
+            logout_url = f"{logout_endpoint}{separator}{urlencode(params)}"
         except Exception as e:
             logger.warning(f"Could not determine OIDC logout endpoint: {e}. Performing local-only logout.")
             request.session.clear()
@@ -3358,6 +3505,8 @@ if not LOCAL_ONLY_MODE:
 # This is for reverse proxies that use forward auth
 @app.get("/api/authz/forward-auth")
 async def forward_auth(request: Request):
+    if LOCAL_ONLY_MODE:
+        raise HTTPException(status_code=404, detail="Not available in LOCAL_ONLY mode.")
     if not check_oidc_availability():
         raise HTTPException(status_code=401, detail="Authentication system is not properly configured")
     redirect_uri = request.url_for('auth')
@@ -3368,38 +3517,158 @@ async def get_index(request: Request):
     user = get_current_user(request)
     admin_status = is_admin(request)
     whisper_models = APP_CONFIG.get("transcription_settings", {}).get("whisper", {}).get("allowed_models", [])
-    conversion_tools = APP_CONFIG.get("conversion_tools", {})
+    # The browser only needs names and output formats; command templates stay server-side.
+    conversion_tools = {
+        tool_id: {"name": tool.get("name", tool_id), "formats": tool.get("formats") or {}}
+        for tool_id, tool in APP_CONFIG.get("conversion_tools", {}).items()
+        if isinstance(tool, dict)
+    }
     return templates.TemplateResponse(request, "index.html", {
         "user": user, "is_admin": admin_status,
         "whisper_models": sorted(list(whisper_models)),
         "conversion_tools": conversion_tools, "local_only_mode": LOCAL_ONLY_MODE
     })
 
+# --- Settings page & API ---
+# Secrets are never sent to the browser; submitting an empty value keeps the stored one.
+SECRET_SETTINGS = (("auth_settings", "oidc_client_secret"), ("webhook_settings", "callback_bearer_token"))
+# Editing a command template from the browser decides which programs the server executes, so it
+# is off unless explicitly enabled. Templates can always be changed in config/settings.yml.
+ALLOW_COMMAND_EDITS = _env_flag("ALLOW_COMMAND_EDITS", False)
+
+
+def _leaves(*names: str) -> dict:
+    return {name: None for name in names}
+
+
+# Everything the settings form may change. Other keys (TTS command templates, model paths, ...)
+# can only be edited in settings.yml.
+EDITABLE_SETTINGS = {
+    "app_settings": _leaves("app_public_url", "max_file_size_mb", "allowed_all_extensions",
+                            "model_concurrency", "model_inactivity_timeout", "cache_check_interval"),
+    "ocr_settings": {"ocrmypdf": _leaves("deskew", "clean", "force_ocr")},
+    "transcription_settings": {"whisper": _leaves("compute_type")},
+    "auth_settings": _leaves("oidc_client_id", "oidc_client_secret", "oidc_server_metadata_url",
+                             "admin_users", "allowed_users", "allowed_domains"),
+    "webhook_settings": _leaves("enabled", "allow_chunked_api_uploads", "allowed_callback_urls", "callback_bearer_token"),
+    "tts_settings": {"piper": {"use_cuda": None, "synthesis_config": _leaves("length_scale", "noise_scale", "noise_w")}},
+}
+EDITABLE_TOOL_KEYS = {"name", "command_template", "supported_input", "formats"}
+POSITIVE_NUMBER_SETTINGS = (("app_settings", "max_file_size_mb"), ("app_settings", "model_concurrency"),
+                            ("app_settings", "model_inactivity_timeout"), ("app_settings", "cache_check_interval"))
+
+
+def _collapse_whitespace(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _validate_settings_payload(payload: dict) -> List[str]:
+    """Returns a list of problems with a settings update coming from the web UI."""
+    errors: List[str] = []
+
+    def walk(data: dict, schema: dict, path: tuple):
+        for key, value in data.items():
+            key_path = ".".join(path + (key,))
+            if key not in schema:
+                errors.append(f"'{key_path}' cannot be changed from the web UI; edit settings.yml instead.")
+                continue
+            sub_schema = schema[key]
+            if sub_schema is None:
+                continue
+            if not isinstance(value, dict):
+                errors.append(f"'{key_path}' must be an object.")
+                continue
+            walk(value, sub_schema, path + (key,))
+
+    walk({k: v for k, v in payload.items() if k != "conversion_tools"}, EDITABLE_SETTINGS, ())
+
+    for section, key in POSITIVE_NUMBER_SETTINGS:
+        section_data = payload.get(section)
+        if isinstance(section_data, dict) and key in section_data:
+            try:
+                valid = float(section_data[key]) > 0
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                errors.append(f"'{section}.{key}' must be a positive number.")
+
+    tools = payload.get("conversion_tools")
+    if tools is None:
+        return errors
+    if not isinstance(tools, dict):
+        errors.append("'conversion_tools' must be an object.")
+        return errors
+    current_tools = APP_CONFIG.get("conversion_tools", {})
+    for tool_id, tool in tools.items():
+        if not isinstance(tool, dict):
+            errors.append(f"'conversion_tools.{tool_id}' must be an object.")
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,64}", str(tool_id)):
+            errors.append(f"Invalid tool id '{tool_id}' (letters, digits and underscores only).")
+            continue
+        for key in sorted(set(tool) - EDITABLE_TOOL_KEYS):
+            errors.append(f"'conversion_tools.{tool_id}.{key}' cannot be changed from the web UI; edit settings.yml instead.")
+        current = current_tools.get(tool_id)
+        if current is None and not ALLOW_COMMAND_EDITS:
+            errors.append(f"Adding conversion tools ('{tool_id}') from the web UI is disabled. "
+                          "Edit config/settings.yml or set ALLOW_COMMAND_EDITS=true.")
+            continue
+        if "command_template" not in tool:
+            if current is None:
+                errors.append(f"New tool '{tool_id}' needs a command_template.")
+            continue
+        template = tool["command_template"]
+        unchanged = current is not None and _collapse_whitespace(template) == _collapse_whitespace(current.get("command_template"))
+        if not isinstance(template, str) or not template.strip():
+            errors.append(f"'conversion_tools.{tool_id}.command_template' must be a non-empty string.")
+        elif unchanged:
+            continue  # the form always submits every template; only changes are checked
+        elif not ALLOW_COMMAND_EDITS:
+            errors.append(f"Changing the command of '{tool_id}' from the web UI is disabled. "
+                          "Edit config/settings.yml or set ALLOW_COMMAND_EDITS=true.")
+        else:
+            try:
+                validate_and_build_command(template, {})
+            except ValueError as e:
+                errors.append(f"Invalid command template for '{tool_id}': {e}")
+    return errors
+
+
+def _drop_blank_secrets(payload: dict) -> None:
+    for section, key in SECRET_SETTINGS:
+        section_data = payload.get(section)
+        if isinstance(section_data, dict) and key in section_data:
+            value = section_data[key]
+            if value is None or (isinstance(value, str) and not value.strip()):
+                del section_data[key]
+
+
 @app.get("/settings")
 async def get_settings_page(request: Request):
-    """Displays the contents of the currently active configuration."""
+    """Settings page: configuration for admins, history management for every user."""
     user = get_current_user(request)
+    if not user:
+        return RedirectResponse(url="/", status_code=302)
     admin_status = is_admin(request)
+    context = {"config": {}, "config_source": "", "secrets_set": {}, "user": user, "is_admin": admin_status,
+               "local_only_mode": LOCAL_ONLY_MODE, "allow_command_edits": ALLOW_COMMAND_EDITS}
+    if not admin_status:
+        return templates.TemplateResponse(request, "settings.html", context)
 
-    # Use the globally loaded and merged APP_CONFIG for consistency
-    # Ensure all required keys exist for template rendering
-    current_config = APP_CONFIG.copy()
-    
+    # Deep copy: the normalization below must not mutate the live configuration.
+    current_config = copy.deepcopy(APP_CONFIG)
+    secrets_set = {}
+    for section, key in SECRET_SETTINGS:
+        section_data = current_config.setdefault(section, {})
+        secrets_set[key] = bool(section_data.get(key))
+        section_data[key] = ""
+
     # Ensure all required nested dictionaries exist
-    if "app_settings" not in current_config:
-        current_config["app_settings"] = {}
-    if "transcription_settings" not in current_config:
-        current_config["transcription_settings"] = {"whisper": {}}
-    if "tts_settings" not in current_config:
-        current_config["tts_settings"] = {"piper": {"synthesis_config": {}}}
-    if "conversion_tools" not in current_config:
-        current_config["conversion_tools"] = {}
-    if "ocr_settings" not in current_config:
-        current_config["ocr_settings"] = {"ocrmypdf": {}}
-    if "auth_settings" not in current_config:
-        current_config["auth_settings"] = {}
-    if "webhook_settings" not in current_config:
-        current_config["webhook_settings"] = {}
+    current_config.setdefault("app_settings", {})
+    current_config.setdefault("transcription_settings", {}).setdefault("whisper", {})
+    current_config.setdefault("tts_settings", {}).setdefault("piper", {}).setdefault("synthesis_config", {})
+    current_config.setdefault("conversion_tools", {})
+    current_config.setdefault("ocr_settings", {}).setdefault("ocrmypdf", {})
 
     # Fix potential format issues in conversion tools - ensure 'formats' is always a dict
     for tool_id, tool_config in current_config.get("conversion_tools", {}).items():
@@ -3415,10 +3684,10 @@ async def get_settings_page(request: Request):
                         value = parts[1].strip() if len(parts) > 1 else ""
                         if key:  # Only add if key is not empty
                             formats_dict[key] = value
-                current_config["conversion_tools"][tool_id]["formats"] = formats_dict
+                tool_config["formats"] = formats_dict
             elif not isinstance(formats_data, dict):
                 # If it's neither list nor dict, set to empty dict
-                current_config["conversion_tools"][tool_id]["formats"] = {}
+                tool_config["formats"] = {}
 
     # Determine the source file for display purposes
     config_source = "none"
@@ -3427,21 +3696,8 @@ async def get_settings_page(request: Request):
     elif PATHS.DEFAULT_SETTINGS_FILE.exists():
         config_source = str(PATHS.DEFAULT_SETTINGS_FILE.name)
 
-    return templates.TemplateResponse(
-        request, "settings.html",
-        {"config": current_config, "config_source": config_source,
-         "user": user, "is_admin": admin_status, "local_only_mode": LOCAL_ONLY_MODE}
-    )
-
-def deep_merge(source: dict, destination: dict) -> dict:
-    """Recursively merges dicts."""
-    for key, value in source.items():
-        if isinstance(value, collections.abc.Mapping):
-            node = destination.setdefault(key, {})
-            deep_merge(value, node)
-        else:
-            destination[key] = value
-    return destination
+    context.update({"config": current_config, "config_source": config_source, "secrets_set": secrets_set})
+    return templates.TemplateResponse(request, "settings.html", context)
 
 def _preprocess_settings_for_saving(config: Dict) -> Dict:
     """
@@ -3503,6 +3759,11 @@ async def save_settings(
 
         # Pre-process the incoming config to fix formatting issues
         processed_config = _preprocess_settings_for_saving(new_config_from_ui)
+        _drop_blank_secrets(processed_config)
+        errors = _validate_settings_payload(processed_config)
+        if errors:
+            logger.warning(f"Rejected settings update from admin '{user.get('email')}': {errors}")
+            raise HTTPException(status_code=400, detail=" ".join(errors[:10]))
 
         try:
             with PATHS.SETTINGS_FILE.open("r", encoding="utf8") as f:
@@ -3510,7 +3771,7 @@ async def save_settings(
         except FileNotFoundError:
             current_config_on_disk = {}
 
-        merged_config = deep_merge(source=processed_config, destination=current_config_on_disk)
+        merged_config = deep_merge(processed_config, current_config_on_disk)
 
         with tmp_path.open("w", encoding="utf8") as f:
             yaml.safe_dump(merged_config, f, default_flow_style=False, sort_keys=False, width=float('inf'))
@@ -3520,6 +3781,8 @@ async def save_settings(
         load_app_config()
         return JSONResponse({"message": "Settings saved successfully."})
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"Failed to update settings for admin '{user.get('email')}'")
         if tmp_path.exists(): tmp_path.unlink()
@@ -3546,13 +3809,13 @@ async def websocket_job_updates(websocket: WebSocket,
             from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
             http_bearer = HTTPBearer()
             creds = HTTPAuthorizationCredentials(credentials=token)
-            user = await require_api_user(request, creds) if not LOCAL_ONLY_MODE else {'sub': 'local_api_user', 'email': 'local@api.user.com', 'name': 'Local API User'}
+            user = await require_api_user(request, creds) if not LOCAL_ONLY_MODE else LOCAL_USER
         except Exception:
             await websocket.close(code=1008, reason="Invalid token")
             return
     elif LOCAL_ONLY_MODE:
         # In local-only mode, always allow with local user
-        user = {'sub': 'local_user', 'email': 'local@user.com', 'name': 'Local User'}
+        user = LOCAL_USER
     else:
         # Get from session for UI users
         user = get_current_user(request) if request else None
@@ -3681,7 +3944,7 @@ async def get_all_jobs(db: Session = Depends(get_db), user: dict = Depends(requi
     return get_jobs(db, user_id=user['sub'])
 
 @app.get("/job/{job_id}", response_model=JobSchema)
-async def get_job_status(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+async def get_job_status(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
     job = get_job(db, job_id)
     if not job or job.user_id != user['sub']:
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -3693,7 +3956,7 @@ class JobStatusRequest(BaseModel):
     job_ids: TypingList[str]
 
 @app.post("/api/v1/jobs/status", response_model=TypingList[JobSchema])
-async def get_jobs_status(payload: JobStatusRequest, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+async def get_jobs_status(payload: JobStatusRequest, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
     """
     Accepts a list of job IDs and returns their current status.
     This is used by the frontend for polling active jobs.
@@ -3708,7 +3971,7 @@ async def get_jobs_status(payload: JobStatusRequest, db: Session = Depends(get_d
 
 
 @app.get("/download/{filename}")
-async def download_file(filename: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+async def download_file(filename: str, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
     file_path = ensure_path_is_safe(PATHS.PROCESSED_DIR / filename, [PATHS.PROCESSED_DIR])
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found.")
@@ -3849,22 +4112,6 @@ async def health():
         logger.exception("Health check failed")
         return JSONResponse({"ok": False}, status_code=500)
     return {"ok": True}
-
-@app.get("/test-websocket-notification")
-async def test_websocket_notification(request: Request, user: dict = Depends(require_user)):
-    """Test endpoint to trigger a WebSocket notification"""
-    fake_job_data = {
-        "id": "test-notification",
-        "user_id": user['sub'],
-        "status": "processing",
-        "progress": 50,
-        "original_filename": "test.txt",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat()
-    }
-    
-    manager.sync_broadcast_job_status_update(user['sub'], fake_job_data)
-    return {"message": "Test notification sent"}
 
 @app.get('/favicon.ico', include_in_schema=False)
 async def favicon():

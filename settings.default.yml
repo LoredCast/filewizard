@@ -6,6 +6,10 @@ auth_settings:
   oidc_end_session_endpoint: https://accounts.example.com/oidc/session/end
   admin_users:
     - user@example.com
+  # Who may log in. Leave both empty to allow every account your identity provider accepts.
+  # Admins are always allowed. Emails the provider marks as unverified never match.
+  allowed_users: []
+  allowed_domains: []
 webhook_settings:
   enabled: False
   allow_chunked_api_uploads: False
