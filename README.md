@@ -2,7 +2,7 @@
 
 [![PayPal](https://img.shields.io/badge/PayPal-Donate-blue?logo=paypal&logoColor=white)](https://www.paypal.me/unterrikermanu)
 [![Docker Pulls](https://img.shields.io/docker/pulls/loredcast/filewizard.svg)](https://hub.docker.com/r/loredcast/filewizard)
-[![Docker Image Version](https://img.shields.io/docker/v/loredcast/filewizard/0.4-latest.svg)](https://hub.docker.com/r/loredcast/filewizard)
+[![Docker Image Version](https://img.shields.io/docker/v/loredcast/filewizard?sort=semver)](https://hub.docker.com/r/loredcast/filewizard)
 
 A self-hosted, browser-based utility for file conversion, OCR and audio transcription. It wraps common CLI and Python converters (FFmpeg, LibreOffice, Pandoc, ImageMagick, etc.), plus `faster-whisper` and Tesseract OCR.
 
@@ -18,7 +18,9 @@ A self-hosted, browser-based utility for file conversion, OCR and audio transcri
 - Simple, responsive dark UI with drag-and-drop and file picker.
 - Background job processing with real-time status updates and persistent history.
 - `/settings` page for configuring conversion tools and OAuth (runs without auth in local mode).
-- CPU-only by default; a `-cuda` image is available for GPU use.
+- OCR in many languages, selectable per job.
+- Delete selected jobs, or remove finished jobs automatically after a number of days.
+- CPU-only by default; a `cuda` image is available for GPU transcription. Images for amd64 and arm64.
 
 ## Security
 **Warning:** in `LOCAL_ONLY` mode there is no login: everyone who can reach the port can use the app and change its settings. Keep it on a trusted network or enable OIDC authentication (`LOCAL_ONLY=False`). The converters process untrusted files, so run the container with only the volumes it needs.
@@ -46,110 +48,30 @@ FastAPI, vanilla HTML/JS/CSS frontend.
 
 ## Installation
 ### Recommended — Docker (pull from Docker Hub)
-Images available:
-- `loredcast/filewizard:latest` (newest full release without cuda)
-- `loredcast/filewizard:0.3-small` (omits TeX and other large tools)
-- `loredcast/filewizard:0.3-cuda` (CUDA-enabled)
+Images (linux/amd64 and linux/arm64, e.g. Raspberry Pi 4/5 and Apple Silicon):
+- `loredcast/filewizard:latest` — all tools
+- `loredcast/filewizard:small` — without TeX, Inkscape and Docling
+- `loredcast/filewizard:cuda` — transcription on NVIDIA GPUs (amd64 only)
 
-```
-# docker-compose.yml
-version: "3.9"
-services:
-  web:
-    image: loredcast/filewizard:latest
-    environment:
-      - LOCAL_ONLY=True # False for Auth
-      - SECRET_KEY= # set if using auth
-      - UPLOADS_DIR=/app/uploads # inside the container
-      - PROCESSED_DIR=/app/processed # inside the container
-      - OMP_NUM_THREADS=1
-      - DOWNLOAD_KOKORO_ON_STARTUP=true
-    ports:
-      - "6969:8000"
-    volumes:
-      - ./config:/app/config # settings.yml will be here
-      - ./uploads_data:/app/uploads
-      - ./processed_data:/app/processed
-volumes:
-  uploads_data: {}
-  processed_data: {}
-```
-
-
-Copy `docker-compose.yml` from the repo or the above, adjust as needed, then:
+Copy [`docker-compose.yml`](docker-compose.yml) from the repo, adjust as needed, then:
 
 ```bash
 docker compose up -d
 ```
-FileWizard will be available at `localhost:6969`
+FileWizard will be available at `localhost:6969`. The app runs as an unprivileged user; set `PUID`/`PGID` to the owner of the mounted folders (Unraid: 99/100, templates in [`unraid/`](unraid)).
 
-### Build locally with Docker (new build types)
-
-For different build configurations, use the BUILD_TYPE argument:
-
-```bash
-# Full build (includes all dependencies but no CUDA)
-docker build --build-arg BUILD_TYPE=full -t filewizard:full .
-
-# Small build (excludes TeX and markitdown dependencies for smaller image)
-docker build --build-arg BUILD_TYPE=small -t filewizard:small .
-
-# CUDA build (includes CUDA support for GPU acceleration)
-docker build --build-arg BUILD_TYPE=cuda -t filewizard:cuda .
-```
-
-Or with docker-compose:
-
-```bash
-# For full build
-docker compose build --build-arg BUILD_TYPE=full
-
-# For small build
-docker compose build --build-arg BUILD_TYPE=small
-
-# For CUDA build
-docker compose build --build-arg BUILD_TYPE=cuda
-```
-
-For CUDA builds, ensure you have:
-- NVIDIA Docker runtime installed (`nvidia-docker2` package)
-- Compatible GPU with appropriate drivers
-- Add the GPU configuration to docker-compose.yml if building with compose:
-```yaml
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-```
-
-For troubleshooting GPU issues, make sure:
-1. Your GPU drivers support the CUDA version (12.1)
-2. cuDNN libraries are properly installed in the container
-3. The `nvidia-container-toolkit` is properly configured
-4. Test NVIDIA setup with: `docker run --rm --gpus all nvidia/cuda:12.1-base-ubuntu22.04 nvidia-smi`
-
-```bash
-git clone https://github.com/LoredCast/filewizard.git
-cd filewizard
-docker compose up --build
-```
-Note: building can be slow (TeX and other dependencies).
+Building the image yourself, GPU setup, publishing to Docker Hub and how the builds are kept reproducible are described in [docs/docker.md](docs/docker.md).
 
 ### Manual (no Docker)
+Needs Python 3.12 and the converters you want to use on the `PATH` (LibreOffice, Pandoc, Ghostscript, Tesseract, FFmpeg, ...; see the Dockerfile for the full list).
 ```bash
 git clone https://github.com/LoredCast/filewizard.git
 cd filewizard
-python -m venv venv
-source venv/bin/activate   # Windows: venv\\Scripts\\activate
-pip install -r requirements.txt
-chmod +x run.sh
+python3 -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -r requirements.txt   # or requirements_small.txt
 ./run.sh
 ```
-
-Dependencies include `fastapi`, `uvicorn`, `sqlalchemy`, `huey`, `faster-whisper`, `ocrmypdf`, `pytesseract`, `python-multipart`, `pyyaml`, etc.
 
 ## Configuration & docs
 See the project Wiki for details and examples:  

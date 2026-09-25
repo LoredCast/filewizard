@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>FileWizard-CUDA</Name>
+  <Repository>loredcast/filewizard:cuda</Repository>
+  <Registry>https://hub.docker.com/r/loredcast/filewizard</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/LoredCast/filewizard/issues</Support>
+  <Project>https://github.com/LoredCast/filewizard</Project>
+  <Overview>Self-hosted file conversion (LibreOffice, Pandoc, FFmpeg, Calibre, ImageMagick-style tools), OCR in many languages, audio transcription with Whisper and text-to-speech, in the browser. This image transcribes on an NVIDIA GPU; it needs the Nvidia Driver plugin.</Overview>
+  <Category>Productivity: Tools:</Category>
+  <WebUI>http://[IP]:[PORT:8000]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/LoredCast/filewizard/main/unraid/filewizard-cuda.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/LoredCast/filewizard/main/static/favicon.png</Icon>
+  <ExtraParams>--runtime=nvidia</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <Requires/>
+  <Config Name="WebUI Port" Target="8000" Default="6969" Mode="tcp" Description="Port of the web interface." Type="Port" Display="always" Required="true" Mask="false">6969</Config>
+  <Config Name="Config" Target="/app/config" Default="/mnt/user/appdata/filewizard/config" Mode="rw" Description="settings.yml and the generated session key." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/filewizard/config</Config>
+  <Config Name="Data" Target="/app/data" Default="/mnt/user/appdata/filewizard/data" Mode="rw" Description="Job history database." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/filewizard/data</Config>
+  <Config Name="Models" Target="/app/models" Default="/mnt/user/appdata/filewizard/models" Mode="rw" Description="Downloaded Whisper and text-to-speech models." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/filewizard/models</Config>
+  <Config Name="Uploads" Target="/app/uploads" Default="/mnt/user/appdata/filewizard/uploads" Mode="rw" Description="Temporary storage for uploaded files." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/filewizard/uploads</Config>
+  <Config Name="Processed Files" Target="/app/processed" Default="/mnt/user/appdata/filewizard/processed" Mode="rw" Description="Conversion results." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/filewizard/processed</Config>
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User ID the app runs as (owns the folders above)." Type="Variable" Display="advanced" Required="true" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID the app runs as." Type="Variable" Display="advanced" Required="true" Mask="false">100</Config>
+  <Config Name="LOCAL_ONLY" Target="LOCAL_ONLY" Default="True" Mode="" Description="True: no login (keep it on a trusted network). False: login through your OIDC provider, configured in settings.yml." Type="Variable" Display="always" Required="true" Mask="false">True</Config>
+  <Config Name="SECRET_KEY" Target="SECRET_KEY" Default="" Mode="" Description="Optional session signing key; generated and stored in the config folder when empty." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+  <Config Name="Download Kokoro TTS models" Target="DOWNLOAD_KOKORO_ON_STARTUP" Default="true" Mode="" Description="Download the Kokoro text-to-speech models (about 350 MB) on first start." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+  <Config Name="NVIDIA_VISIBLE_DEVICES" Target="NVIDIA_VISIBLE_DEVICES" Default="all" Mode="" Description="GPU(s) to use: all, or a GPU UUID from the Nvidia Driver plugin page." Type="Variable" Display="always" Required="true" Mask="false">all</Config>
+</Container>
