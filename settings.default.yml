@@ -776,6 +776,19 @@ conversion_tools:
       - .svgz
     formats:
       png: PNG from SVG
+  rsvg:
+    name: librsvg (rsvg-convert)
+    command_template: rsvg-convert --format {output_ext} --output {output} {input}
+    timeout: 60
+    supported_input:
+      - .svg
+      - .svgz
+    formats:
+      png: PNG Image
+      pdf: PDF Document
+      ps: PostScript
+      eps: Encapsulated PostScript
+      svg: SVG (Plain)
   potrace:
     name: Potrace
     command_template: potrace {input} --svg -o {output}

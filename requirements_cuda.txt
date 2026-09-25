@@ -1,47 +1,5 @@
-# Web Framework & Server
-fastapi
-gunicorn
-uvicorn[standard]
-Jinja2
-
-# Database & Task Queue
-SQLAlchemy
-huey
-
-# OCR & Transcription Features
-ctranslate2[cuda]
-faster-whisper
-ocrmypdf
-pytesseract
-pypdf
-piper-tts
-kokoro-tts
-opencv-python-headless
-marker-pdf[full]
-Pillow
-docling
-
-# Configuration & Utilities
-werkzeug
-itsdangerous
-authlib
-dotenv
-httpx
-python-dotenv
-PyYAML
-pydantic
-pydantic-settings
-python-multipart
-markitdown[pdf,docx,pptx,xlsx,outlook]==0.1.3
-#unstructured[all-docs]
-PyPDF2==3.0.1
-mechanize
-html5_parser
-css_parser
-#PyQt6==6.9.1 # uncomment for calibre, it uses the webengine
-#PyQt6-Qt6==6.9.2
-#PyQt6-WebEngine==6.9.0
-#PyQt6-WebEngine-Qt6==6.9.2
-
-# Security libraries
-bleach
+# CUDA image: everything from the full image plus the CUDA 12 cuBLAS runtime that
+# faster-whisper (CTranslate2) loads for GPU transcription. The GPU driver itself is
+# provided by the NVIDIA container runtime. Docling uses the CPU build of PyTorch.
+-r requirements.txt
+nvidia-cublas-cu12

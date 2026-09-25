@@ -11,8 +11,6 @@ import yaml
 import os
 import httpx
 import glob
-import cv2
-import numpy as np
 import secrets
 import hashlib
 from contextlib import asynccontextmanager
@@ -344,13 +342,15 @@ def _compute_child_rlimits() -> list:
     """
     Limits for converter processes, computed once in the parent and clamped to the
     current hard limits (raising a hard limit fails without privileges).
-    CHILD_CPU_LIMIT_SECONDS (default 6000) and CHILD_MEMORY_LIMIT_MB (default 4096,
-    0 = no limit; tools embedding Chromium/QtWebEngine may need more address space).
+    CHILD_CPU_LIMIT_SECONDS (default 6000) and CHILD_MEMORY_LIMIT_MB (default 4096, 0 = no limit).
+    The memory limit is RLIMIT_DATA (memory a process can actually write to), not RLIMIT_AS:
+    Chromium-based tools such as Calibre's PDF output reserve far more address space than
+    they use and fail under an address-space limit.
     """
     wanted = [(resource.RLIMIT_CPU, int(os.environ.get("CHILD_CPU_LIMIT_SECONDS", "6000")))]
     memory_mb = int(os.environ.get("CHILD_MEMORY_LIMIT_MB", "4096"))
     if memory_mb > 0:
-        wanted.append((resource.RLIMIT_AS, memory_mb * 1024 * 1024))
+        wanted.append((resource.RLIMIT_DATA, memory_mb * 1024 * 1024))
     limits = []
     for res, value in wanted:
         if value <= 0:
@@ -3048,7 +3048,8 @@ if CORS_ALLOWED_ORIGINS:
 # Optional Host header allowlist (protects LOCAL_ONLY instances against DNS rebinding).
 ALLOWED_HOSTS = _env_list('ALLOWED_HOSTS')
 if ALLOWED_HOSTS:
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+    # Loopback names stay allowed for health checks; a rebinding attack arrives with its own host name.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS + ["localhost", "127.0.0.1", "::1"])
 
 # --- CSRF protection & security headers ---
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
@@ -4573,7 +4574,8 @@ async def health():
     except Exception:
         logger.exception("Health check failed")
         return JSONResponse({"ok": False}, status_code=500)
-    return {"ok": True}
+    return {"ok": True, "version": os.environ.get("FILEWIZARD_VERSION", "dev"),
+            "variant": os.environ.get("FILEWIZARD_VARIANT", "")}
 
 @app.get('/favicon.ico', include_in_schema=False)
 async def favicon():
