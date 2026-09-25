@@ -62,7 +62,7 @@ FileWizard will be available at `localhost:6969`. The app runs as an unprivilege
 
 Building the image yourself, GPU setup, publishing to Docker Hub and how the builds are kept reproducible are described in [docs/docker.md](docs/docker.md).
 
-**Upgrading from 0.4:** `docker compose pull && docker compose up -d` works with your existing setup. Read [the upgrade notes](docs/docker.md#upgrading-from-04) first: the app no longer runs as root, and you can keep your job history.
+**Upgrading from 0.4:** `docker compose pull && docker compose up -d` works with your existing setup. Read [the upgrade notes](docs/docker.md#upgrading-from-04) first: the app no longer runs as root, and you can keep your job history. What's new: [CHANGELOG.md](CHANGELOG.md).
 
 ### Manual (no Docker)
 Needs Python 3.12 and the converters you want to use on the `PATH` (LibreOffice, Pandoc, Ghostscript, Tesseract, FFmpeg, ...; see the Dockerfile for the full list).
