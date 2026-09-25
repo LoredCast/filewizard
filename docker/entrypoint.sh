@@ -20,10 +20,18 @@ if [ "$(id -u)" = "0" ]; then
     fi
     for dir in ${writable_dirs}; do
         mkdir -p "${dir}"
-        # Only walk the tree when the owner differs (e.g. volumes written by older, root-run images).
-        if [ "$(stat -c '%u:%g' "${dir}")" != "${PUID}:${PGID}" ]; then
+        # Only walk the tree when the folder or an entry directly in it has another owner
+        # (e.g. volumes written by older, root-run images, or files copied in as root).
+        if [ -n "$(find "${dir}" -maxdepth 1 \( ! -user "${PUID}" -o ! -group "${PGID}" \) -print -quit)" ]; then
             echo "Setting owner of ${dir} to ${PUID}:${PGID}"
-            chown -R "${PUID}:${PGID}" "${dir}"
+            # Some storage (e.g. NFS/SMB shares) refuses ownership changes; that is fine as long
+            # as the folder is writable anyway, which is checked below.
+            chown -R "${PUID}:${PGID}" "${dir}" 2>/dev/null \
+                || echo "Warning: could not change the owner of ${dir}."
+        fi
+        if ! setpriv --reuid="${PUID}" --regid="${PGID}" --init-groups -- test -w "${dir}"; then
+            echo "Error: ${dir} is not writable for user ${PUID}:${PGID}. Set PUID/PGID to the owner of the mounted folder, or make it writable for that user." >&2
+            exit 1
         fi
     done
     # The container's stdout/stderr pipes belong to root; hand them over (as `docker run --user`

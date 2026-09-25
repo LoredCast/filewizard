@@ -1,7 +1,7 @@
 # Builds the FileWizard images and publishes them to Docker Hub.
 #
 # - Pushing a version tag (git tag v0.5.0 && git push origin v0.5.0) publishes
-#     full:  0.5.0  0.5  latest
+#     full:  0.5.0  0.5  0.5-latest  latest
 #     small: 0.5.0-small  0.5-small  small
 #     cuda:  0.5.0-cuda   0.5-cuda   cuda  latest-cuda
 #   Pre-release tags (v0.5.0-rc1) only get their version tags.
@@ -145,7 +145,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - { variant: full,  suffix: "",       floating: latest }
+          - { variant: full,  suffix: "",       floating: latest, minor_alias: "-latest" }
           - { variant: small, suffix: "-small", floating: small }
           - { variant: cuda,  suffix: "-cuda",  floating: "cuda,latest-cuda" }
     steps:
@@ -175,6 +175,8 @@ jobs:
               *-*) ;;  # pre-release: version tag only
               *)
                 tags="${tags} ${image}:${version%.*}${suffix}"
+                # X.Y-latest, as published before 0.5 (full image only)
+                if [ -n "${{ matrix.minor_alias }}" ]; then tags="${tags} ${image}:${version%.*}${{ matrix.minor_alias }}"; fi
                 for floating in $(echo "${{ matrix.floating }}" | tr ',' ' '); do tags="${tags} ${image}:${floating}"; done
                 ;;
             esac

@@ -4,7 +4,7 @@
 
 | Variant | Tags | Platforms | Contents |
 |---|---|---|---|
-| full | `latest`, `X.Y.Z`, `X.Y` | linux/amd64, linux/arm64 | All converters incl. TeX (Pandoc → PDF), Inkscape, Docling, Whisper, OCR, TTS |
+| full | `latest`, `X.Y.Z`, `X.Y`, `X.Y-latest` | linux/amd64, linux/arm64 | All converters incl. TeX (Pandoc → PDF), Inkscape, Docling, Whisper, OCR, TTS |
 | small | `small`, `X.Y.Z-small`, `X.Y-small` | linux/amd64, linux/arm64 | Without TeX, Inkscape and Docling |
 | cuda | `cuda`, `latest-cuda`, `X.Y.Z-cuda`, `X.Y-cuda` | linux/amd64 | Full image that transcribes on an NVIDIA GPU |
 
@@ -24,19 +24,35 @@ Use [`docker-compose.yml`](../docker-compose.yml) as a starting point:
 
 The app runs as an unprivileged user. `PUID`/`PGID` (default `1000`/`1000`, Unraid: `99`/`100`) choose its user and group; on start the container gives that user ownership of the mounted folders. You can also start the container with `--user UID:GID`, in which case the folders must already be writable for that user.
 
-Coming from an image older than 0.5: folders written by the old root-run container are handed to `PUID`/`PGID` automatically on the first start. The job history used to live inside the container and was lost on updates; mount `/app/data` to keep it.
-
 ### NVIDIA GPU (`cuda` image)
 
 Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) and give the container the GPU (see the `deploy` section in `docker-compose.yml`, or `--gpus all`). The image uses the GPU for transcription when one is available and falls back to the CPU otherwise (`TRANSCRIPTION_DEVICE=auto`). It ships the CUDA 12 libraries it needs, so any driver with CUDA 12 support (version 525 or newer) works. Check the GPU is visible:
 
 ```bash
-docker exec filewizard python -c "import ctranslate2; print(ctranslate2.get_cuda_device_count())"
+docker compose exec web python -c "import ctranslate2; print(ctranslate2.get_cuda_device_count())"
 ```
 
 ### Unraid
 
 Templates are in [`unraid/`](../unraid): `filewizard.xml` and `filewizard-cuda.xml` (needs the Nvidia Driver plugin).
+
+## Upgrading from 0.4
+
+Your existing `docker-compose.yml`, `settings.yml` and mounted folders keep working; `docker compose pull && docker compose up -d` is enough. Things to know:
+
+- **Folder ownership:** 0.4 ran as root. On the first start, 0.5 hands the mounted folders to `PUID`/`PGID` (default `1000:1000`). Set them to the user that should own the files on the host (Unraid: `99`/`100`). On storage that refuses ownership changes (some NFS/SMB shares) the log shows a warning; the folders then have to be writable for that user, otherwise the container stops with an error naming the folder.
+- **Job history:** 0.4 kept it inside the container, so every update lost it. Add the `/app/data` volume (and `/app/models`, so downloaded models survive updates too). To carry the current history over, copy it out of the old container *before* updating:
+  ```bash
+  mkdir -p data && docker compose cp web:/app/jobs.db ./data/jobs.db   # "web": the service name in docker-compose.yml
+  ```
+  Then add `- ./data:/app/data` and `- ./models:/app/models` under `volumes:` and update. Result files in the processed folder are kept either way.
+- **Settings:** `settings.yml` is used as is; new options take their defaults. Customised conversion commands keep working but are read-only on the settings page (edit the file, or set `ALLOW_COMMAND_EDITS=true`).
+- **Reverse proxy:** 0.5 rejects state-changing requests from other origins. If uploads fail with *403* behind a proxy, forward the original `Host` header, or set `app_public_url` in the settings or `CSRF_TRUSTED_ORIGINS`.
+- **Login (OIDC):** `SECRET_KEY` is optional now (generated and stored in `config/.secret_key`). `allowed_users`/`allowed_domains` in `auth_settings` restrict who may log in; an account whose e-mail the provider marks as unverified (`email_verified: false`) is not treated as an admin.
+- **Image tags:** `latest` (full) and `small` keep their meaning; if you pinned `0.4-latest`, switch to `0.5-latest` or `0.5`. The GPU image is `cuda` (was `0.3-cuda`). The old build targets (`full-final`, `small-final`) are gone: remove the `build:` section, or build with the `VARIANT` argument (see *Building locally*).
+- **Converter versions:** the image is based on Ubuntu 24.04 LTS instead of Debian 13, so some converters are older releases (e.g. LibreOffice 24.2, Pandoc 3.1.3, Tesseract 5.3).
+
+Going back: set the image to `loredcast/filewizard:0.4-latest`. 0.4 can still read the files and settings written by 0.5.
 
 ## Building locally
 
@@ -82,7 +98,7 @@ git tag v0.5.0
 git push origin v0.5.0
 ```
 
-The workflow publishes `0.5.0`, `0.5`, `latest`, the `-small` and `-cuda` equivalents, `small`, `cuda` and `latest-cuda`. A pre-release tag such as `v0.5.0-rc1` only gets its version tags. Progress is visible in the *Actions* tab; afterwards check the result with `docker buildx imagetools inspect loredcast/filewizard:0.5.0`. *Run workflow* on the Actions page builds (and optionally publishes as `edge`) without a tag. Pull requests that change the image build and smoke-test the small image.
+The workflow publishes `0.5.0`, `0.5`, `0.5-latest`, `latest`, the `-small` and `-cuda` equivalents, `small`, `cuda` and `latest-cuda`. A pre-release tag such as `v0.5.0-rc1` only gets its version tags. Progress is visible in the *Actions* tab; afterwards check the result with `docker buildx imagetools inspect loredcast/filewizard:0.5.0`. *Run workflow* on the Actions page builds (and optionally publishes as `edge`) without a tag. Pull requests that change the image build and smoke-test the small image.
 
 ### Manually
 
@@ -136,6 +152,6 @@ tar -xOf build-1.tar index.json; echo; tar -xOf build-2.tar index.json
 
 ## Troubleshooting
 
-- **Permission denied on a mounted folder:** set `PUID`/`PGID` to the owner of the folder on the host, or fix the ownership.
+- **The container exits with "… is not writable for user …"** (or permission errors in the log): set `PUID`/`PGID` to the owner of the folder on the host, or fix the ownership.
 - **A converter runs out of memory:** converter processes are limited to 4 GB of memory each; raise `CHILD_MEMORY_LIMIT_MB` (`0` = no limit).
 - **Behind a reverse proxy, uploads fail with 403:** forward the original `Host` header, or set `app_public_url` in the settings or `CSRF_TRUSTED_ORIGINS`.

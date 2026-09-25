@@ -62,6 +62,8 @@ FileWizard will be available at `localhost:6969`. The app runs as an unprivilege
 
 Building the image yourself, GPU setup, publishing to Docker Hub and how the builds are kept reproducible are described in [docs/docker.md](docs/docker.md).
 
+**Upgrading from 0.4:** `docker compose pull && docker compose up -d` works with your existing setup. Read [the upgrade notes](docs/docker.md#upgrading-from-04) first: the app no longer runs as root, and you can keep your job history.
+
 ### Manual (no Docker)
 Needs Python 3.12 and the converters you want to use on the `PATH` (LibreOffice, Pandoc, Ghostscript, Tesseract, FFmpeg, ...; see the Dockerfile for the full list).
 ```bash
@@ -72,6 +74,7 @@ source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt   # or requirements_small.txt
 ./run.sh
 ```
+To update: `git pull`, run the `pip install` line again and restart; settings and job history are kept.
 
 ## Configuration & docs
 See the project Wiki for details and examples:  

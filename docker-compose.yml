@@ -1,5 +1,5 @@
 services:
-  filewizard:
+  web: # keep this name when updating an existing setup; renaming it leaves the old container running
     image: loredcast/filewizard:latest # or :small, or :cuda for NVIDIA GPUs
     # To build locally instead: docker compose build (VARIANT: full, small or cuda)
     build:
