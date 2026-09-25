@@ -82,9 +82,55 @@ docker buildx build --secret id=build_ca,src=/path/to/proxy-ca.crt -t filewizard
 
 ## Publishing to Docker Hub
 
-### Automatically (recommended)
+Release either from your own machine with [`scripts/docker-release.sh`](../scripts/docker-release.sh) or with the GitHub workflow. Both publish the same tags; use one of them per release.
 
-The workflow [`.github/workflows/docker-publish.yml`](../.github/workflows/docker-publish.yml) builds every variant on native amd64 and arm64 GitHub runners and publishes the multi-arch tags.
+### From your machine
+
+You need Docker with buildx (Docker Desktop, or Docker Engine with the buildx plugin), push access to the Docker Hub repository and around 40 GB of free disk space for the build cache (`docker buildx prune --builder filewizard` frees it afterwards). The script builds for amd64 and arm64. Docker Desktop can build the other architecture out of the box; on a Linux amd64 machine, install QEMU emulation first (again after a reboot):
+
+```bash
+docker run --privileged --rm tonistiigi/binfmt --install arm64
+```
+
+Building under emulation is slow: expect one to two hours for the arm64 images.
+
+1. **Log in:** `docker login` (with a Docker Hub access token as password).
+2. **Optional quick check** before the long build, for your own platform only:
+   ```bash
+   docker buildx build --build-arg VARIANT=small -t filewizard:small --load .
+   docker/smoke-test.sh filewizard:small
+   ```
+3. **Build and push test images.** This builds all variants for all platforms and pushes them as `test`, `test-small` and `test-cuda`:
+   ```bash
+   scripts/docker-release.sh test 0.5.0
+   ```
+4. **Try the test images.** Pull first, so no older local copy is used:
+   ```bash
+   for tag in test test-small test-cuda; do
+       docker pull loredcast/filewizard:$tag && docker/smoke-test.sh loredcast/filewizard:$tag
+   done
+   # the arm64 image, emulated:
+   docker pull --platform linux/arm64 loredcast/filewizard:test-small
+   DOCKER_DEFAULT_PLATFORM=linux/arm64 docker/smoke-test.sh loredcast/filewizard:test-small
+   ```
+   Also try them where they will run: point `image:` in your `docker-compose.yml` at `loredcast/filewizard:test` (or on Unraid, the repository field) and `docker compose pull && docker compose up -d`.
+5. **Release:** give the tested images their release tags. Nothing is rebuilt, so the release is exactly what you tested; this takes seconds:
+   ```bash
+   scripts/docker-release.sh promote 0.5.0
+   docker buildx imagetools inspect loredcast/filewizard:0.5.0
+   ```
+   This publishes `0.5.0`, `0.5`, `0.5-latest`, `latest`, `0.5.0-small`, `0.5-small`, `small`, `0.5.0-cuda`, `0.5-cuda`, `cuda` and `latest-cuda`. `scripts/docker-release.sh tags 0.5.0` lists them without publishing.
+6. **Tag the commit and publish the GitHub release** with the notes from [CHANGELOG.md](../CHANGELOG.md):
+   ```bash
+   git tag 0.5.0 && git push origin 0.5.0
+   ```
+   The tag also starts the workflow below. Without the Docker Hub secrets in the repository it only builds and tests the images; with them, it would publish its own build under the same tags.
+
+Settings (environment variables): `IMAGE` (another repository, default `loredcast/filewizard`), `VARIANTS` (default `full small cuda`), `PLATFORMS` (default `linux/amd64,linux/arm64`), `BUILDER` (default `filewizard`, created if missing) and `BUILD_FLAGS` (extra `docker buildx build` flags, e.g. `--no-cache` or `--secret id=build_ca,src=...`). For example, a quick test of the small amd64 image only: `VARIANTS=small PLATFORMS=linux/amd64 scripts/docker-release.sh test 0.5.0`. The `test` tags stay on Docker Hub until the next test build replaces them; delete them on the repository's *Tags* page if you like.
+
+### With GitHub Actions
+
+The workflow [`.github/workflows/docker-publish.yml`](../.github/workflows/docker-publish.yml) builds every variant on native amd64 and arm64 GitHub runners (no emulation, so it is faster), smoke-tests each image and publishes the multi-arch tags.
 
 One-time setup:
 
@@ -94,35 +140,11 @@ One-time setup:
 Releasing a version:
 
 ```bash
-git tag v0.5.0
-git push origin v0.5.0
+git tag 0.5.0
+git push origin 0.5.0
 ```
 
-The workflow publishes `0.5.0`, `0.5`, `0.5-latest`, `latest`, the `-small` and `-cuda` equivalents, `small`, `cuda` and `latest-cuda`. A pre-release tag such as `v0.5.0-rc1` only gets its version tags. Progress is visible in the *Actions* tab; afterwards check the result with `docker buildx imagetools inspect loredcast/filewizard:0.5.0`. *Run workflow* on the Actions page builds (and optionally publishes as `edge`) without a tag. Pull requests that change the image build and smoke-test the small image.
-
-### Manually
-
-Test first: build for your own platform with `--load` and run `docker/smoke-test.sh` on it. Multi-arch builds need a `docker-container` builder, and QEMU when building for the other architecture (slow: expect an hour or more for arm64 on an amd64 machine):
-
-```bash
-docker login
-docker buildx create --name filewizard --driver docker-container --use
-docker run --privileged --rm tonistiigi/binfmt --install arm64   # on amd64 hosts
-
-export VERSION=0.5.0 SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
-for variant in full small cuda; do
-    case $variant in
-        full)  suffix="";       extra="latest";            platforms=linux/amd64,linux/arm64 ;;
-        small) suffix="-small"; extra="small";             platforms=linux/amd64,linux/arm64 ;;
-        cuda)  suffix="-cuda";  extra="cuda latest-cuda";  platforms=linux/amd64 ;;
-    esac
-    tags="-t loredcast/filewizard:${VERSION}${suffix} -t loredcast/filewizard:${VERSION%.*}${suffix}"
-    for t in $extra; do tags="$tags -t loredcast/filewizard:$t"; done
-    docker buildx build --platform "$platforms" \
-        --build-arg VARIANT=$variant --build-arg VERSION=$VERSION --build-arg SOURCE_DATE_EPOCH \
-        --output type=image,push=true,rewrite-timestamp=true $tags .
-done
-```
+`v0.5.0` and `0.5` work as tag names too. The workflow publishes the same tags as `scripts/docker-release.sh promote`; a pre-release tag such as `0.5.0-rc1` only gets its version tags. Progress is visible in the *Actions* tab; afterwards check the result with `docker buildx imagetools inspect loredcast/filewizard:0.5.0`. *Run workflow* on the Actions page builds (and optionally publishes as `edge`, `edge-small` and `edge-cuda`, for testing) without a tag. Pull requests that change the image build and smoke-test the small image.
 
 ## Reproducible builds
 
