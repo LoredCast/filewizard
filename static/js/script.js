@@ -487,49 +487,40 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    function showActionDialog() {
+    // Grouped choices for every configured output format (used when no single input type is known).
+    function allFormatChoices() {
+        const tools = window.APP_CONFIG.conversionTools || {};
+        return Object.keys(tools).map(toolKey => {
+            const tool = tools[toolKey];
+            return {
+                label: tool.name,
+                choices: Object.keys(tool.formats || {}).map(formatKey => ({
+                    value: `${toolKey}_${formatKey}`,
+                    label: `${tool.name} - ${tool.formats[formatKey]}`
+                }))
+            };
+        });
+    }
+
+    async function showActionDialog() {
         dialogFileCount.textContent = stagedFiles.length;
-        
+
+        // Create the widget first, then fill it: a single file only gets the formats its type supports.
+        if (dialogConversionChoices) dialogConversionChoices.destroy();
+        dialogConversionChoices = new Choices(dialogOutputFormatSelect, { searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a format...' });
         if (stagedFiles.length === 1) {
-            // If only one file is staged, update the format dropdown based on that file
-            updateFormatsForFile(stagedFiles[0]).then(() => {
-                // Initialize the dialog choices after updating formats
-                if (dialogConversionChoices) dialogConversionChoices.destroy();
-                dialogConversionChoices = new Choices(dialogOutputFormatSelect, { searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a format...' });
-                if (dialogTtsChoices) dialogTtsChoices.destroy();
-                dialogTtsChoices = new Choices(dialogTtsModelSelect, { searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a voice...' });
-                dialogTtsChoices.setChoices(ttsModelsCache, 'value', 'label', true);
-                dialogInitialView.style.display = 'grid';
-                dialogConvertView.style.display = 'none';
-                dialogTtsView.style.display = 'none';
-                actionDialog.classList.add('visible');
-            });
+            await updateFormatsForFile(stagedFiles[0], [dialogConversionChoices]);
         } else {
-            // If multiple files or no files, use all formats
-            if (dialogConversionChoices) dialogConversionChoices.destroy();
-            dialogConversionChoices = new Choices(dialogOutputFormatSelect, { searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a format...' });
-            // Set all available formats
-            const tools = window.APP_CONFIG.conversionTools || {};
-            const choicesArray = Object.keys(tools).map(toolKey => {
-                const tool = tools[toolKey];
-                return {
-                    label: tool.name,
-                    choices: Object.keys(tool.formats).map(formatKey => ({
-                        value: `${toolKey}_${formatKey}`,
-                        label: `${tool.name} - ${tool.formats[formatKey]}`
-                    }))
-                };
-            });
-            dialogConversionChoices.setChoices(choicesArray, 'value', 'label', true);
-            
-            if (dialogTtsChoices) dialogTtsChoices.destroy();
-            dialogTtsChoices = new Choices(dialogTtsModelSelect, { searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a voice...' });
-            dialogTtsChoices.setChoices(ttsModelsCache, 'value', 'label', true);
-            dialogInitialView.style.display = 'grid';
-            dialogConvertView.style.display = 'none';
-            dialogTtsView.style.display = 'none';
-            actionDialog.classList.add('visible');
+            dialogConversionChoices.setChoices(allFormatChoices(), 'value', 'label', true);
         }
+
+        if (dialogTtsChoices) dialogTtsChoices.destroy();
+        dialogTtsChoices = new Choices(dialogTtsModelSelect, { searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a voice...' });
+        dialogTtsChoices.setChoices(ttsModelsCache, 'value', 'label', true);
+        dialogInitialView.style.display = 'grid';
+        dialogConvertView.style.display = 'none';
+        dialogTtsView.style.display = 'none';
+        actionDialog.classList.add('visible');
     }
 
     function closeActionDialog() {
@@ -591,19 +582,7 @@ document.addEventListener('DOMContentLoaded', () => {
 function initializeSelectors() {
     if (conversionChoices) conversionChoices.destroy();
     conversionChoices = new Choices(mainOutputFormatSelect, { searchEnabled: true, itemSelectText: 'Select', shouldSort: false, placeholder: true, placeholderValue: 'Select a format...' });
-    const tools = window.APP_CONFIG.conversionTools || {};
-    const choicesArray = Object.keys(tools).map(toolKey => {
-        const tool = tools[toolKey];
-        return {
-            label: tool.name,
-            choices: Object.keys(tool.formats).map(formatKey => ({
-                value: `${toolKey}_${formatKey}`,
-                // --- THIS IS THE MODIFIED LINE ---
-                label: `${tool.name} - ${tool.formats[formatKey]}`
-            }))
-        };
-    });
-    conversionChoices.setChoices(choicesArray, 'value', 'label', true);
+    conversionChoices.setChoices(allFormatChoices(), 'value', 'label', true);
 
     if (transcriptionChoices) transcriptionChoices.destroy();
     transcriptionChoices = new Choices(mainModelSizeSelect, { searchEnabled: false, shouldSort: false, itemSelectText: '' });
@@ -617,78 +596,48 @@ function initializeSelectors() {
         return '.' + filename.split('.').pop().toLowerCase();
     }
 
-    async function updateFormatsForFile(file) {
+    // Restricts the given Choices widgets to the output formats available for the file's extension.
+    async function updateFormatsForFile(file, targets) {
         if (!file) return;
-        
+
         const fileExtension = getFileExtension(file.name);
+        if (fileExtension === '.zip') {
+            // ZIP uploads are processed file by file, so every output format applies.
+            for (const choices of targets) {
+                if (!choices) continue;
+                choices.clearStore();
+                choices.setChoices(allFormatChoices(), 'value', 'label', true);
+            }
+            return;
+        }
         try {
             const response = await authFetch(`/api/v1/supported-formats/${encodeURIComponent(fileExtension)}`);
             if (!response.ok) {
                 console.error(`Failed to fetch supported formats for ${fileExtension}:`, response.status);
                 return;
             }
-            
+
             const data = await response.json();
             const formats = data.formats || [];
-            
-            // Update main output format select
-            if (conversionChoices) {
-                // Clear existing choices
-                conversionChoices.clearStore();
-                
-                // Group formats by tool name for better UI
-                const groupedFormats = formats.reduce((acc, format) => {
-                    if (!acc[format.tool]) {
-                        acc[format.tool] = {
-                            label: window.APP_CONFIG.conversionTools[format.tool]?.name || format.tool,
-                            choices: []
-                        };
-                    }
-                    acc[format.tool].choices.push({
-                        value: format.value,
-                        label: format.label
-                    });
-                    return acc;
-                }, {});
-                
-                // Convert grouped formats to choices array
-                const choicesArray = Object.keys(groupedFormats).map(toolKey => ({
-                    label: groupedFormats[toolKey].label,
-                    choices: groupedFormats[toolKey].choices
-                }));
-                
-                conversionChoices.setChoices(choicesArray, 'value', 'label', true);
+
+            // Group formats by tool name for better UI
+            const groupedFormats = formats.reduce((acc, format) => {
+                if (!acc[format.tool]) {
+                    acc[format.tool] = {
+                        label: window.APP_CONFIG.conversionTools[format.tool]?.name || format.tool,
+                        choices: []
+                    };
+                }
+                acc[format.tool].choices.push({ value: format.value, label: format.label });
+                return acc;
+            }, {});
+            const choicesArray = Object.values(groupedFormats);
+
+            for (const choices of targets) {
+                if (!choices) continue;
+                choices.clearStore();
+                choices.setChoices(choicesArray, 'value', 'label', true);
             }
-            
-            // Update dialog output format select
-            if (dialogConversionChoices) {
-                // Clear existing choices
-                dialogConversionChoices.clearStore();
-                
-                // Group formats by tool name for better UI
-                const dialogGroupedFormats = formats.reduce((acc, format) => {
-                    if (!acc[format.tool]) {
-                        acc[format.tool] = {
-                            label: window.APP_CONFIG.conversionTools[format.tool]?.name || format.tool,
-                            choices: []
-                        };
-                    }
-                    acc[format.tool].choices.push({
-                        value: format.value,
-                        label: format.label
-                    });
-                    return acc;
-                }, {});
-                
-                // Convert grouped formats to choices array
-                const dialogChoicesArray = Object.keys(dialogGroupedFormats).map(toolKey => ({
-                    label: dialogGroupedFormats[toolKey].label,
-                    choices: dialogGroupedFormats[toolKey].choices
-                }));
-                
-                dialogConversionChoices.setChoices(dialogChoicesArray, 'value', 'label', true);
-            }
-            
         } catch (error) {
             console.error(`Error fetching supported formats for ${fileExtension}:`, error);
         }
@@ -701,7 +650,10 @@ function initializeSelectors() {
         
         // Update format dropdowns if exactly one file is selected
         if (numFiles === 1) {
-            updateFormatsForFile(input.files[0]);
+            updateFormatsForFile(input.files[0], [conversionChoices]);
+        } else if (numFiles > 1 && conversionChoices) {
+            conversionChoices.clearStore();
+            conversionChoices.setChoices(allFormatChoices(), 'value', 'label', true);
         } else if (numFiles === 0) {
             // Reset to all formats when no file is selected
             initializeSelectors();

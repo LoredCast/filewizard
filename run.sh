@@ -2,7 +2,10 @@
 
 # Exit immediately if a command exits with a non-zero status.
 set -e
-source .env
+# .env is optional; main.py also reads it via python-dotenv
+if [ -f .env ]; then
+    source .env
+fi
 
 # Set environment variables for the application
 #export LOCAL_ONLY=True
