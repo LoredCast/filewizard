@@ -657,7 +657,7 @@ def load_app_config():
     settings.default.yml, and settings.yml, then applies environment variable
     overrides.
     """
-    global APP_CONFIG, _config_mtimes
+    global APP_CONFIG, UNAVAILABLE_TOOLS, _config_mtimes
     # Recorded before reading, so a write that races with this load triggers another reload.
     _config_mtimes = _settings_mtimes()
 
@@ -730,7 +730,6 @@ def load_app_config():
     app_settings["allowed_all_extensions"] = set(allowed)
     config["app_settings"] = app_settings
 
-    global UNAVAILABLE_TOOLS
     UNAVAILABLE_TOOLS = _compute_unavailable_tools(config.get("conversion_tools", {}) or {})
     if UNAVAILABLE_TOOLS:
         logger.info("Conversion tools hidden because their program is not installed: "
