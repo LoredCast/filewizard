@@ -8,7 +8,7 @@
 | small | `small`, `X.Y.Z-small`, `X.Y-small` | linux/amd64, linux/arm64 | Without TeX, Inkscape and Docling |
 | cuda | `cuda`, `latest-cuda`, `X.Y.Z-cuda`, `X.Y-cuda` | linux/amd64 | Full image that transcribes on an NVIDIA GPU |
 
-`edge`, `edge-small` and `edge-cuda` are test builds from the main branch when published.
+`edge`, `edge-small` and `edge-cuda` are test builds, published only when the workflow is run manually with *push*.
 
 ## Running
 
@@ -28,7 +28,7 @@ Coming from an image older than 0.5: folders written by the old root-run contain
 
 ### NVIDIA GPU (`cuda` image)
 
-Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) and give the container the GPU (see the `deploy` section in `docker-compose.yml`, or `--gpus all`). The image uses the GPU for transcription when one is available and falls back to the CPU otherwise (`TRANSCRIPTION_DEVICE=auto`). It ships the CUDA 12 runtime libraries, so any driver that supports CUDA 12 works. Check the GPU is visible:
+Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) and give the container the GPU (see the `deploy` section in `docker-compose.yml`, or `--gpus all`). The image uses the GPU for transcription when one is available and falls back to the CPU otherwise (`TRANSCRIPTION_DEVICE=auto`). It ships the CUDA 12 libraries it needs, so any driver with CUDA 12 support (version 525 or newer) works. Check the GPU is visible:
 
 ```bash
 docker exec filewizard python -c "import ctranslate2; print(ctranslate2.get_cuda_device_count())"
@@ -58,7 +58,7 @@ docker buildx build --secret id=build_ca,src=/path/to/proxy-ca.crt -t filewizard
 | Build argument | Default | Purpose |
 |---|---|---|
 | `VARIANT` | `full` | `full`, `small` or `cuda` |
-| `TESSERACT_LANGS` | `eng deu fra spa ita por nld pol` | OCR language packs ([Tesseract codes](https://tesseract-ocr.github.io/tessdoc/Data-Files-in-different-versions.html)), or `all` (~700 MB) |
+| `TESSERACT_LANGS` | `eng deu fra spa ita por nld pol` | OCR language packs ([Tesseract codes](https://tesseract-ocr.github.io/tessdoc/Data-Files-in-different-versions.html)), or `all` (several hundred MB) |
 | `UBUNTU_SNAPSHOT` | a fixed date | Ubuntu archive snapshot for amd64 packages; empty uses the current archive |
 | `TORCH_INDEX_URL` | PyTorch CPU index | Where the CPU build of PyTorch (for Docling) comes from |
 | `VERSION` | `dev` | Shown in `/health` and the image label |
@@ -86,7 +86,7 @@ The workflow publishes `0.5.0`, `0.5`, `latest`, the `-small` and `-cuda` equiva
 
 ### Manually
 
-Multi-arch builds need a `docker-container` builder, and QEMU when building for the other architecture (slow: expect an hour or more for arm64 on an amd64 machine):
+Test first: build for your own platform with `--load` and run `docker/smoke-test.sh` on it. Multi-arch builds need a `docker-container` builder, and QEMU when building for the other architecture (slow: expect an hour or more for arm64 on an amd64 machine):
 
 ```bash
 docker login
