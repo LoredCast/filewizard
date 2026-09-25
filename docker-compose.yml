@@ -1,38 +1,35 @@
-version: "3.9"
 services:
-  web:
-    image: loredcast/filewizard:latest
+  filewizard:
+    image: loredcast/filewizard:latest # or :small, or :cuda for NVIDIA GPUs
+    # To build locally instead: docker compose build (VARIANT: full, small or cuda)
     build:
       context: .
-      target: full-final # Change to 'full-final' or 'small-final' as needed
-    #env_file:
-    # - .env
+      args:
+        VARIANT: full
     environment:
       - LOCAL_ONLY=True # set to False to enable OIDC auth (requires configuration in settings.yml)
-      - SECRET_KEY= # if using auth
-      - UPLOADS_DIR=/app/uploads # directory structure INSIDE the container, not on host
-      - PROCESSED_DIR=/app/processed
-      - OMP_NUM_THREADS=1
+      - SECRET_KEY= # optional; generated and stored in ./config if empty
+      - PUID=1000 # user/group the app runs as; owns the mounted folders (Unraid: 99/100)
+      - PGID=1000
       - DOWNLOAD_KOKORO_ON_STARTUP=true
       #- SESSION_COOKIE_SECURE=true # when served over HTTPS
       #- CSRF_TRUSTED_ORIGINS=https://files.example.com # if your reverse proxy rewrites the Host header
-      #- ALLOWED_HOSTS=localhost,127.0.0.1,files.example.com # only answer to these host names
+      #- ALLOWED_HOSTS=files.example.com,192.168.1.10 # only answer to these host names
       #- ALLOW_COMMAND_EDITS=true # allow editing conversion commands on the settings page
-      #- TRANSCRIPTION_DEVICE=cpu  # change to 'cuda' if GPU available
-      #- TRANSCRIPTION_COMPUTE_TYPE=int8 # change to 'float16' or 'int8_float16' if GPU available
-      #- TRANSCRIPTION_DEVICE_INDEX=0 # change if multiple GPUs available
-    #user: "1000:1000"
+      #- TRANSCRIPTION_DEVICE=cuda # the :cuda image uses the GPU automatically when one is available
     ports:
       # Reachable from your whole network. In LOCAL_ONLY mode there is no login, so use
       # "127.0.0.1:6969:8000" to restrict it to this machine.
       - "6969:8000"
     volumes:
-      # Mount local directories and files into the container for persistence
-      - ./config:/app/config # you can copy settings.default.yml into here as settings.yml
+      - ./config:/app/config # settings.yml (created from the defaults on first start)
+      - ./data:/app/data # job history database
+      - ./models:/app/models # downloaded Whisper/TTS models, so they survive updates
       - ./uploads_data:/app/uploads
       - ./processed_data:/app/processed
+    restart: unless-stopped
 
-    # For CUDA builds, enable GPU access (uncomment below)
+    # For the :cuda image, give the container access to the GPU (needs the NVIDIA Container Toolkit):
     #deploy:
     #  resources:
     #    reservations:
@@ -40,7 +37,3 @@ services:
     #        - driver: nvidia
     #          count: all
     #          capabilities: [gpu]
-
-volumes:
-  uploads_data: {}
-  processed_data: {}
