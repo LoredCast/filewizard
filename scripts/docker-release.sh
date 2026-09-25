@@ -121,6 +121,7 @@ cmd_test() {
     # File times inside the image come from the commit, so rebuilding a commit gives the same image.
     epoch="$(git -C "${repo_root}" log -1 --format=%ct)"
     revision="$(git -C "${repo_root}" rev-parse HEAD)"
+    pushed=""
     for variant in ${VARIANTS}; do
         platforms="$(platforms_for "${variant}")"
         if [ -z "${platforms}" ]; then
@@ -135,18 +136,22 @@ cmd_test() {
             --build-arg SOURCE_DATE_EPOCH="${epoch}" \
             --label org.opencontainers.image.revision="${revision}" \
             --provenance=mode=max --sbom=true \
-            --output "type=image,name=${tag},push=true,rewrite-timestamp=true" \
+            --output "type=image,name=${tag},push=true,unpack=false,rewrite-timestamp=true" \
             ${BUILD_FLAGS} "${repo_root}"
+        pushed="${pushed} ${tag}"
     done
     echo
-    echo "Pushed the test images. Try them (pull first, so no older local copy is used), e.g.:"
-    echo "    docker pull ${IMAGE}:test && docker/smoke-test.sh ${IMAGE}:test"
+    echo "Pushed the test images. Try them (pull first, so no older local copy is used):"
+    for tag in ${pushed}; do
+        echo "    docker pull ${tag} && docker/smoke-test.sh ${tag}"
+    done
     echo "then publish them under the release tags:"
     echo "    $0 promote ${version}"
 }
 
 cmd_promote() {
     version="${1#v}"
+    released=""
     for variant in ${VARIANTS}; do
         if [ -z "$(platforms_for "${variant}")" ]; then
             continue
@@ -167,10 +172,13 @@ cmd_promote() {
         echo "=== ${source} ->$(echo "${args}" | sed 's/ --tag / /g')"
         # shellcheck disable=SC2086  # args holds several flags
         docker buildx imagetools create ${args} "${source}"
+        released="${released} ${IMAGE}:$(release_tags "${version}" "${variant}" | cut -d' ' -f1)"
     done
     echo
     echo "Released ${version}. Check the result with:"
-    echo "    docker buildx imagetools inspect ${IMAGE}:${version}"
+    for tag in ${released}; do
+        echo "    docker buildx imagetools inspect ${tag}"
+    done
 }
 
 [ $# -ge 2 ] || usage
