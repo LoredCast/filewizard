@@ -1,10 +1,28 @@
 document.addEventListener('DOMContentLoaded', () => {
+    // Server-side configuration is embedded as a JSON data block (see index.html).
+    try {
+        window.APP_CONFIG = JSON.parse(document.getElementById('app-config').textContent);
+    } catch (e) {
+        console.error('Could not read app configuration:', e);
+        window.APP_CONFIG = {};
+    }
+
     // --- Constants ---
     const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB chunks
     const API_BASE = (window.APP_CONFIG && window.APP_CONFIG.api_base) ? window.APP_CONFIG.api_base.replace(/\/$/, '') : '';
 
     // --- User Locale ---
-    const USER_LOCALE = navigator.language || 'en-US';
+    // Browsers can report locale tags Intl rejects (e.g. "en-US@posix"), which would make every
+    // toLocaleString() call throw and the job history fail to render; fall back to the default locale.
+    const USER_LOCALE = (() => {
+        try {
+            const locale = navigator.language || 'en-US';
+            new Intl.DateTimeFormat(locale);
+            return locale;
+        } catch (e) {
+            return undefined;
+        }
+    })();
     const USER_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
     const DATETIME_FORMAT_OPTIONS = {
         year: 'numeric', month: 'short', day: 'numeric',
@@ -154,9 +172,78 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    // Escape a value for safe interpolation into HTML text or a quoted attribute.
+    // Every server- or user-controlled string (file names, tool error output, ...) must go through this.
+    function escapeHtml(value) {
+        return String(value ?? '').replace(/[&<>"']/g, ch => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[ch]));
+    }
+
+    function processedBasename(job) {
+        return job.processed_filepath ? job.processed_filepath.split(/[\\\/]/).pop() : '';
+    }
+
+    function formatJobDate(job) {
+        return new Date(job.created_at).toLocaleString(USER_LOCALE, DATETIME_FORMAT_OPTIONS);
+    }
+
+    function formatJobFileSize(job) {
+        let text = job.input_filesize ? formatBytes(job.input_filesize) : '-';
+        if (job.status === 'completed' && job.output_filesize) {
+            text += ` → ${formatBytes(job.output_filesize)}`;
+        }
+        return text;
+    }
+
+    function buildDetailsHtml(job) {
+        const processedName = processedBasename(job);
+        const downloadHtml = (processedName && job.status === 'completed' && job.task_type !== 'unzip')
+            ? `<div class="detail-item">
+                    <span class="detail-label">Download:</span>
+                    <a class="detail-value details-download-link" href="${escapeHtml(apiUrl('/download') + '/' + encodeURIComponent(processedName))}" download>${escapeHtml(processedName)}</a>
+               </div>`
+            : '';
+        const errorHtml = job.error_message
+            ? `<div class="detail-item">
+                    <span class="detail-label">Error:</span>
+                    <span class="detail-value error-text details-error" title="${escapeHtml(job.error_message)}">${escapeHtml(job.error_message.length > 50 ? job.error_message.substring(0, 50) + '...' : job.error_message)}</span>
+               </div>`
+            : '';
+        return `
+            <td colspan="7" class="job-details-content">
+                <div class="job-details-grid">
+                    <div class="detail-item">
+                        <span class="detail-label">Full Filename:</span>
+                        <span class="detail-value details-full-filename">${escapeHtml(job.original_filename || 'No filename')}</span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="detail-label">Submitted:</span>
+                        <span class="detail-value details-submitted">${escapeHtml(formatJobDate(job))}</span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="detail-label">File Size:</span>
+                        <span class="detail-value details-file-size">${escapeHtml(formatJobFileSize(job))}</span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="detail-label">ID:</span>
+                        <span class="detail-value details-id">${escapeHtml(String(job.id).substring(0, 8))}</span>
+                    </div>
+                    <div class="detail-item">
+                        <span class="detail-label">Processed File:</span>
+                        <span class="detail-value">${escapeHtml(processedName || 'Not available')}</span>
+                    </div>
+                    ${downloadHtml}
+                    ${errorHtml}
+                </div>
+            </td>
+        `;
+    }
+
     function renderJobRow(job) {
         const permanentDomId = `job-${job.id}`;
         let row = document.getElementById(permanentDomId);
+        const jobId = escapeHtml(job.id);
 
         // --- Generate Content ---
         let taskTypeLabel = job.task_type;
@@ -172,42 +259,44 @@ document.addEventListener('DOMContentLoaded', () => {
         } else if (job.task_type) {
             taskTypeLabel = job.task_type.charAt(0).toUpperCase() + job.task_type.slice(1);
         }
-        const formattedDate = new Date(job.created_at).toLocaleString(USER_LOCALE, DATETIME_FORMAT_OPTIONS);
-        let statusHtml = `<span class="job-status-badge status-${job.status}">${job.status}</span>`;
+        taskTypeLabel = escapeHtml(taskTypeLabel);
+        const formattedDate = escapeHtml(formatJobDate(job));
+        const status = escapeHtml(job.status);
+        const progress = Math.max(0, Math.min(100, Number(job.progress) || 0));
+        let statusHtml = `<span class="job-status-badge status-${status}">${status}</span>`;
         if ((job.status === 'processing' || job.status === 'pending') && job.task_type === 'unzip') {
-            statusHtml += `<div class="progress-bar-container"><div class="progress-bar" style="width: ${job.progress || 0}%"></div></div>`;
+            statusHtml += `<div class="progress-bar-container"><div class="progress-bar" style="width: ${progress}%"></div></div>`;
         } else if (job.status === 'processing') {
-            const progressClass = (job.progress > 0) ? '' : 'indeterminate';
-            const progressWidth = (job.progress > 0) ? job.progress : 100;
+            const progressClass = (progress > 0) ? '' : 'indeterminate';
+            const progressWidth = (progress > 0) ? progress : 100;
             statusHtml += `<div class="progress-bar-container"><div class="progress-bar ${progressClass}" style="width: ${progressWidth}%"></div></div>`;
         }
         let actionHtml = '<span>-</span>';
         if (['pending', 'processing', 'uploading'].includes(job.status)) {
-            actionHtml = `<button class="cancel-button" data-job-id="${job.id}"><i class="fa">&#xf00d;</i></button>`;
+            actionHtml = `<button class="cancel-button" data-job-id="${jobId}"><i class="fa">&#xf00d;</i></button>`;
         } else if (job.status === 'completed') {
             if (job.task_type === 'unzip') {
-                actionHtml = `<a href="${apiUrl('/download/zip-batch')}/${encodeURIComponent(job.id)}" class="download-button" download><i class="fa">&#xf019;</i> Batch</a>`;
+                actionHtml = `<a href="${escapeHtml(apiUrl('/download/zip-batch') + '/' + encodeURIComponent(job.id))}" class="download-button" download><i class="fa">&#xf019;</i> Batch</a>`;
             } else if (job.processed_filepath) {
-                const downloadFilename = job.processed_filepath.split(/[\\\/]/).pop();
-                actionHtml = `<a href="${apiUrl('/download')}/${encodeURIComponent(downloadFilename)}" class="download-button" download><i class="fa">&#xf019;</i></a>`;
+                actionHtml = `<a href="${escapeHtml(apiUrl('/download') + '/' + encodeURIComponent(processedBasename(job)))}" class="download-button" download><i class="fa">&#xf019;</i></a>`;
             }
         } else if (job.status === 'failed') {
-            const errorTitle = job.error_message ? ` title="${job.error_message.replace(/"/g, '&quot;')}"` : '';
+            const errorTitle = job.error_message ? ` title="${escapeHtml(job.error_message)}"` : '';
             actionHtml = `<span class="error-text"${errorTitle}>Error</span>`;
         } else if (job.status === 'cancelled') {
             actionHtml = `<span>Cancelled</span>`;
         }
-        let fileSizeHtml = job.input_filesize ? formatBytes(job.input_filesize) : '-';
-        if (job.status === 'completed' && job.output_filesize) {
-            fileSizeHtml += ` → ${formatBytes(job.output_filesize)}`;
-        }
+        const fileSizeHtml = escapeHtml(formatJobFileSize(job));
         let checkboxHtml = '';
         if (job.status === 'completed' && job.processed_filepath && job.task_type !== 'unzip') {
-            checkboxHtml = `<input type="checkbox" class="job-checkbox" value="${job.id}">`;
+            checkboxHtml = `<input type="checkbox" class="job-checkbox" value="${jobId}">`;
         }
 
-        // Truncate filename for mobile view
-        const truncatedFilename = job.original_filename ? (job.original_filename.length > 25 ? job.original_filename.substring(0, 25) + '...' : job.original_filename) : "No filename";
+        // Truncate filename for mobile view (truncate first, then escape, so entities are never cut in half)
+        const rawFilename = job.original_filename || 'No filename';
+        const escapedFilename = escapeHtml(rawFilename);
+        const truncatedFilename = escapeHtml(rawFilename.length > 25 ? rawFilename.substring(0, 25) + '...' : rawFilename);
+        const expanderHtml = job.task_type === 'unzip' ? '<span class="expander-arrow"></span>' : '';
 
         // --- Create or Update logic ---
         if (row) {
@@ -217,63 +306,34 @@ document.addEventListener('DOMContentLoaded', () => {
             const taskCell = row.querySelector('td[data-label="Task"] .cell-value');
             const statusCell = row.querySelector('td[data-label="Status"] .cell-value');
             const actionCell = row.querySelector('td[data-label="Action"] .cell-value');
-            
+
             if (selectCell) selectCell.innerHTML = checkboxHtml;
-            // Calculate expanderHtml for the update section
-            const expanderHtml = job.task_type === 'unzip' ? '<span class="expander-arrow"></span>' : '';
             if (fileCell) {
-                fileCell.innerHTML = `<span class="file-cell-content" title="${job.original_filename}">${expanderHtml}${truncatedFilename}</span><button class="details-button" style="display: none;" title="Show details">i</button>`;
+                fileCell.innerHTML = `<span class="file-cell-content" title="${escapedFilename}">${expanderHtml}${truncatedFilename}</span><button class="details-button" style="display: none;" title="Show details">i</button>`;
             }
             if (taskCell) taskCell.innerHTML = taskTypeLabel;
             if (statusCell) statusCell.innerHTML = statusHtml;
             if (actionCell) actionCell.innerHTML = actionHtml;
-            
+
             // Update the expanded details if they exist
             const detailsRow = document.getElementById(`${permanentDomId}-details`);
             if (detailsRow) {
-                detailsRow.querySelector('.details-full-filename').textContent = job.original_filename || "No filename";
-                detailsRow.querySelector('.details-submitted').textContent = formattedDate;
-                detailsRow.querySelector('.details-file-size').textContent = fileSizeHtml;
-                detailsRow.querySelector('.details-id').textContent = job.id.substring(0, 8); // Truncate ID for display
-                if (job.processed_filepath) {
-                    const downloadLink = detailsRow.querySelector('.details-download-link');
-                    if (downloadLink) {
-                        const downloadFilename = job.processed_filepath.split(/[\\\/]/).pop();
-                        downloadLink.href = `${apiUrl('/download')}/${encodeURIComponent(downloadFilename)}`;
-                        downloadLink.textContent = downloadFilename;
-                    }
-                }
+                detailsRow.innerHTML = buildDetailsHtml(job);
             }
         } else {
             // CREATE a new row
             row = document.createElement('tr');
             row.id = permanentDomId;
-            // Sanitize filename to prevent XSS
-            let escapedFilename = "No filename";
-            if (job.original_filename) {
-                escapedFilename = job.original_filename.replace(/[<>"'&]/g, function(match) {
-                    return {
-                        '<': '&lt;',
-                        '>': '&gt;',
-                        '"': '&quot;',
-                        "'": '&#x27;',
-                        '&': '&amp;'
-                    }[match];
-                });
-            }
             const rowClasses = [];
             if (job.parent_job_id) rowClasses.push('sub-job');
             if (job.task_type === 'unzip') rowClasses.push('parent-job');
             row.className = rowClasses.join(' ');
             if (job.parent_job_id) row.dataset.parentId = job.parent_job_id;
-            const expanderHtml = job.task_type === 'unzip' ? '<span class="expander-arrow"></span>' : '';
 
-            // Define expanderHtml for the new row creation
-            const newExpanderHtml = job.task_type === 'unzip' ? '<span class="expander-arrow"></span>' : '';
             // Create the row with all columns to match the table headers
             row.innerHTML = `
                 <td data-label="Select"><span class="cell-value">${checkboxHtml}</span></td>
-                <td data-label="File"><span class="cell-value" title="${escapedFilename}">${newExpanderHtml}<span class="file-cell-content">${truncatedFilename}</span><button class="details-button" style="display: none;" title="Show details">i</button></span></td>
+                <td data-label="File"><span class="cell-value" title="${escapedFilename}">${expanderHtml}<span class="file-cell-content">${truncatedFilename}</span><button class="details-button" style="display: none;" title="Show details">i</button></span></td>
                 <td data-label="File Size"><span class="cell-value">${fileSizeHtml}</span></td>
                 <td data-label="Task"><span class="cell-value">${taskTypeLabel}</span></td>
                 <td data-label="Submitted"><span class="cell-value">${formattedDate}</span></td>
@@ -292,57 +352,7 @@ document.addEventListener('DOMContentLoaded', () => {
             detailsRow.id = `${permanentDomId}-details`;
             detailsRow.className = 'job-details-row';
             detailsRow.style.display = 'none';
-            
-            // Sanitize values for details
-            const escapedOriginalFilename = job.original_filename ? job.original_filename.replace(/[<>"'&]/g, function(match) {
-                return {
-                    '<': '&lt;',
-                    '>': '&gt;',
-                    '"': '&quot;',
-                    "'": '&#x27;',
-                    '&': '&amp;'
-                }[match];
-            }) : "No filename";
-            const escapedProcessedFilepath = job.processed_filepath ? job.processed_filepath.split(/[\\\/]/).pop() : "Not available";
-            
-            detailsRow.innerHTML = `
-                <td colspan="5" class="job-details-content">
-                    <div class="job-details-grid">
-                        <div class="detail-item">
-                            <span class="detail-label">Full Filename:</span>
-                            <span class="detail-value details-full-filename">${escapedOriginalFilename}</span>
-                        </div>
-                        <div class="detail-item">
-                            <span class="detail-label">Submitted:</span>
-                            <span class="detail-value details-submitted">${formattedDate}</span>
-                        </div>
-                        <div class="detail-item">
-                            <span class="detail-label">File Size:</span>
-                            <span class="detail-value details-file-size">${fileSizeHtml}</span>
-                        </div>
-                        <div class="detail-item">
-                            <span class="detail-label">ID:</span>
-                            <span class="detail-value details-id">${job.id.substring(0, 8)}</span>
-                        </div>
-                        <div class="detail-item">
-                            <span class="detail-label">Processed File:</span>
-                            <span class="detail-value">${escapedProcessedFilepath}</span>
-                        </div>
-                        ${job.processed_filepath && job.status === 'completed' && job.task_type !== 'unzip' ? 
-                            `<div class="detail-item">
-                                <span class="detail-label">Download:</span>
-                                <a class="detail-value details-download-link" href="${apiUrl('/download')}/${encodeURIComponent(job.processed_filepath.split(/[\\\/]/).pop())}" download>
-                                    ${job.processed_filepath.split(/[\\\/]/).pop()}
-                                </a>
-                            </div>` : ''}
-                        ${job.error_message ? 
-                            `<div class="detail-item">
-                                <span class="detail-label">Error:</span>
-                                <span class="detail-value error-text details-error" title="${job.error_message.replace(/"/g, '&quot;')}">${job.error_message.length > 50 ? job.error_message.substring(0, 50) + '...' : job.error_message}</span>
-                            </div>` : ''}
-                    </div>
-                </td>
-            `;
+            detailsRow.innerHTML = buildDetailsHtml(job);
 
             // Insert details row after the main row
             row.parentNode.insertBefore(detailsRow, row.nextSibling);
@@ -723,7 +733,7 @@ function initializeSelectors() {
     async function handleCancelJob(jobId) {
         if (!confirm('Are you sure you want to cancel this job?')) return;
         try {
-            const response = await authFetch(`/job/${jobId}/cancel`, { method: 'POST' });
+            const response = await authFetch(`/job/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({}));
                 throw new Error(errorData.detail || 'Failed to cancel job.');
@@ -862,78 +872,10 @@ function initializeSelectors() {
                     // Insert details row after the main row
                     row.parentNode.insertBefore(detailsRow, row.nextSibling);
                     
-                    // Now we need to update the details with actual job data by finding the job object
-                    // We'll do this by looking for the job in the DOM or by re-rendering
-                    const jobData = Array.from(jobListBody.querySelectorAll('tr[id^="job-"]'))
-                        .filter(tr => tr.id !== `job-${jobId}-details`)  // Exclude details rows
-                        .map(tr => {
-                            const jobId = tr.id.replace('job-', '');
-                            // We need to get the job data - this is tricky without a lookup table
-                            // For now, we'll update all job rows which will update the details
-                            return jobId;
-                        });
-                    
-                    // Trigger a refresh of the job details by re-rendering the job
-                    // We'll need to get the job data from the server
-                    authFetch(`/job/${jobId}`)
+                    authFetch(`/job/${encodeURIComponent(jobId)}`)
                         .then(response => response.json())
                         .then(job => {
-                            const formattedDate = new Date(job.created_at).toLocaleString(USER_LOCALE, DATETIME_FORMAT_OPTIONS);
-                            let fileSizeHtml = job.input_filesize ? formatBytes(job.input_filesize) : '-';
-                            if (job.status === 'completed' && job.output_filesize) {
-                                fileSizeHtml += ` → ${formatBytes(job.output_filesize)}`;
-                            }
-                            
-                            // Sanitize values for details
-                            const escapedOriginalFilename = job.original_filename ? job.original_filename.replace(/[<>"'&]/g, function(match) {
-                                return {
-                                    '<': '&lt;',
-                                    '>': '&gt;',
-                                    '"': '&quot;',
-                                    "'": '&#x27;',
-                                    '&': '&amp;'
-                                }[match];
-                            }) : "No filename";
-                            const escapedProcessedFilepath = job.processed_filepath ? job.processed_filepath.split(/[\\\/]/).pop() : "Not available";
-                            
-                            detailsRow.innerHTML = `
-                                <td colspan="7" class="job-details-content">
-                                    <div class="job-details-grid">
-                                        <div class="detail-item">
-                                            <span class="detail-label">Full Filename:</span>
-                                            <span class="detail-value details-full-filename">${escapedOriginalFilename}</span>
-                                        </div>
-                                        <div class="detail-item">
-                                            <span class="detail-label">Submitted:</span>
-                                            <span class="detail-value details-submitted">${formattedDate}</span>
-                                        </div>
-                                        <div class="detail-item">
-                                            <span class="detail-label">File Size:</span>
-                                            <span class="detail-value details-file-size">${fileSizeHtml}</span>
-                                        </div>
-                                        <div class="detail-item">
-                                            <span class="detail-label">ID:</span>
-                                            <span class="detail-value details-id">${job.id.substring(0, 8)}</span>
-                                        </div>
-                                        <div class="detail-item">
-                                            <span class="detail-label">Processed File:</span>
-                                            <span class="detail-value">${escapedProcessedFilepath}</span>
-                                        </div>
-                                        ${job.processed_filepath && job.status === 'completed' && job.task_type !== 'unzip' ? 
-                                            `<div class="detail-item">
-                                                <span class="detail-label">Download:</span>
-                                                <a class="detail-value details-download-link" href="${apiUrl('/download')}/${encodeURIComponent(job.processed_filepath.split(/[\\\/]/).pop())}" download>
-                                                    ${job.processed_filepath.split(/[\\\/]/).pop()}
-                                                </a>
-                                            </div>` : ''}
-                                        ${job.error_message ? 
-                                            `<div class="detail-item">
-                                                <span class="detail-label">Error:</span>
-                                                <span class="detail-value error-text details-error" title="${job.error_message.replace(/"/g, '&quot;')}">${job.error_message.length > 50 ? job.error_message.substring(0, 50) + '...' : job.error_message}</span>
-                                            </div>` : ''}
-                                    </div>
-                                </td>
-                            `;
+                            detailsRow.innerHTML = buildDetailsHtml(job);
                         })
                         .catch(error => {
                             console.error("Error fetching job details:", error);

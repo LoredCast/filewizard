@@ -55,6 +55,8 @@ from string import Formatter
 from werkzeug.utils import secure_filename
 from typing import List as TypingList
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.datastructures import Headers, MutableHeaders
 from authlib.integrations.starlette_client import OAuth
 from dotenv import load_dotenv
 from piper import PiperVoice
@@ -2612,6 +2614,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 ENV = os.environ.get('ENV', 'dev').lower()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    return os.environ.get(name, str(default)).strip().lower() in ('true', '1', 't', 'yes', 'y')
+
+
+def _env_list(name: str) -> List[str]:
+    return [v.strip() for v in os.environ.get(name, '').split(',') if v.strip()]
+
+
 SECRET_KEY = os.environ.get('SECRET_KEY')
 if not SECRET_KEY and not LOCAL_ONLY_MODE and ENV != 'dev':
     raise RuntimeError('SECRET_KEY must be set in production when authentication is enabled.')
@@ -2627,22 +2639,126 @@ app.add_middleware(
     max_age=14 * 24 * 60 * 60  # 14 days
 )
 
-# CORS Configuration - allow all in dev, restrict in production
-if ENV == 'production':
-    # Read allowed origins from environment variable
-    allowed_origins_env = os.environ.get('ALLOWED_ORIGINS', 'http://localhost,http://127.0.0.1')
-    allowed_origins = [origin.strip() for origin in allowed_origins_env.split(',') if origin.strip()]
-else:
-    # Allow all in development
-    allowed_origins = ["*"]
+# CORS: the UI is served from the same origin and API clients (curl, n8n, ...) do not need CORS,
+# so no cross-origin access is granted unless origins are listed explicitly.
+CORS_ALLOWED_ORIGINS = [o for o in _env_list('ALLOWED_ORIGINS') if o != '*']
+if '*' in _env_list('ALLOWED_ORIGINS'):
+    logger.warning("ALLOWED_ORIGINS='*' is ignored: credentialed CORS must list explicit origins.")
+if CORS_ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+# Optional Host header allowlist (protects LOCAL_ONLY instances against DNS rebinding).
+ALLOWED_HOSTS = _env_list('ALLOWED_HOSTS')
+if ALLOWED_HOSTS:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+
+# --- CSRF protection & security headers ---
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
+CSRF_TRUSTED_ORIGINS = _env_list('CSRF_TRUSTED_ORIGINS') + CORS_ALLOWED_ORIGINS
+# Who may embed the UI in a frame (e.g. a dashboard such as Homarr/Organizr): CSP frame-ancestors syntax.
+FRAME_ANCESTORS = os.environ.get('FRAME_ANCESTORS', "'self'").strip() or "'self'"
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; object-src 'none'; "
+    f"base-uri 'self'; form-action 'self'; frame-ancestors {FRAME_ANCESTORS}"
 )
+# The interactive API docs load their assets from a CDN; they get the other headers but no CSP.
+CSP_EXEMPT_PATHS = ("/docs", "/redoc", "/openapi.json")
+
+
+def _host_key(netloc: str) -> str:
+    """Normalizes host[:port] for comparison, dropping default ports."""
+    netloc = (netloc or "").strip().lower()
+    for default_port in (":80", ":443"):
+        if netloc.endswith(default_port):
+            return netloc[: -len(default_port)]
+    return netloc
+
+
+def _csrf_allowed_hosts(headers: Headers) -> set:
+    hosts = {_host_key(headers.get("host", ""))}
+    forwarded_host = headers.get("x-forwarded-host")
+    if forwarded_host:
+        hosts.add(_host_key(forwarded_host.split(",")[0]))
+    public_url = APP_CONFIG.get("app_settings", {}).get("app_public_url")
+    if public_url:
+        hosts.add(_host_key(urlparse(public_url).netloc))
+    for origin in CSRF_TRUSTED_ORIGINS:
+        hosts.add(_host_key(urlparse(origin).netloc or origin))
+    hosts.discard("")
+    return hosts
+
+
+def _is_csrf_safe(method: str, headers: Headers) -> bool:
+    """
+    Rejects state-changing requests that a browser sent on behalf of another site.
+    Browsers always attach Origin to cross-site POSTs; clients that send neither
+    Origin nor Referer (curl, n8n, ...) are not browsers and are let through.
+    """
+    if method in SAFE_METHODS:
+        return True
+    source = headers.get("origin") or headers.get("referer")
+    if not source:
+        return True
+    if source == "null":
+        return False
+    try:
+        netloc = urlparse(source).netloc
+    except ValueError:
+        return False
+    return _host_key(netloc) in _csrf_allowed_hosts(headers)
+
+
+class SecurityMiddleware:
+    """Pure ASGI middleware: CSRF origin check and security response headers."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = Headers(scope=scope)
+        if not _is_csrf_safe(scope["method"], headers):
+            logger.warning(
+                "Blocked cross-origin %s %s (origin=%r, referer=%r, host=%r).",
+                scope["method"], scope.get("path"), headers.get("origin"), headers.get("referer"), headers.get("host"),
+            )
+            response = JSONResponse(
+                {"detail": "Cross-origin request blocked. If FileWizard runs behind a reverse proxy, "
+                           "forward the original Host header, or set app_public_url / CSRF_TRUSTED_ORIGINS."},
+                status_code=403,
+            )
+            await response(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                response_headers = MutableHeaders(scope=message)
+                response_headers.setdefault("X-Content-Type-Options", "nosniff")
+                response_headers.setdefault("Referrer-Policy", "same-origin")
+                if FRAME_ANCESTORS == "'self'":
+                    response_headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+                elif FRAME_ANCESTORS == "'none'":
+                    response_headers.setdefault("X-Frame-Options", "DENY")
+                if not path.startswith(CSP_EXEMPT_PATHS):
+                    response_headers.setdefault("Content-Security-Policy", CONTENT_SECURITY_POLICY)
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
+app.add_middleware(SecurityMiddleware)
 
 
 # Static / templates

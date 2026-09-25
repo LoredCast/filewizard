@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>File Wizard</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/choices.js/public/assets/styles/choices.min.css"/>
+    <link rel="stylesheet" href="{{ url_for('static', path='/vendor/font-awesome/css/font-awesome.min.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='/vendor/choices/choices.min.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', path='/css/style.css') }}">
 <!--     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -178,16 +178,10 @@
     <div id="format-counter" class="format-counter" style="display: none;">
         <span id="input-format-count"></span> in | <span id="output-format-count"></span> out
     </div>
-    <script>
-        // Inject server-side configuration for the client-side script
-        window.APP_CONFIG = {
-            conversionTools: {{ conversion_tools | tojson }},
-            user: {{ user | tojson }},
-            local_only_mode: {{ local_only_mode | tojson }}
-        };
-    </script>
-    
-    <script src="https://cdn.jsdelivr.net/npm/choices.js/public/assets/scripts/choices.min.js"></script>
+    <!-- Server-side configuration for script.js. A data block (not executed) keeps inline scripts out so the CSP can forbid them. -->
+    <script type="application/json" id="app-config">{{ {"conversionTools": conversion_tools, "user": user, "local_only_mode": local_only_mode} | tojson }}</script>
+
+    <script src="{{ url_for('static', path='/vendor/choices/choices.min.js') }}"></script>
     <script src="{{ url_for('static', path='/js/script.js') }}"></script>
 </body>
 </html>
