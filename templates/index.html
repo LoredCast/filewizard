@@ -4,9 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>File Wizard</title>
-    <link rel="stylesheet" href="{{ url_for('static', path='/vendor/font-awesome/css/font-awesome.min.css') }}">
-    <link rel="stylesheet" href="{{ url_for('static', path='/vendor/choices/choices.min.css') }}">
-    <link rel="stylesheet" href="{{ url_for('static', path='/css/style.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='/vendor/font-awesome/css/font-awesome.min.css') }}?v={{ static_version }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='/vendor/choices/choices.min.css') }}?v={{ static_version }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='/css/style.css') }}?v={{ static_version }}">
 <!--     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet"> -->
@@ -187,7 +187,7 @@
     <!-- Server-side configuration for script.js. A data block (not executed) keeps inline scripts out so the CSP can forbid them. -->
     <script type="application/json" id="app-config">{{ {"conversionTools": conversion_tools, "user": user, "local_only_mode": local_only_mode} | tojson }}</script>
 
-    <script src="{{ url_for('static', path='/vendor/choices/choices.min.js') }}"></script>
-    <script src="{{ url_for('static', path='/js/script.js') }}"></script>
+    <script src="{{ url_for('static', path='/vendor/choices/choices.min.js') }}?v={{ static_version }}"></script>
+    <script src="{{ url_for('static', path='/js/script.js') }}?v={{ static_version }}"></script>
 </body>
 </html>

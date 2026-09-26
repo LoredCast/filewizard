@@ -26,5 +26,5 @@ echo "Started Gunicorn..."
 GUNICORN_PID=$!
 echo "Gunicorn PID: $GUNICORN_PID"
 # Start the Huey consumer in the foreground with the same env
-exec env LOCAL_ONLY=$LOCAL_ONLY SECRET_KEY=$SECRET_KEY UPLOADS_DIR=$UPLOADS_DIR PROCESSED_DIR=$PROCESSED_DIR CHUNK_TMP_DIR=$CHUNK_TMP_DIR python -m huey.bin.huey_consumer main.huey -w 4
+exec env LOCAL_ONLY=$LOCAL_ONLY SECRET_KEY=$SECRET_KEY UPLOADS_DIR=$UPLOADS_DIR PROCESSED_DIR=$PROCESSED_DIR CHUNK_TMP_DIR=$CHUNK_TMP_DIR python -m huey.bin.huey_consumer main.huey -w 4 --max-delay 1
 echo "Started Huey consumer..."

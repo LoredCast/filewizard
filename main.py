@@ -47,12 +47,13 @@ from fastapi import (Depends, FastAPI, File, Form, HTTPException, Request,
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from huey import SqliteHuey, crontab
 from pydantic import BaseModel, ConfigDict, field_serializer
-from sqlalchemy import (Column, DateTime, Integer, String, Text,
-                        create_engine, delete, event, text)
+from sqlalchemy import (Column, DateTime, Index, Integer, String, Text,
+                        create_engine, delete, event, func, text)
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import NullPool
 from sqlalchemy.exc import OperationalError
@@ -108,12 +109,6 @@ except ImportError:
     find_voice = None
     VoiceNotFoundError = None
 
-
-try:
-    from PyPDF2 import PdfMerger
-    _HAS_PYPDF2 = True
-except Exception:
-    _HAS_PYPDF2 = False
 
 # Instantiate OAuth object (was referenced in code)
 oauth = OAuth()
@@ -322,19 +317,19 @@ def get_supported_output_formats_for_file(filename: str, conversion_tools_config
     """
     file_ext = get_file_extension(filename)
     supported_formats = []
-    
+
     for tool_name, tool_config in conversion_tools_config.items():
-        supported_inputs = tool_config.get("supported_input", [])
-        # Convert supported inputs to lowercase for comparison
-        supported_inputs_lower = [ext.lower() for ext in supported_inputs]
-        
+        if not isinstance(tool_config, dict) or tool_name in UNAVAILABLE_TOOLS:
+            continue
+        supported_inputs_lower = [str(ext).lower() for ext in tool_config.get("supported_input") or []]
+
         if file_ext in supported_inputs_lower:
             # Add all available formats for this tool
-            for format_key, format_label in tool_config.get("formats", {}).items():
+            for format_key, format_label in (tool_config.get("formats") or {}).items():
                 full_format_key = f"{tool_name}_{format_key}"
                 supported_formats.append({
                     "value": full_format_key,
-                    "label": f"{tool_config['name']} - {format_label}",
+                    "label": f"{tool_config.get('name', tool_name)} - {format_label}",
                     "tool": tool_name,
                     "format": format_key
                 })
@@ -666,6 +661,14 @@ class Job(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
+    __table_args__ = (
+        # The job history (newest first) and its incremental polling (changed since ...).
+        Index("ix_jobs_user_created", "user_id", "created_at"),
+        Index("ix_jobs_user_updated", "user_id", "updated_at"),
+        # Downloads look up the job that owns a file.
+        Index("ix_jobs_processed_filepath", "processed_filepath"),
+    )
+
 def get_db():
     db = SessionLocal()
     try:
@@ -744,8 +747,6 @@ def create_job(db: Session, job: JobCreate):
     db.add(db_job)
     db.commit()
     db.refresh(db_job)
-    # Broadcast the new job to UI clients via Huey task
-    job_schema = JobSchema.model_validate(db_job)
     return db_job
 
 def update_job_status(db: Session, job_id: str, status: str, progress: int = None, error: str = None):
@@ -843,7 +844,6 @@ def send_webhook_notification(job_id: str, app_config: Dict[str, Any], base_url:
 huey = SqliteHuey(filename=PATHS.HUEY_DB_PATH)
 WHISPER_MODELS_CACHE: Dict[str, WhisperModel] = {}
 PIPER_VOICES_CACHE: Dict[str, "PiperVoice"] = {}
-AVAILABLE_TTS_VOICES_CACHE: Dict[str, Any] | None = None
 WHISPER_MODELS_LAST_USED: Dict[str, float] = {}
 
 # --- Cache Eviction Settings ---
@@ -1400,6 +1400,141 @@ def list_kokoro_languages_cli(timeout: int = 60) -> List[str]:
         return []
 
 
+# ---------------------------
+# Voice list for the UI
+# ---------------------------
+PIPER_VOICES_JSON_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/voices.json?download=true"
+TTS_VOICES_CACHE_FILE = PATHS.DATA_DIR / "tts_voices.json"
+TTS_VOICES_TTL_SECONDS = 24 * 3600
+TTS_VOICES_RETRY_SECONDS = 300  # after an incomplete listing (offline, Kokoro models still downloading, ...)
+_tts_voices_memo: Optional[tuple] = None  # (expires_at, voices)
+_tts_voices_lock = threading.Lock()
+
+
+def installed_tts_engines() -> List[str]:
+    engines = []
+    if PiperVoice is not None:
+        engines.append("piper")
+    if shutil.which("kokoro-tts"):
+        engines.append("kokoro")
+    return engines
+
+
+def _piper_model_dir() -> Path:
+    configured = APP_CONFIG.get("tts_settings", {}).get("piper", {}).get("model_dir")
+    return Path(configured) if configured else PATHS.TTS_MODELS_DIR
+
+
+def _local_piper_voices(model_dir: Path) -> List[dict]:
+    """Voices already downloaded into model_dir; they work without internet access."""
+    try:
+        return [{"id": onnx.stem, "name": onnx.stem, "local": True}
+                for onnx in sorted(model_dir.glob("*.onnx")) if onnx.with_name(onnx.name + ".json").exists()]
+    except OSError:
+        return []
+
+
+def _remote_piper_voices() -> List[dict]:
+    """Piper's voice catalogue (voices.json on Hugging Face), with language names to group the voices by."""
+    response = httpx.get(PIPER_VOICES_JSON_URL, follow_redirects=True, timeout=20)
+    response.raise_for_status()
+    voices = []
+    for voice_id, meta in response.json().items():
+        meta = meta if isinstance(meta, dict) else {}
+        language = meta.get("language") if isinstance(meta.get("language"), dict) else {}
+        language_name = language.get("name_english") or language.get("code") or voice_id.split("-")[0]
+        if language.get("country_english"):
+            language_name = f"{language_name} ({language['country_english']})"
+        name = f"{meta['name']} ({meta['quality']})" if meta.get("name") and meta.get("quality") else voice_id
+        voices.append({"id": voice_id, "name": name, "language": {"name": language_name}, "local": False})
+    return voices
+
+
+def list_piper_voices(model_dir: Path) -> tuple:
+    """Returns (voices, complete); complete is False when only the downloaded voices could be listed."""
+    complete = True
+    try:
+        # Older piper releases have a Python API for this; piper-tts >= 1.3 only a CLI, which fetches
+        # the same catalogue without a timeout.
+        remote = safe_get_voices(model_dir) if get_voices else _remote_piper_voices()
+    except Exception as e:
+        logger.warning("Could not fetch the Piper voice catalogue (%s); only downloaded voices are offered.", e)
+        remote, complete = [], False
+    voices = {v["id"]: dict(v) for v in remote if isinstance(v, dict) and v.get("id")}
+    for local in _local_piper_voices(model_dir):
+        voices.setdefault(local["id"], local)["local"] = True
+    return list(voices.values()), complete
+
+
+def _collect_tts_voices() -> tuple:
+    """Returns (voices, complete) for all installed engines."""
+    voices, complete = [], True
+    if PiperVoice is not None:
+        piper_voices, complete = list_piper_voices(_piper_model_dir())
+        for voice in piper_voices:
+            voice["name"] = f"Piper: {voice.get('name') or voice['id']}"
+            voice["id"] = f"piper/{voice['id']}"
+            voices.append(voice)
+    if shutil.which("kokoro-tts"):
+        kokoro_voices, kokoro_langs = list_kokoro_voices_cli(), list_kokoro_languages_cli()
+        if not (kokoro_voices and kokoro_langs):
+            complete = False  # e.g. the model files are still being downloaded
+        for lang in kokoro_langs:
+            for voice in kokoro_voices:
+                voices.append({"id": f"kokoro/{lang}/{voice}", "name": f"Kokoro ({lang}): {voice}",
+                               "language": {"name": f"Kokoro: {lang}"}, "local": True})
+    return sorted(voices, key=lambda v: v["name"]), complete
+
+
+def _read_tts_voices_cache(engines: List[str]) -> Optional[tuple]:
+    try:
+        data = json.loads(TTS_VOICES_CACHE_FILE.read_text(encoding="utf8"))
+        if data.get("engines") == engines and float(data["expires"]) > time.time() and isinstance(data["voices"], list):
+            return float(data["expires"]), data["voices"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def available_tts_voices() -> List[dict]:
+    """
+    The voices of the installed TTS engines. Listing them is slow, so the result is kept in memory
+    and in DATA_DIR, shared by all worker processes: for a day, or for a few minutes when the
+    listing was incomplete. Blocking; call it from a thread.
+    """
+    global _tts_voices_memo
+    memo = _tts_voices_memo
+    if memo and memo[0] > time.time():
+        return memo[1]
+    with _tts_voices_lock:
+        memo = _tts_voices_memo
+        if memo and memo[0] > time.time():
+            return memo[1]
+        engines = installed_tts_engines()
+        cached = _read_tts_voices_cache(engines)
+        if cached is None:
+            with open(PATHS.DATA_DIR / ".tts_voices.lock", "w") as lock_file:
+                # One process lists the voices; the others wait for its result instead of repeating the work.
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                cached = _read_tts_voices_cache(engines)
+                if cached is None:
+                    try:
+                        voices, complete = _collect_tts_voices()
+                    except Exception:
+                        logger.exception("Could not list TTS voices.")
+                        voices, complete = [], False
+                    expires = time.time() + (TTS_VOICES_TTL_SECONDS if complete and voices else TTS_VOICES_RETRY_SECONDS)
+                    tmp_file = TTS_VOICES_CACHE_FILE.with_name(f"{TTS_VOICES_CACHE_FILE.name}.tmp-{os.getpid()}")
+                    try:
+                        tmp_file.write_text(json.dumps({"engines": engines, "expires": expires, "voices": voices}), encoding="utf8")
+                        tmp_file.replace(TTS_VOICES_CACHE_FILE)
+                    except OSError as e:
+                        logger.warning(f"Could not cache the TTS voice list: {e}")
+                    cached = (expires, voices)
+        _tts_voices_memo = cached
+        return cached[1]
+
+
 def run_command(
     argv: List[str],
     timeout: int = 300,
@@ -1729,6 +1864,27 @@ def run_tts_task(job_id: str, input_path_str: str, output_path_str: str, model_n
 
         send_webhook_notification(job_id, app_config, base_url)
 
+PREVIEW_MAX_CHARS = 2000
+
+
+def _pdf_text_preview(pdf_path: str, limit: int = PREVIEW_MAX_CHARS) -> str:
+    """
+    Text of the first pages of a PDF, for the job preview. Stops once `limit` characters are
+    collected: extracting every page of a large document took longer than the OCR itself.
+    """
+    parts, collected = [], 0
+    try:
+        for page in pypdf.PdfReader(pdf_path).pages:
+            text = page.extract_text() or ""
+            parts.append(text)
+            collected += len(text)
+            if collected >= limit:
+                break
+    except Exception:
+        logger.warning("Could not extract a text preview from %s", pdf_path, exc_info=True)
+    return "\n".join(parts)
+
+
 @huey.task()
 def run_pdf_ocr_task(job_id: str, input_path_str: str, output_path_str: str, ocr_settings: dict, app_config: dict, base_url: str):
     db = SessionLocal()
@@ -1751,10 +1907,7 @@ def run_pdf_ocr_task(job_id: str, input_path_str: str, output_path_str: str, ocr
                      clean=ocr_settings.get('clean', True),
                      optimize=ocr_settings.get('optimize', 1),
                      progress_bar=False)
-        with open(output_path_str, "rb") as f:
-            reader = pypdf.PdfReader(f)
-            preview = "\n".join(page.extract_text() or "" for page in reader.pages)
-        mark_job_as_completed(db, job_id, output_filepath_str=output_path_str, preview=preview)
+        mark_job_as_completed(db, job_id, output_filepath_str=output_path_str, preview=_pdf_text_preview(output_path_str))
         logger.info(f"PDF OCR for job {job_id} completed.")
     except Exception as e:
         logger.exception(f"ERROR during PDF OCR for job {job_id}")
@@ -1798,79 +1951,52 @@ def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, a
         lang = resolve_ocr_language(ocr_language, app_config.get("ocr_settings", {}).get("ocrmypdf", {}))
         logger.info(f"Starting Image OCR for job {job_id} ({lang}) - {input_path}")
 
-        # open image and gather frames (support multi-frame TIFF)
         try:
             pil_img = Image.open(str(input_path))
         except UnidentifiedImageError as e:
             raise RuntimeError(f"Cannot identify/open input image: {e}")
 
-        frames = []
-        try:
-            # some images support n_frames (multi-page TIFF); iterate safely
-            n_frames = getattr(pil_img, "n_frames", 1)
-            for i in range(n_frames):
-                pil_img.seek(i)
-                # copy the frame to avoid problems when the original image object is closed
-                frames.append(pil_img.convert("RGB").copy())
-        except Exception:
-            # fallback: single frame
-            frames = [pil_img.convert("RGB")]
-
-        update_job_status(db, job_id, "processing", progress=30)
-
-        pdf_bytes_list = []
-        text_parts = []
-        for idx, frame in enumerate(frames):
-            # produce searchable PDF bytes for the frame and plain text as well
-            try:
-                pdf_bytes = pytesseract.image_to_pdf_or_hocr(frame, extension="pdf", lang=lang)
-            except TesseractNotFoundError as e:
-                raise RuntimeError("Tesseract not found. Ensure Tesseract OCR is installed and in PATH.") from e
-            except Exception as e:
-                raise RuntimeError(f"Failed to run Tesseract on frame {idx}: {e}") from e
-
-            pdf_bytes_list.append(pdf_bytes)
-
-            # also extract plain text for preview and possible fallback
-            try:
-                page_text = pytesseract.image_to_string(frame, lang=lang)
-            except Exception:
-                page_text = ""
-            text_parts.append(page_text)
-
-            # update progress incrementally
-            prog = 30 + int((idx + 1) / max(1, len(frames)) * 50)
-            update_job_status(db, job_id, "processing", progress=min(prog, 80))
-
-        # merge per-page pdfs if multiple frames
-        final_pdf_bytes = None
-        if len(pdf_bytes_list) == 1:
-            final_pdf_bytes = pdf_bytes_list[0]
-        else:
-            if _HAS_PYPDF2:
-                merger = PdfMerger()
-                for b in pdf_bytes_list:
-                    merger.append(io.BytesIO(b))
-                out_buffer = io.BytesIO()
-                merger.write(out_buffer)
-                merger.close()
-                final_pdf_bytes = out_buffer.getvalue()
-            else:
-                # PyPDF2 not installed — try a simple concatenation (not valid PDF merge),
-                # better to fail loudly so user can install PyPDF2; but as a fallback
-                # write the first page only and include a warning in job preview.
-                logger.warning("PyPDF2 not available; only the first frame will be written to output PDF.")
-                final_pdf_bytes = pdf_bytes_list[0]
-                text_parts.insert(0, "[WARNING] Multiple frames detected but PyPDF2 not available; only first page saved.\n")
+        writer = pypdf.PdfWriter()  # merges the pages of multi-frame images
+        single_page_pdf: Optional[bytes] = None
+        text_parts: List[str] = []
+        with pil_img:
+            n_frames = max(1, getattr(pil_img, "n_frames", 1))  # multi-page TIFFs have several
+            for idx in range(n_frames):
+                if idx and _current_job_status(db, job_id) in (None, "cancelled"):
+                    logger.info(f"Image OCR job {job_id} cancelled or deleted. Stopping.")
+                    return
+                # One frame at a time: converting every page of a large TIFF up front used GBs of memory.
+                pil_img.seek(idx)
+                frame = pil_img.convert("RGB")
+                try:
+                    # A single Tesseract run produces both the searchable PDF and the plain text
+                    # (running it once per output doubled the OCR time).
+                    pdf_bytes, page_text = pytesseract.run_and_get_multiple_output(frame, extensions=["pdf", "txt"], lang=lang)
+                except TesseractNotFoundError:
+                    raise
+                except Exception as e:
+                    raise RuntimeError(f"Failed to run Tesseract on frame {idx}: {e}") from e
+                finally:
+                    frame.close()
+                text_parts.append(page_text or "")
+                if n_frames == 1:
+                    single_page_pdf = pdf_bytes
+                else:
+                    writer.append(io.BytesIO(pdf_bytes))
+                update_job_status(db, job_id, "processing", progress=min(80, 30 + int((idx + 1) / n_frames * 50)))
 
         # write out atomically
         tmp_out = out_path.with_name(f"{out_path.stem}.tmp-{uuid.uuid4().hex}{out_path.suffix or '.pdf'}")
         try:
             tmp_out.parent.mkdir(parents=True, exist_ok=True)
             with tmp_out.open("wb") as f:
-                f.write(final_pdf_bytes)
+                if single_page_pdf is not None:
+                    f.write(single_page_pdf)
+                else:
+                    writer.write(f)
             tmp_out.replace(out_path)
         except Exception as e:
+            tmp_out.unlink(missing_ok=True)
             raise RuntimeError(f"Failed writing output PDF to {out_path}: {e}") from e
 
         # create a preview from the recognized text (limit length)
@@ -1878,7 +2004,6 @@ def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, a
         preview = full_text[:1000] + ("…" if len(full_text) > 1000 else "")
 
         mark_job_as_completed(db, job_id, output_filepath_str=str(out_path), preview=preview)
-        update_job_status(db, job_id, "completed", progress=100)
         logger.info(f"Image OCR for job {job_id} completed. Output: {out_path}")
 
     except TesseractNotFoundError:
@@ -2180,8 +2305,6 @@ def run_conversion_task(job_id: str,
         finally:
             db_for_check.close()
 
-        gc.collect()
-
         try:
             send_webhook_notification(job_id, app_config, base_url)
         except Exception:
@@ -2277,6 +2400,13 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
                 return None
 
         original_stem = Path(safe_filename).stem
+
+        supported_inputs = {str(ext).lower() for ext in app_config.get("conversion_tools", {}).get(tool, {}).get("supported_input") or []}
+        if parent_job_id and supported_inputs and Path(safe_filename).suffix.lower() not in supported_inputs:
+            # Archives often mix file types; only the ones the chosen tool accepts become sub-jobs.
+            logger.info(f"Skipping '{original_filename}' from batch job '{parent_job_id}': {tool} does not accept this file type.")
+            final_path.unlink(missing_ok=True)
+            return None
 
         if tool == 'pandoc_academic':
             processed_path = PATHS.PROCESSED_DIR / f"{original_stem}_{job_id}.pdf"
@@ -2423,24 +2553,25 @@ def _update_parent_zip_job_progress(parent_job_id: str):
         if not parent_job or parent_job.status != 'processing':
             return # Job is still dispatching, already finalized, or doesn't exist
 
-        child_jobs = db.query(Job).filter(Job.parent_job_id == parent_job.id).all()
-        total_children = len(child_jobs)
+        # Counted in SQL: loading every sub-job each time one finishes is quadratic for big batches.
+        status_counts = dict(db.query(Job.status, func.count(Job.id))
+                             .filter(Job.parent_job_id == parent_job.id)
+                             .group_by(Job.status)
+                             .all())
+        total_children = sum(status_counts.values())
 
         if total_children == 0:
             return # Should not happen if dispatched correctly, but safeguard.
 
-        finished_children = 0
-        for child in child_jobs:
-            if child.status in ['completed', 'failed', 'cancelled']:
-                finished_children += 1
-
-        progress = int((finished_children / total_children) * 100) if total_children > 0 else 100
+        finished_children = sum(status_counts.get(state, 0) for state in FINAL_JOB_STATES)
+        progress = int((finished_children / total_children) * 100)
 
         if finished_children == total_children:
-            failed_count = sum(1 for child in child_jobs if child.status == 'failed')
-            preview = f"Batch processing complete. {total_children - failed_count}/{total_children} tasks succeeded."
-            if failed_count > 0:
-                preview += f" ({failed_count} failed)."
+            succeeded = status_counts.get('completed', 0)
+            preview = f"Batch processing complete. {succeeded}/{total_children} tasks succeeded."
+            unsuccessful = [f"{status_counts[state]} {state}" for state in ('failed', 'cancelled') if status_counts.get(state)]
+            if unsuccessful:
+                preview += f" ({', '.join(unsuccessful)})."
             mark_job_as_completed(db, parent_job.id, preview=preview)
             logger.info(f"Batch job {parent_job.id} marked as completed.")
         else:
@@ -2666,8 +2797,6 @@ async def _download_kokoro_files(files_to_download: dict):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Application starting up...")
-    global AVAILABLE_TTS_VOICES_CACHE
-    AVAILABLE_TTS_VOICES_CACHE = None
     # Base.metadata.create_all(bind=engine)
 
     create_attempts = 3
@@ -2676,6 +2805,9 @@ async def lifespan(app: FastAPI):
             # use engine.begin() to ensure the DDL runs in a connection/transaction context
             with engine.begin() as conn:
                 Base.metadata.create_all(bind=conn)
+                # create_all() skips tables that already exist, including their new indexes.
+                for index in Job.__table__.indexes:
+                    index.create(bind=conn, checkfirst=True)
             logger.info("Database tables ensured (create_all succeeded).")
             break
         except OperationalError as oe:
@@ -2944,10 +3076,54 @@ class SecurityMiddleware:
 
 app.add_middleware(SecurityMiddleware)
 
+# File downloads are served as they are: compressing them on the fly costs CPU (most outputs are
+# compressed already) and drops Content-Length, so browsers could not show download progress.
+UNCOMPRESSED_PATHS = ("/download",)
+
+
+class CompressionMiddleware:
+    """gzip for pages, scripts, styles and API responses."""
+
+    def __init__(self, app):
+        self.app = app
+        self.gzip_app = GZipMiddleware(app, minimum_size=1024, compresslevel=6)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and not scope.get("path", "").startswith(UNCOMPRESSED_PATHS):
+            await self.gzip_app(scope, receive, send)
+        else:
+            await self.app(scope, receive, send)
+
+
+app.add_middleware(CompressionMiddleware)
+
+
+class VersionedStaticFiles(StaticFiles):
+    """
+    The templates request static files with ?v=<hash of all static files>, so those responses can be
+    cached for good and an upgrade still reaches every browser at once. Other requests revalidate.
+    """
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code in (200, 304):
+            versioned = b"v=" in scope.get("query_string", b"")
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable" if versioned else "no-cache"
+        return response
+
+
+def _static_files_version(static_dir: Path) -> str:
+    digest = hashlib.sha256()
+    for file_path in sorted(p for p in static_dir.rglob("*") if p.is_file()):
+        digest.update(str(file_path.relative_to(static_dir)).encode())
+        digest.update(file_path.read_bytes())
+    return digest.hexdigest()[:12]
+
 
 # Static / templates
-app.mount("/static", StaticFiles(directory=str(PATHS.BASE_DIR / "static")), name="static")
+app.mount("/static", VersionedStaticFiles(directory=str(PATHS.BASE_DIR / "static")), name="static")
 templates = Jinja2Templates(directory=str(PATHS.BASE_DIR / "templates"))
+templates.env.globals["static_version"] = _static_files_version(PATHS.BASE_DIR / "static")
 
 # --- AUTH & USER HELPERS ---
 http_bearer = HTTPBearer()
@@ -3171,11 +3347,17 @@ async def _stitch_chunks(temp_dir: Path, final_path: Path, total_chunks: int):
                 raise FileNotFoundError(f"Upload failed: missing chunk {i}")
         if sum(p.stat().st_size for p in chunk_paths) > max_size:
             raise HTTPException(status_code=413, detail=f"File exceeds {max_size / 1024 / 1024:.0f} MB limit")
-        with open(final_path, "wb") as final_file:
-            for chunk_path in chunk_paths:
+        # The first chunk becomes the file and the others are appended, so a single-chunk upload
+        # (anything up to the browser's 5 MB chunk size) is moved instead of copied.
+        try:
+            os.replace(chunk_paths[0], final_path)
+            remaining = chunk_paths[1:]
+        except OSError:  # e.g. CHUNK_TMP_DIR on another file system
+            remaining = chunk_paths
+        with open(final_path, "ab" if len(remaining) < len(chunk_paths) else "wb") as final_file:
+            for chunk_path in remaining:
                 with open(chunk_path, "rb") as chunk_file:
-                    # Use copyfileobj for memory efficiency
-                    shutil.copyfileobj(chunk_file, final_file)
+                    shutil.copyfileobj(chunk_file, final_file, 1024 * 1024)
 
     try:
         await run_in_threadpool(do_stitch)
@@ -3422,51 +3604,10 @@ async def get_ocr_languages(user: dict = Depends(require_user_or_api)):
 
 @app.get("/api/v1/tts-voices")
 async def get_tts_voices_list(user: dict = Depends(require_user)):
-    global AVAILABLE_TTS_VOICES_CACHE
-
-    if AVAILABLE_TTS_VOICES_CACHE is not None:
-        return AVAILABLE_TTS_VOICES_CACHE
-
-    kokoro_available = shutil.which("kokoro-tts") is not None
-    piper_available = False
-    try:
-        import piper
-        piper_available = True
-    except ImportError:
-        pass
-
-    if not piper_available and not kokoro_available:
-        AVAILABLE_TTS_VOICES_CACHE = []
+    if not installed_tts_engines():
         return JSONResponse(content={"error": "TTS feature not configured on server (no TTS engines found)."}, status_code=501)
-
-    all_voices = []
-    try:
-        if piper_available:
-            logger.info("Fetching available Piper voices list...")
-            piper_voices = safe_get_voices(PATHS.TTS_MODELS_DIR)
-            for voice in piper_voices:
-                voice['id'] = f"piper/{voice.get('id')}"
-                voice['name'] = f"Piper: {voice.get('name', voice.get('id'))}"
-            all_voices.extend(piper_voices)
-
-        if kokoro_available:
-            logger.info("Fetching available Kokoro TTS voices and languages...")
-            kokoro_voices = list_kokoro_voices_cli()
-            kokoro_langs = list_kokoro_languages_cli()
-            for lang in kokoro_langs:
-                for voice in kokoro_voices:
-                    all_voices.append({
-                        "id": f"kokoro/{lang}/{voice}",
-                        "name": f"Kokoro ({lang}): {voice}",
-                        "local": False
-                    })
-
-        AVAILABLE_TTS_VOICES_CACHE = sorted(all_voices, key=lambda x: x['name'])
-        return AVAILABLE_TTS_VOICES_CACHE
-    except Exception as e:
-        logger.exception("Could not fetch list of TTS voices.")
-        AVAILABLE_TTS_VOICES_CACHE = [] # Cache the failure
-        raise HTTPException(status_code=500, detail=f"Could not retrieve voices list: {e}")
+    # Listing can take a while (network, kokoro-tts runs); it must not block the event loop.
+    return await run_in_threadpool(available_tts_voices)
 
 # --- Standard API endpoint (non-chunked) ---
 @app.post("/api/v1/process", status_code=status.HTTP_202_ACCEPTED, tags=["Webhook API"])
@@ -3840,7 +3981,7 @@ async def get_settings_page(request: Request):
     admin_status = is_admin(request)
     context = {"config": {}, "config_source": "", "secrets_set": {}, "user": user, "is_admin": admin_status,
                "local_only_mode": LOCAL_ONLY_MODE, "allow_command_edits": ALLOW_COMMAND_EDITS,
-               "unavailable_tools": UNAVAILABLE_TOOLS, "ocr_languages": installed_ocr_languages()}
+               "unavailable_tools": UNAVAILABLE_TOOLS, "ocr_languages": await run_in_threadpool(installed_ocr_languages)}
     if not admin_status:
         return templates.TemplateResponse(request, "settings.html", context)
 
@@ -3997,7 +4138,7 @@ def _delete_job_files(jobs) -> tuple[int, list]:
 
 
 FINAL_JOB_STATES = ("completed", "failed", "cancelled")
-MAX_JOBS_PER_DELETE = 1000
+MAX_SELECTED_JOBS = 1000
 
 
 def delete_jobs_and_files(db: Session, jobs: list) -> tuple[list, int]:
@@ -4027,7 +4168,7 @@ def delete_jobs_and_files(db: Session, jobs: list) -> tuple[list, int]:
 @app.post("/jobs/delete")
 async def delete_selected_jobs(payload: JobSelection, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
     """Deletes the selected jobs of the current user, their files and, for ZIP batches, their sub-jobs."""
-    job_ids = list(dict.fromkeys(payload.job_ids))[:MAX_JOBS_PER_DELETE]
+    job_ids = list(dict.fromkeys(payload.job_ids))[:MAX_SELECTED_JOBS]
     if not job_ids:
         raise HTTPException(status_code=400, detail="No job IDs provided.")
     jobs = db.query(Job).filter(Job.id.in_(job_ids), Job.user_id == user['sub']).all()
@@ -4074,9 +4215,47 @@ async def cancel_job(job_id: str, db: Session = Depends(get_db), user: dict = De
         return {"message": "Job cancellation requested."}
     raise HTTPException(status_code=400, detail=f"Job is already in a final state ({job.status}).")
 
+JOB_HISTORY_LIMIT = 100
+MAX_CHANGED_JOBS = 5000
+
+
+def _parse_timestamp(value: str) -> datetime:
+    """Parses an ISO 8601 timestamp (as sent in JobSchema) into the naive UTC the database stores."""
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"Invalid timestamp '{value}'.")
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
 @app.get("/jobs", response_model=List[JobSchema])
-async def get_all_jobs(db: Session = Depends(get_db), user: dict = Depends(require_user)):
-    return get_jobs(db, user_id=user['sub'])
+async def get_all_jobs(since: Optional[str] = None, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+    """
+    Without `since`: the user's most recent jobs, each ZIP batch together with all of its sub-jobs
+    (sub-jobs don't count towards the limit, so a big batch can't push its own parent out of the list).
+    With `since` (an ISO timestamp, e.g. the newest updated_at seen so far): only the jobs created or
+    changed at or after that time, which keeps polling cheap.
+    """
+    if since:
+        return (db.query(Job)
+                .filter(Job.user_id == user['sub'], Job.updated_at >= _parse_timestamp(since))
+                .order_by(Job.updated_at)
+                .limit(MAX_CHANGED_JOBS)
+                .all())
+    jobs = (db.query(Job)
+            .filter(Job.user_id == user['sub'], Job.parent_job_id.is_(None))
+            .order_by(Job.created_at.desc())
+            .limit(JOB_HISTORY_LIMIT)
+            .all())
+    batch_ids = [job.id for job in jobs if job.task_type == "unzip"]
+    for start in range(0, len(batch_ids), 500):
+        jobs += (db.query(Job)
+                 .filter(Job.parent_job_id.in_(batch_ids[start:start + 500]), Job.user_id == user['sub'])
+                 .order_by(Job.created_at.desc())
+                 .all())
+    return jobs
 
 @app.get("/job/{job_id}", response_model=JobSchema)
 async def get_job_status(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
@@ -4124,6 +4303,14 @@ def _content_disposition(filename: str) -> str:
     return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
 
 
+# Formats that are compressed already; they are stored in ZIP downloads as they are.
+PRECOMPRESSED_SUFFIXES = frozenset({
+    ".7z", ".aac", ".avif", ".azw3", ".bz2", ".cbz", ".docx", ".epub", ".flac", ".gif", ".gz", ".heic",
+    ".heif", ".jpeg", ".jpg", ".jxl", ".m4a", ".m4v", ".mkv", ".mobi", ".mov", ".mp3", ".mp4", ".odp",
+    ".ods", ".odt", ".ogg", ".opus", ".pdf", ".png", ".pptx", ".webm", ".webp", ".xlsx", ".xz", ".zip",
+})
+
+
 def _zip_files_response(entries: List[tuple], download_name: str) -> StreamingResponse:
     """
     Builds a ZIP of (path, archive_name) entries in a spooled temp file (memory up to 32 MB,
@@ -4139,7 +4326,9 @@ def _zip_files_response(entries: List[tuple], download_name: str) -> StreamingRe
                 counter += 1
                 unique_name = f"{stem} ({counter}){suffix}"
             used_names.add(unique_name)
-            zip_file.write(file_path, arcname=unique_name)
+            # Deflating media, PDFs or Office files costs a lot of CPU and saves next to nothing.
+            compress_type = zipfile.ZIP_STORED if Path(file_path).suffix.lower() in PRECOMPRESSED_SUFFIXES else zipfile.ZIP_DEFLATED
+            zip_file.write(file_path, arcname=unique_name, compress_type=compress_type)
     spool.seek(0)
 
     def iter_file():
@@ -4154,8 +4343,19 @@ def _zip_files_response(entries: List[tuple], download_name: str) -> StreamingRe
 
 
 @app.post("/download/batch", response_class=StreamingResponse)
-async def download_batch(payload: JobSelection, db: Session = Depends(get_db), user: dict = Depends(require_user)):
-    job_ids = payload.job_ids
+async def download_batch(request: Request, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+    """
+    ZIP of the selected jobs' results. Takes JSON ({"job_ids": [...]}) or a form with repeated
+    job_ids fields; the web UI submits a form so the browser streams the download to disk.
+    """
+    if request.headers.get("content-type", "").startswith(("application/x-www-form-urlencoded", "multipart/form-data")):
+        job_ids = [str(v) for v in (await request.form()).getlist("job_ids")]
+    else:
+        try:
+            job_ids = JobSelection.model_validate(await request.json()).job_ids
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Expected {\"job_ids\": [...]}.")
+    job_ids = list(dict.fromkeys(job_ids))[:MAX_SELECTED_JOBS]
     if not job_ids:
         raise HTTPException(status_code=400, detail="No job IDs provided.")
 
@@ -4201,33 +4401,9 @@ async def get_supported_formats_for_file_type(file_extension: str, user: dict = 
     Get supported output formats for a given file extension.
     The file_extension should include the dot (e.g., '.pdf', '.docx').
     """
-    # Validate file extension format
     if not file_extension.startswith('.'):
         file_extension = '.' + file_extension
-    
-    file_extension = file_extension.lower()
-    conversion_tools = APP_CONFIG.get("conversion_tools", {})
-    
-    # Find tools that support this input extension
-    supported_formats = []
-    for tool_name, tool_config in conversion_tools.items():
-        if tool_name in UNAVAILABLE_TOOLS:
-            continue
-        supported_inputs = tool_config.get("supported_input", [])
-        # Convert supported inputs to lowercase for comparison
-        supported_inputs_lower = [ext.lower() for ext in supported_inputs]
-        
-        if file_extension in supported_inputs_lower:
-            # Add all available formats for this tool
-            for format_key, format_label in tool_config.get("formats", {}).items():
-                full_format_key = f"{tool_name}_{format_key}"
-                supported_formats.append({
-                    "value": full_format_key,
-                    "label": f"{tool_config['name']} - {format_label}",
-                    "tool": tool_name,
-                    "format": format_key
-                })
-    
+    supported_formats = get_supported_output_formats_for_file(f"file{file_extension}", APP_CONFIG.get("conversion_tools", {}))
     return {"formats": supported_formats}
 
 

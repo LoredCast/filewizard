@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Settings - File Wizard</title>
-    <link rel="stylesheet" href="{{ url_for('static', path='/css/style.css') }}">
-    <link rel="stylesheet" href="{{ url_for('static', path='/css/settings.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='/css/style.css') }}?v={{ static_version }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='/css/settings.css') }}?v={{ static_version }}">
 
 </head>
 <body>
@@ -248,6 +248,6 @@
         </main>
     </div>
     
-    <script src="{{ url_for('static', path='/js/settings.js') }}"></script>
+    <script src="{{ url_for('static', path='/js/settings.js') }}?v={{ static_version }}"></script>
 </body>
 </html>
