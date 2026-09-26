@@ -1,5 +1,7 @@
 # main.py (merged)
+import asyncio
 import html
+import json
 import threading
 import logging
 import shutil
@@ -41,7 +43,7 @@ from pytesseract import TesseractNotFoundError
 from PIL import Image, UnidentifiedImageError
 from faster_whisper import WhisperModel
 from fastapi import (Depends, FastAPI, File, Form, HTTPException, Request,
-                     UploadFile, status, Body, WebSocket, Query, WebSocketDisconnect)
+                     UploadFile, status, Body)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -71,9 +73,6 @@ from piper import PiperVoice
 import wave
 import io
 import mimetypes
-
-ENABLE_WEBSOCKETS = False
-
 
 load_dotenv()
 
@@ -467,164 +466,6 @@ try:
 except OSError as e:
     logger.warning(f"File logging disabled: {e}")
 
-# --- WebSocket Connection Manager ---
-import json
-import asyncio
-import threading
-from typing import Dict, List
-from collections import defaultdict
-import time
-
-class ConnectionManager:
-    def __init__(self):
-        # Maps user_id to list of WebSocket connections
-        self.active_connections: Dict[str, List[WebSocket]] = defaultdict(list)
-        # Maps WebSocket to user_id
-        self.connection_to_user: Dict[WebSocket, str] = {}
-        # Maps WebSocket to connection metadata
-        self.connection_metadata: Dict[WebSocket, dict] = {}
-        # Logger
-        self.logger = logging.getLogger(__name__)
-
-    async def connect(self, websocket: WebSocket, user_id: str, connection_id: str = None):
-        await websocket.accept()
-        self.connection_to_user[websocket] = user_id
-        self.connection_metadata[websocket] = {"connection_id": connection_id or str(uuid.uuid4())}
-        self.active_connections[user_id].append(websocket)
-
-    def disconnect(self, websocket: WebSocket):
-        user_id = self.connection_to_user.pop(websocket, None)
-        if user_id and websocket in self.active_connections[user_id]:
-            self.active_connections[user_id].remove(websocket)
-        self.connection_metadata.pop(websocket, None)
-
-    async def send_personal_message(self, message: str, websocket: WebSocket):
-        await websocket.send_text(message)
-
-    async def broadcast_user_jobs(self, user_id: str, message: str):
-        """Send message to all connections for a specific user"""
-        self.logger.debug(f"Broadcasting message to user {user_id}: {message}")
-        if user_id in self.active_connections:
-            disconnected = []
-            sent_count = 0
-            for websocket in self.active_connections[user_id]:
-                try:
-                    await websocket.send_text(message)
-                    sent_count += 1
-                except WebSocketDisconnect:
-                    disconnected.append(websocket)
-            
-            # Remove disconnected connections
-            for websocket in disconnected:
-                self.disconnect(websocket)
-            
-            if sent_count > 0:
-                self.logger.info(f"Sent WebSocket message to {sent_count} connections for user {user_id}")
-        else:
-            self.logger.info(f"No active connections for user {user_id}")
-
-    async def broadcast_job_status_update(self, user_id: str, job_data: dict):
-        """Send job status update to user's connections"""
-        logger = logging.getLogger(__name__)
-        logger.info(f"Broadcasting job update to user {user_id}: job_id={job_data.get('id')}, status={job_data.get('status')}")
-        
-        message = json.dumps({
-            "type": "job_update",
-            "job": job_data,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        })
-        await self.broadcast_user_jobs(user_id, message)
-        logger.info(f"Finished broadcasting job update to user {user_id}")
-
-    async def broadcast_multiple_jobs_update(self, user_id: str, jobs_data: List):
-        """Send multiple job updates to user's connections"""
-        message = json.dumps({
-            "type": "batch_job_update",
-            "jobs": jobs_data,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        })
-        await self.broadcast_user_jobs(user_id, message)
-
-    def sync_broadcast_job_status_update(self, user_id: str, job_data: dict):
-        """Synchronously broadcast job status update - for use from sync contexts like Huey tasks"""
-        logger = logging.getLogger(__name__)
-        job_id = job_data.get('id')
-        status = job_data.get('status')
-        progress = job_data.get('progress')
-        logger.info(f"Queueing WebSocket notification for user {user_id}: job_id={job_id}, status={status}, progress={progress}")
-        
-        try:
-            db = SessionLocal()
-            notification = Notification(
-                user_id=user_id,
-                job_data=json.dumps(job_data)
-            )
-            db.add(notification)
-            db.commit()
-            logger.info(f"Queued WebSocket notification for user {user_id}, job {job_id}")
-        except Exception as e:
-            logger.warning(f"Could not queue WebSocket notification for user {user_id}, job {job_id}: {e}")
-        finally:
-            if db:
-                db.close()
-
-    async def process_notification_queue(self):
-        """Process queued notifications and send them to WebSocket clients"""
-        db = SessionLocal()
-        claimed_notification_data = None
-        try:
-            # Find a notification to process
-            notification_to_process = db.query(Notification).order_by(Notification.created_at).first()
-            if not notification_to_process:
-                return
-
-            # Try to "claim" it by deleting it.
-            notification_id = notification_to_process.id
-            
-            # We need to copy the data before deleting.
-            claimed_notification_data = {
-                "id": notification_id,
-                "user_id": notification_to_process.user_id,
-                "job_data": notification_to_process.job_data
-            }
-
-            deleted_count = db.query(Notification).filter_by(id=notification_id).delete(synchronize_session=False)
-            db.commit()
-
-            if deleted_count == 0:
-                # Another worker got it first.
-                self.logger.debug(f"Notification {notification_id} was already claimed by another worker.")
-                claimed_notification_data = None # Do not process
-        
-        except Exception as e:
-            self.logger.error(f"Error claiming notification from DB: {e}")
-            db.rollback()
-            claimed_notification_data = None # Do not process
-        finally:
-            db.close()
-
-        # --- Process the claimed notification outside the DB transaction ---
-        if claimed_notification_data:
-            try:
-                user_id = claimed_notification_data["user_id"]
-                notification_id = claimed_notification_data["id"]
-                self.logger.debug(f"Processing claimed notification {notification_id} for user {user_id}")
-
-                if user_id in self.active_connections:
-                    job_data = json.loads(claimed_notification_data["job_data"])
-                    message = json.dumps({
-                        "type": "job_update",
-                        "job": job_data,
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    })
-                    await self.broadcast_user_jobs(user_id, message)
-                    self.logger.info(f"Sent claimed notification {notification_id} to user {user_id}")
-            except Exception as e:
-                self.logger.warning(f"Error sending claimed notification {claimed_notification_data['id']}: {e}")
-
-# Initialize manager
-manager = ConnectionManager()
-
 
 def deep_merge(source: dict, dest: dict) -> dict:
     """
@@ -877,12 +718,6 @@ class FinalizeUploadPayload(BaseModel):
 class JobSelection(BaseModel):
     job_ids: List[str]
 
-class Notification(Base):
-    __tablename__ = "notifications"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String, index=True, nullable=False)
-    job_data = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 # --------------------------------------------------------------------------------
 # --- 3. CRUD OPERATIONS & WEBHOOKS
@@ -924,25 +759,13 @@ def update_job_status(db: Session, job_id: str, status: str, progress: int = Non
         if db_job.status == "cancelled" and status != "cancelled":
             # A cancelled job stays cancelled even if its task later finishes or fails.
             return db_job
-        old_status = db_job.status
-        old_progress = db_job.progress
-
         db_job.status = status
         if progress is not None:
             db_job.progress = progress
         if error:
             db_job.error_message = error
 
-        status_changed = old_status != status
-        progress_changed = progress is not None and old_progress != progress
-
         db.commit()
-
-        job_schema = JobSchema.model_validate(db_job)
-
-        # Notifications are only consumed by the WebSocket processor; without it they piled up forever.
-        if ENABLE_WEBSOCKETS and (status_changed or progress_changed) and db_job.user_id:
-            manager.sync_broadcast_job_status_update(db_job.user_id, job_schema.model_dump())
     return db_job
 
 def mark_job_as_completed(db: Session, job_id: str, output_filepath_str: str | None = None, preview: str | None = None):
@@ -2921,46 +2744,8 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"Failed to register OIDC OAuth provider: {e}. Authentication will be disabled.")
                 app.state.oidc_registration_failed = True
-    
-    # Background task for processing WebSocket notification queue
-    async def process_notifications_periodically():
-        """Process WebSocket notification queue periodically"""
-        consecutive_errors = 0
-        max_consecutive_errors = 10
-        
-        while True:
-            try:
-                await manager.process_notification_queue()
-                await asyncio.sleep(0.1)  # Process every 100ms
-                
-                # Reset error counter on success
-                consecutive_errors = 0
-                
-            except Exception as e:
-                consecutive_errors += 1
-                logger.error(f"Error processing WebSocket notifications (consecutive errors: {consecutive_errors}): {e}")
-                
-                # If we have too many consecutive errors, log a warning
-                if consecutive_errors >= max_consecutive_errors:
-                    logger.warning(f"Too many consecutive errors in WebSocket notification processor. Restarting...")
-                    consecutive_errors = 0
-                
-                await asyncio.sleep(min(1 * consecutive_errors, 10))  # Exponential backoff, max 10s
-    
-    if ENABLE_WEBSOCKETS:
-        # Store the task reference so we can cancel it later
-        app.state.notification_processor_task = asyncio.create_task(process_notifications_periodically())
-        logger.info("WebSocket notification processor task started")
-    
+
     yield
-    
-    # Cleanup
-    if ENABLE_WEBSOCKETS and hasattr(app.state, 'notification_processor_task'):
-        app.state.notification_processor_task.cancel()
-        try:
-            await app.state.notification_processor_task
-        except asyncio.CancelledError:
-            pass
 
     if hasattr(app.state, 'download_kokoro_task'):
         app.state.download_kokoro_task.cancel()
@@ -4191,114 +3976,6 @@ async def save_settings(
         logger.exception(f"Failed to update settings for admin '{user.get('email')}'")
         if tmp_path.exists(): tmp_path.unlink()
         raise HTTPException(status_code=500, detail=f"Could not save settings.yml: {e}")
-
-# WebSocket endpoint for real-time job updates
-@app.websocket("/ws/jobs")
-async def websocket_job_updates(websocket: WebSocket, 
-                               token: str = Query(None),
-                               request: Request = None):
-    """
-    WebSocket endpoint for real-time job status updates.
-    Requires authentication via token or session.
-    """
-    if not ENABLE_WEBSOCKETS:
-        await websocket.close(code=1008, reason="WebSockets are disabled")
-        return
-
-    # Get user from either token or session
-    user = None
-    if token:
-        # Validate bearer token for API users  
-        try:
-            from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-            http_bearer = HTTPBearer()
-            creds = HTTPAuthorizationCredentials(credentials=token)
-            user = await require_api_user(request, creds) if not LOCAL_ONLY_MODE else LOCAL_USER
-        except Exception:
-            await websocket.close(code=1008, reason="Invalid token")
-            return
-    elif LOCAL_ONLY_MODE:
-        # In local-only mode, always allow with local user
-        user = LOCAL_USER
-    else:
-        # Get from session for UI users
-        user = get_current_user(request) if request else None
-    
-    if not user:
-        await websocket.close(code=1008, reason="Authentication required")
-        return
-    
-    user_id = user['sub']
-    
-    # Establish connection
-    await manager.connect(websocket, user_id)
-    
-    try:
-        # Send initial connection confirmation
-        await websocket.send_text(json.dumps({
-            "type": "connection_established",
-            "user_id": user_id,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }))
-        logger.info(f"WebSocket connection established for user {user_id}")
-        
-        # Send initial job states
-        db = SessionLocal()
-        try:
-            # Get recent jobs for user
-            recent_jobs = get_jobs(db, user_id=user_id, skip=0, limit=50)  # Configurable limit
-            if recent_jobs:
-                jobs_data = [JobSchema.model_validate(job).model_dump() for job in recent_jobs]
-                await manager.broadcast_multiple_jobs_update(user_id, jobs_data)
-                logger.info(f"Sent initial job states to user {user_id}: {len(jobs_data)} jobs")
-            else:
-                logger.info(f"No initial jobs to send to user {user_id}")
-        finally:
-            db.close()
-        
-        # Listen for messages and maintain connection
-        # Add server-side heartbeat to prevent timeout
-        async def send_keepalive():
-            while True:
-                await asyncio.sleep(45)  # Send keepalive every 45 seconds
-                try:
-                    await websocket.send_text(json.dumps({
-                        "type": "keepalive", 
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    }))
-                except Exception:
-                    # Connection likely closed, break the loop
-                    break
-        
-        # Start keepalive task
-        keepalive_task = asyncio.create_task(send_keepalive())
-        
-        try:
-            while True:
-                # WebSocket operations are handled by the manager and job updates
-                data = await websocket.receive_text()
-                # In the basic implementation, client just sends keep-alive or commands
-                try:
-                    message = json.loads(data)
-                    msg_type = message.get("type", "")
-                    if msg_type == "ping":
-                        await websocket.send_text(json.dumps({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()}))
-                except json.JSONDecodeError:
-                    # Ignore malformed messages
-                    pass
-        finally:
-            # Cancel the keepalive task when connection closes
-            keepalive_task.cancel()
-            try:
-                await keepalive_task
-            except asyncio.CancelledError:
-                pass
-    except WebSocketDisconnect as e:
-        manager.disconnect(websocket)
-        logger.info(f"WebSocket disconnected for user {user_id}. Code: {e.code}, Reason: {e.reason}")
-    except Exception as e:
-        logger.error(f"WebSocket error for user {user_id}: {e}", exc_info=True)
-        manager.disconnect(websocket)
 
 # --------------------------------------------------------------------------------
 # --- JOB MANAGEMENT & UTILITY ROUTES

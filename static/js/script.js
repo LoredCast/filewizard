@@ -115,13 +115,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function pollForJobUpdates() {
-        // If WebSocket is connected, we don't need to poll
-        if (webSocketConnected) {
-            // Still check for any local state issues but don't poll server
-            return;
-        }
-        
-        // Fallback to polling if WebSocket is not connected
         try {
             const allJobs = await authFetch('/jobs').then(res => res.json());
 
@@ -153,14 +146,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function startJobPolling() {
-        // If WebSocket is connected, stop any existing polling
-        if (webSocketConnected && jobPollerInterval) {
-            clearInterval(jobPollerInterval);
-            jobPollerInterval = null;
-            console.log('Stopped polling since WebSocket is connected');
-            return;
-        }
-        
         if (jobPollerInterval) return; // Poller is already running
         
         // Run once immediately, then start the regular interval
@@ -945,169 +930,5 @@ function initializeSelectors() {
         initializeApp();
     } else {
         showLoginView();
-    }
-    
-    // --- WebSocket Manager ---
-    const ENABLE_WEBSOCKETS = false;
-    let webSocket = null;
-    let webSocketConnected = false;
-    let isUsingPollingFallback = false;
-    let reconnectAttempts = 0;
-    const RECONNECT_INTERVAL = 3000; // 3 seconds
-
-    function initializeWebSocket() {
-        // Close existing connection if any
-        if (webSocket) {
-            webSocket.close();
-        }
-
-        // Construct WebSocket URL
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws/jobs`;
-        
-        // For authentication, add token if available (in a production setup)
-        const fullUrl = wsUrl; // For now, no token needed since we're in local mode
-
-        try {
-            webSocket = new WebSocket(fullUrl);
-            
-            webSocket.onopen = function(event) {
-                console.log('WebSocket connected');
-                webSocketConnected = true;
-                isUsingPollingFallback = false;
-                reconnectAttempts = 0; // Reset on successful connection
-                // Start a heartbeat to keep connection alive
-                startHeartbeat();
-                // Update polling behavior since WebSocket is connected
-                if (jobPollerInterval) {
-                    clearInterval(jobPollerInterval);
-                    jobPollerInterval = null;
-                    console.log('Stopped polling since WebSocket is connected');
-                }
-            };
-
-            webSocket.onmessage = function(event) {
-                try {
-                    const data = JSON.parse(event.data);
-                    handleWebSocketMessage(data);
-                } catch (error) {
-                    console.error('Error parsing WebSocket message:', error);
-                }
-            };
-
-            webSocket.onclose = function(event) {
-                console.log('WebSocket disconnected:', event.code, event.reason);
-                webSocketConnected = false;
-                isUsingPollingFallback = true;
-                // Attempt to reconnect
-                attemptReconnect();
-                // Start polling as a fallback
-                startJobPolling();
-            };
-
-            webSocket.onerror = function(error) {
-                console.error('WebSocket error:', error);
-                webSocketConnected = false;
-            };
-        } catch (error) {
-            console.error('Failed to create WebSocket connection:', error);
-            attemptReconnect();
-        }
-    }
-
-    function handleWebSocketMessage(data) {
-        switch (data.type) {
-            case 'connection_established':
-                console.log('WebSocket connection established for user:', data.user_id);
-                updateConnectionStatus(true);
-                break;
-                
-            case 'job_update':
-                // Update a single job
-                if (data.job) {
-                    const jobId = data.job.id;
-                    console.log('Received job update:', jobId, data.job.status, data.job.progress);
-                    renderJobRow(data.job);
-                }
-                break;
-                
-            case 'batch_job_update':
-                // Update multiple jobs
-                if (data.jobs && Array.isArray(data.jobs)) {
-                    data.jobs.forEach(job => {
-                        renderJobRow(job);
-                    });
-                }
-                break;
-                
-            case 'pong':
-                // Heartbeat response
-                break;
-                
-            default:
-                console.log('Unknown WebSocket message type:', data.type);
-        }
-    }
-
-    function attemptReconnect() {
-        reconnectAttempts++;
-        const delay = Math.min(RECONNECT_INTERVAL * Math.pow(2, reconnectAttempts), 30000); // Exponential backoff up to 30 seconds
-        console.log(`Attempting to reconnect... (attempt ${reconnectAttempts}, next in ${delay / 1000}s)`);
-        setTimeout(initializeWebSocket, delay);
-    }
-
-    let heartbeatInterval;
-
-    function startHeartbeat() {
-        // Clear existing interval
-        if (heartbeatInterval) {
-            clearInterval(heartbeatInterval);
-        }
-        
-        // Send ping every 30 seconds to keep connection alive
-        heartbeatInterval = setInterval(() => {
-            if (webSocket && webSocket.readyState === WebSocket.OPEN) {
-                webSocket.send(JSON.stringify({ type: 'ping' }));
-            }
-        }, 30000); // 30 seconds
-    }
-
-    function stopHeartbeat() {
-        if (heartbeatInterval) {
-            clearInterval(heartbeatInterval);
-            heartbeatInterval = null;
-        }
-    }
-
-
-
-
-    // Connection status UI updates
-    function updateConnectionStatus(connected) {
-        const statusDot = document.getElementById('status-indicator');
-        const statusText = document.getElementById('status-text');
-        
-        if (statusDot && statusText) {
-            if (connected) {
-                statusDot.className = 'status-dot connected';
-                statusText.textContent = 'Real-time connection';
-            } else {
-                statusDot.className = 'status-dot disconnected';
-                statusText.textContent = 'Polling active';
-            }
-        }
-    }
-    
-    // Close WebSocket when page unloads
-    window.addEventListener('beforeunload', () => {
-        if (webSocket) {
-            stopHeartbeat();
-            webSocket.close();
-        }
-    });
-    
-    // Initialize WebSocket connection after UI is set up
-    if (ENABLE_WEBSOCKETS && window.APP_CONFIG && (window.APP_CONFIG.local_only_mode || window.APP_CONFIG.user)) {
-        initializeWebSocket();
     }
 });
