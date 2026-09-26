@@ -126,7 +126,7 @@ Building under emulation is slow: expect one to two hours for the arm64 images.
    ```
    The tag also starts the workflow below. Without the Docker Hub secrets in the repository it only builds and tests the images; with them, it would publish its own build under the same tags.
 
-Settings (environment variables): `IMAGE` (another repository, default `loredcast/filewizard`), `VARIANTS` (default `full small cuda`), `PLATFORMS` (default `linux/amd64,linux/arm64`), `BUILDER` (default `filewizard`, created if missing) and `BUILD_FLAGS` (extra `docker buildx build` flags, e.g. `--no-cache` or `--secret id=build_ca,src=...`). For example, a quick test of the small amd64 image only: `VARIANTS=small PLATFORMS=linux/amd64 scripts/docker-release.sh test 0.5.0`. The `test` tags stay on Docker Hub until the next test build replaces them; delete them on the repository's *Tags* page if you like.
+Settings (environment variables): `IMAGE` (another repository, default `loredcast/filewizard`), `VARIANTS` (default `full small cuda`), `PLATFORMS` (default `linux/amd64,linux/arm64`), `BUILDER` (default `filewizard`, created if missing), `BUILD_FLAGS` (extra `docker buildx build` flags, e.g. `--no-cache` or `--secret id=build_ca,src=...`) and `TEST_TAG` (default `test`: the tag the test step pushes and promote reads; `TEST_TAG=nightly` publishes `nightly`, `nightly-small` and `nightly-cuda` and leaves the `test` images alone). For example, a quick test of the small amd64 image only: `VARIANTS=small PLATFORMS=linux/amd64 scripts/docker-release.sh test 0.5.0`. The `test` tags stay on Docker Hub until the next test build replaces them; delete them on the repository's *Tags* page if you like.
 
 ### With GitHub Actions
 

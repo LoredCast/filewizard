@@ -19,6 +19,9 @@
 #   PLATFORMS    platforms of the full and small images (default: linux/amd64,linux/arm64);
 #                the cuda image is linux/amd64 only
 #   BUILDER      buildx builder to use (default: "filewizard", created if missing)
+#   TEST_TAG     tag the test step pushes and promote reads (default: "test", giving test,
+#                test-small and test-cuda). E.g. TEST_TAG=nightly publishes a nightly build
+#                without replacing the images under the test tags.
 #   BUILD_FLAGS  extra flags for `docker buildx build`, e.g. "--no-cache" or
 #                "--secret id=build_ca,src=/path/to/proxy-ca.crt"
 #
@@ -29,6 +32,7 @@ IMAGE="${IMAGE:-loredcast/filewizard}"
 VARIANTS="${VARIANTS:-full small cuda}"
 PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
 BUILDER="${BUILDER:-filewizard}"
+TEST_TAG="${TEST_TAG:-test}"
 BUILD_FLAGS="${BUILD_FLAGS:-}"
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -128,7 +132,7 @@ cmd_test() {
             echo "Skipping ${variant}: it is not built for ${PLATFORMS}"
             continue
         fi
-        tag="${IMAGE}:test$(suffix "${variant}")"
+        tag="${IMAGE}:${TEST_TAG}$(suffix "${variant}")"
         echo "=== Building ${variant} for ${platforms} and pushing ${tag}"
         # shellcheck disable=SC2086  # BUILD_FLAGS holds several flags
         docker buildx build --builder "${BUILDER}" --platform "${platforms}" \
@@ -146,7 +150,11 @@ cmd_test() {
         echo "    docker pull ${tag} && docker/smoke-test.sh ${tag}"
     done
     echo "then publish them under the release tags:"
-    echo "    $0 promote ${version}"
+    if [ "${TEST_TAG}" = "test" ]; then
+        echo "    $0 promote ${version}"
+    else
+        echo "    TEST_TAG=${TEST_TAG} $0 promote ${version}"
+    fi
 }
 
 cmd_promote() {
@@ -156,14 +164,14 @@ cmd_promote() {
         if [ -z "$(platforms_for "${variant}")" ]; then
             continue
         fi
-        source="${IMAGE}:test$(suffix "${variant}")"
+        source="${IMAGE}:${TEST_TAG}$(suffix "${variant}")"
         # Refuse to release a test image that was built for another version.
         config="$(docker buildx imagetools inspect "${source}" --format '{{json .Image}}')" \
-            || die "could not read ${source}; build it with: $0 test ${version}"
+            || die "could not read ${source}; build it with: TEST_TAG=${TEST_TAG} $0 test ${version}"
         built="$(echo "${config}" | grep -o '"org.opencontainers.image.version": *"[^"]*"' \
             | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/')"
         if [ "${built}" != "${version}" ]; then
-            die "${source} was built as version '${built}', not ${version}; run: $0 test ${version}"
+            die "${source} was built as version '${built}', not ${version}; run: TEST_TAG=${TEST_TAG} $0 test ${version}"
         fi
         args=""
         for name in $(release_tags "${version}" "${variant}"); do
@@ -182,6 +190,8 @@ cmd_promote() {
 }
 
 [ $# -ge 2 ] || usage
+echo "${TEST_TAG}" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,100}$' \
+    || die "TEST_TAG '${TEST_TAG}' is not a valid Docker tag"
 command="$1"
 check_version "$2"
 for variant in ${VARIANTS}; do
