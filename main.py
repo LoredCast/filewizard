@@ -785,8 +785,14 @@ def mark_job_as_completed(db: Session, job_id: str, output_filepath_str: str | N
         update_job_status(db, job_id, "completed", progress=100)
     return db_job
 
+WEBHOOK_ATTEMPTS = 3
+
+
 def send_webhook_notification(job_id: str, app_config: Dict[str, Any], base_url: str):
-    """Sends a notification to the callback URL if one is configured for the job."""
+    """
+    Sends a notification to the callback URL if one is configured for the job. Connection errors,
+    5xx and 429 responses are retried (3 attempts in total, 2 s and 4 s apart).
+    """
     webhook_config = app_config.get("webhook_settings", {})
     if not webhook_config.get("enabled", False):
         return
@@ -807,6 +813,7 @@ def send_webhook_notification(job_id: str, app_config: Dict[str, Any], base_url:
             else:
                 download_url = urljoin(public_url, f"/download/{filename}")
 
+        callback_url = job.callback_url
         payload = {
             "job_id": job.id,
             "status": job.status,
@@ -816,26 +823,36 @@ def send_webhook_notification(job_id: str, app_config: Dict[str, Any], base_url:
             "created_at": job.created_at.isoformat() + "Z",
             "updated_at": job.updated_at.isoformat() + "Z",
         }
-
-        headers = {"Content-Type": "application/json", "User-Agent": "FileProcessor-Webhook/1.0"}
-        token = webhook_config.get("callback_bearer_token")
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-
-        try:
-            with httpx.Client() as client:
-                response = client.post(job.callback_url, json=payload, headers=headers, timeout=15)
-                response.raise_for_status()
-            logger.info(f"Sent webhook notification for job {job_id} to {job.callback_url} (Status: {response.status_code})")
-        except httpx.RequestError as e:
-            logger.error(f"Failed to send webhook for job {job_id} to {job.callback_url}: {e}")
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Webhook for job {job_id} received non-2xx response {e.response.status_code} from {job.callback_url}")
-
     except Exception as e:
         logger.exception(f"An unexpected error occurred in send_webhook_notification for job {job_id}: {e}")
+        return
     finally:
-        db.close()
+        db.close()  # not held open while the callback (and its retries) run
+
+    headers = {"Content-Type": "application/json", "User-Agent": "FileProcessor-Webhook/1.0"}
+    token = webhook_config.get("callback_bearer_token")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    for attempt in range(1, WEBHOOK_ATTEMPTS + 1):
+        try:
+            with httpx.Client() as client:
+                response = client.post(callback_url, json=payload, headers=headers, timeout=15)
+            if response.is_success:
+                logger.info(f"Sent webhook notification for job {job_id} to {callback_url} (Status: {response.status_code})")
+                return
+            problem = f"non-2xx response {response.status_code}"
+            retryable = response.status_code >= 500 or response.status_code == 429
+        except httpx.RequestError as e:
+            problem, retryable = f"request error: {e}", True
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred sending the webhook for job {job_id}: {e}")
+            return
+        if not retryable or attempt == WEBHOOK_ATTEMPTS:
+            logger.error(f"Webhook for job {job_id} to {callback_url} failed after {attempt} attempt(s): {problem}")
+            return
+        logger.warning(f"Webhook for job {job_id} to {callback_url} failed ({problem}); retrying.")
+        time.sleep(2 ** attempt)
 
 
 # --------------------------------------------------------------------------------
@@ -1657,8 +1674,6 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
         logger.info(f"Detected language: {info.language} with probability {info.language_probability:.2f} for a duration of {info.duration:.2f}s")
 
         last_update_time = time.time()
-        last_db_refresh_time = time.time()
-        DB_REFRESH_INTERVAL = 30
 
         update_job_status(db, job_id, "processing", progress=5)
         logger.info(f"Transcription job {job_id} started, progress at 5%")
@@ -1668,56 +1683,31 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
         preview_segments = []
         PREVIEW_MAX_LENGTH = 1000
         current_preview_length = 0
+        srt_formatter = SrtFormatter() if generate_timestamps else None
 
         with tmp_output_path.open("w", encoding="utf-8") as f:
-            if generate_timestamps:
-                srt_formatter = SrtFormatter()
-                for segment in segments_generator:
-                    formatted_srt = srt_formatter.format_segment(segment)
-                    f.write(formatted_srt)
-                    
-                    segment_text = segment.text.strip()
-                    if current_preview_length < PREVIEW_MAX_LENGTH:
-                        preview_segments.append(segment_text)
-                        current_preview_length += len(segment_text)
-                    
-                    current_time = time.time()
-                    if current_time - last_db_refresh_time > DB_REFRESH_INTERVAL:
-                        db.close()
-                        db = SessionLocal()
-                        last_db_refresh_time = current_time
+            for segment in segments_generator:
+                segment_text = segment.text.strip()
+                f.write(srt_formatter.format_segment(segment) if srt_formatter else segment_text + "\n")
 
-                    if current_time - last_update_time > DB_POLL_INTERVAL_SECONDS:
-                        last_update_time = current_time
-                        if _current_job_status(db, job_id) in (None, 'cancelled'):
-                            logger.info(f"Job {job_id} cancelled or deleted during transcription. Stopping.")
-                            return
-                        if info.duration > 0:
-                            progress = int((segment.end / info.duration) * 100)
-                            update_job_status(db, job_id, "processing", progress=progress)
-            else:
-                for segment in segments_generator:
-                    segment_text = segment.text.strip()
-                    f.write(segment_text + "\n")
+                if current_preview_length < PREVIEW_MAX_LENGTH:
+                    preview_segments.append(segment_text)
+                    current_preview_length += len(segment_text)
 
-                    if current_preview_length < PREVIEW_MAX_LENGTH:
-                        preview_segments.append(segment_text)
-                        current_preview_length += len(segment_text)
-
-                    current_time = time.time()
-                    if current_time - last_db_refresh_time > DB_REFRESH_INTERVAL:
-                        db.close()
-                        db = SessionLocal()
-                        last_db_refresh_time = current_time
-
-                    if current_time - last_update_time > DB_POLL_INTERVAL_SECONDS:
-                        last_update_time = current_time
-                        if _current_job_status(db, job_id) in (None, 'cancelled'):
-                            logger.info(f"Job {job_id} cancelled or deleted during transcription. Stopping.")
-                            return
-                        if info.duration > 0:
-                            progress = int((segment.end / info.duration) * 100)
-                            update_job_status(db, job_id, "processing", progress=progress)
+                current_time = time.time()
+                if current_time - last_update_time > DB_POLL_INTERVAL_SECONDS:
+                    last_update_time = current_time
+                    # Still in use: the idle-model eviction must not unload it (the next job would
+                    # then load a second copy while this one still holds the first).
+                    with _cache_lock:
+                        if model_size in WHISPER_MODELS_CACHE:
+                            WHISPER_MODELS_LAST_USED[model_size] = current_time
+                    if _current_job_status(db, job_id) in (None, 'cancelled'):
+                        logger.info(f"Job {job_id} cancelled or deleted during transcription. Stopping.")
+                        return
+                    if info.duration > 0:
+                        progress = min(99, int((segment.end / info.duration) * 100))
+                        update_job_status(db, job_id, "processing", progress=progress)
 
         tmp_output_path.replace(output_path)
 
@@ -2637,21 +2627,75 @@ def unzip_and_dispatch_task(job_id: str, input_path_str: str, sub_task_type: str
 
 
 _huey_startup_lock = threading.Lock()
+# Everything this process runs is marked 'processing' after this moment (set at import, before
+# the consumer starts its workers).
+_PROCESS_STARTED_AT = datetime.now(timezone.utc).replace(tzinfo=None)
+_interrupted_jobs_recovered = False
+INTERRUPTED_JOB_MESSAGE = "Interrupted: the background worker restarted while this job was running. Please submit it again."
+
+
+def recover_interrupted_jobs(started_before: datetime) -> None:
+    """
+    huey does not re-run a task it had already taken from the queue, so jobs that were running
+    when the worker stopped (container restart, crash, out of memory) stayed 'processing' forever
+    and the page kept polling them. Marks them failed. Queued ('pending') jobs are left alone:
+    their tasks are still in the queue.
+    """
+    db = SessionLocal()
+    try:
+        interrupted = (db.query(Job)
+                       .filter(Job.status == "processing", Job.task_type != "unzip", Job.updated_at < started_before)
+                       .all())
+        # A batch stays 'pending' while its archive is unpacked; one that already has sub-jobs was cut off.
+        has_sub_jobs = db.query(Job.parent_job_id).filter(Job.parent_job_id.isnot(None))
+        cut_off_batches = (db.query(Job)
+                           .filter(Job.task_type == "unzip", Job.status == "pending", Job.updated_at < started_before,
+                                   Job.id.in_(has_sub_jobs))
+                           .all())
+        if not interrupted and not cut_off_batches:
+            return
+        for job in interrupted:
+            job.status, job.error_message = "failed", INTERRUPTED_JOB_MESSAGE
+        for job in cut_off_batches:
+            job.status = "failed"
+            job.error_message = ("Interrupted while unpacking the archive (the background worker restarted). "
+                                 "The files unpacked before that are still processed.")
+        db.commit()
+        logger.warning(f"Marked {len(interrupted)} interrupted jobs and {len(cut_off_batches)} batches as failed.")
+
+        for job in interrupted:
+            try:
+                ensure_path_is_safe(Path(job.input_filepath), [PATHS.UPLOADS_DIR, PATHS.CHUNK_TMP_DIR]).unlink(missing_ok=True)
+            except Exception:
+                logger.debug(f"Could not remove the input of interrupted job {job.id}", exc_info=True)
+        for parent_id in {job.parent_job_id for job in interrupted if job.parent_job_id}:
+            _update_parent_zip_job_progress.call_local(parent_id)
+        for job in interrupted + cut_off_batches:
+            if job.callback_url:
+                send_webhook_notification(job.id, APP_CONFIG, "")
+    except Exception:
+        logger.exception("Could not check for jobs interrupted by a restart.")
+    finally:
+        db.close()
 
 
 @huey.on_startup()
 def _init_huey_worker():
     """
     The huey consumer is a separate process that never runs the FastAPI lifespan: load the
-    settings there and run the Whisper cache eviction where the models are actually loaded.
+    settings there, fail the jobs a previous worker left unfinished, and run the Whisper cache
+    eviction where the models are actually loaded. huey calls this in every worker.
     """
-    global _cache_cleanup_thread
+    global _cache_cleanup_thread, _interrupted_jobs_recovered
     with _huey_startup_lock:
         if not APP_CONFIG:
             try:
                 load_app_config()
             except Exception:
                 logger.exception("Huey worker could not load settings.")
+        if not _interrupted_jobs_recovered:
+            _interrupted_jobs_recovered = True
+            recover_interrupted_jobs(_PROCESS_STARTED_AT)
         if _cache_cleanup_thread is None:
             _cache_cleanup_thread = threading.Thread(target=_whisper_cache_cleanup_worker, daemon=True)
             _cache_cleanup_thread.start()
@@ -2683,12 +2727,26 @@ def apply_retention_policy():
 
 
 STALE_UPLOAD_HOURS = float(os.environ.get("STALE_UPLOAD_HOURS", "6"))
+# "<name>.tmp-<uuid hex>[.ext]": partial files written before an atomic rename. Real inputs and
+# results end in "_<job id>.<ext>", so they never match.
+TEMP_FILE_RE = re.compile(r"\.tmp-[0-9a-f]{32}(\.[A-Za-z0-9]{1,10})?$")
 
 
 @huey.periodic_task(crontab(minute="*/30"))
 def cleanup_stale_uploads():
-    """Removes abandoned chunked uploads and ZIP extraction directories of finished batches."""
+    """
+    Removes abandoned chunked uploads, ZIP extraction directories of finished batches, and
+    partial files left behind by interrupted uploads and conversions.
+    """
     cutoff = time.time() - STALE_UPLOAD_HOURS * 3600
+    for base in (PATHS.UPLOADS_DIR, PATHS.PROCESSED_DIR):
+        for entry in base.glob("*.tmp-*"):
+            try:
+                if TEMP_FILE_RE.search(entry.name) and entry.is_file() and not entry.is_symlink() and entry.stat().st_mtime < cutoff:
+                    entry.unlink()
+                    logger.info(f"Removed stale temporary file {entry.name}")
+            except OSError:
+                logger.exception(f"Could not remove stale temporary file {entry}")
     removed = 0
     db = SessionLocal()
     try:
@@ -4166,7 +4224,7 @@ def delete_jobs_and_files(db: Session, jobs: list) -> tuple[list, int]:
 
 
 @app.post("/jobs/delete")
-async def delete_selected_jobs(payload: JobSelection, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
+def delete_selected_jobs(payload: JobSelection, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
     """Deletes the selected jobs of the current user, their files and, for ZIP batches, their sub-jobs."""
     job_ids = list(dict.fromkeys(payload.job_ids))[:MAX_SELECTED_JOBS]
     if not job_ids:
@@ -4183,21 +4241,22 @@ async def delete_selected_jobs(payload: JobSelection, db: Session = Depends(get_
 
 
 @app.post("/settings/clear-history")
-async def clear_job_history(db: Session = Depends(get_db), user: dict = Depends(require_user)):
-    """Deletes the user's job records together with their processed files (they'd be unreachable otherwise)."""
+def clear_job_history(db: Session = Depends(get_db), user: dict = Depends(require_user)):
+    """
+    Deletes the user's job records together with their processed files (they'd be unreachable
+    otherwise). Running jobs are cancelled first, so their converters are stopped.
+    """
     try:
-        files_deleted, _errors = _delete_job_files(get_jobs(db, user_id=user['sub'], limit=None))
-        num_deleted = db.query(Job).filter(Job.user_id == user['sub']).delete()
-        db.commit()
-        logger.info(f"Cleared {num_deleted} jobs and {files_deleted} files for user {user['sub']}.")
-        return {"deleted_count": num_deleted, "files_deleted": files_deleted}
+        deleted_ids, files_deleted = delete_jobs_and_files(db, db.query(Job).filter(Job.user_id == user['sub']).all())
+        logger.info(f"Cleared {len(deleted_ids)} jobs and {files_deleted} files for user {user['sub']}.")
+        return {"deleted_count": len(deleted_ids), "files_deleted": files_deleted}
     except Exception:
         db.rollback()
         logger.exception("Failed to clear job history")
         raise HTTPException(status_code=500, detail="Database error while clearing history.")
 
 @app.post("/settings/delete-files")
-async def delete_processed_files(db: Session = Depends(get_db), user: dict = Depends(require_user)):
+def delete_processed_files(db: Session = Depends(get_db), user: dict = Depends(require_user)):
     # All of the user's jobs, not just the 100 most recent ones.
     deleted_count, errors = _delete_job_files(get_jobs(db, user_id=user['sub'], limit=None))
     if errors:
@@ -4206,13 +4265,14 @@ async def delete_processed_files(db: Session = Depends(get_db), user: dict = Dep
     return {"deleted_count": deleted_count}
 
 @app.post("/job/{job_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
-async def cancel_job(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+def cancel_job(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
     job = get_job(db, job_id)
     if not job or job.user_id != user['sub']:
         raise HTTPException(status_code=404, detail="Job not found.")
     if job.status in ["pending", "processing"]:
-        update_job_status(db, job_id, status="cancelled")
-        return {"message": "Job cancellation requested."}
+        job = update_job_status(db, job_id, status="cancelled")
+        # The updated job lets the page show the new state without waiting for its next poll.
+        return {"message": "Job cancellation requested.", "job": JobSchema.model_validate(job).model_dump()}
     raise HTTPException(status_code=400, detail=f"Job is already in a final state ({job.status}).")
 
 JOB_HISTORY_LIMIT = 100
@@ -4231,7 +4291,7 @@ def _parse_timestamp(value: str) -> datetime:
 
 
 @app.get("/jobs", response_model=List[JobSchema])
-async def get_all_jobs(since: Optional[str] = None, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+def get_all_jobs(since: Optional[str] = None, db: Session = Depends(get_db), user: dict = Depends(require_user)):
     """
     Without `since`: the user's most recent jobs, each ZIP batch together with all of its sub-jobs
     (sub-jobs don't count towards the limit, so a big batch can't push its own parent out of the list).
@@ -4258,7 +4318,7 @@ async def get_all_jobs(since: Optional[str] = None, db: Session = Depends(get_db
     return jobs
 
 @app.get("/job/{job_id}", response_model=JobSchema)
-async def get_job_status(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
+def get_job_status(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
     job = get_job(db, job_id)
     if not job or job.user_id != user['sub']:
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -4270,7 +4330,7 @@ class JobStatusRequest(BaseModel):
     job_ids: TypingList[str]
 
 @app.post("/api/v1/jobs/status", response_model=TypingList[JobSchema])
-async def get_jobs_status(payload: JobStatusRequest, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
+def get_jobs_status(payload: JobStatusRequest, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
     """
     Accepts a list of job IDs and returns their current status.
     This is used by the frontend for polling active jobs.
@@ -4285,7 +4345,7 @@ async def get_jobs_status(payload: JobStatusRequest, db: Session = Depends(get_d
 
 
 @app.get("/download/{filename}")
-async def download_file(filename: str, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
+def download_file(filename: str, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
     file_path = ensure_path_is_safe(PATHS.PROCESSED_DIR / filename, [PATHS.PROCESSED_DIR])
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found.")
