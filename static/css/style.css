@@ -176,6 +176,14 @@ header p {
     background-color: #bafaff; /* Error color */
 }
 
+.status-dot.idle {
+    background-color: var(--muted-text);
+}
+
+.status-dot.error {
+    background-color: var(--error-color);
+}
+
 .header-actions div {
     position: fixed;
     left: 0;
@@ -524,7 +532,7 @@ input[type="file"] {
     display: inline-block;
     white-space: nowrap;
 }
-.status-pending, .status-processing {
+.status-pending, .status-processing, .status-queued, .status-uploading {
     background-color: rgba(0,180,255,0.15);
     color: var(--primary-hover);
 }

@@ -31,8 +31,8 @@
                     </div>
                 {% endif %}
                 <div id="connection-status" class="connection-status">
-                    <span id="status-indicator" class="status-dot disconnected"></span>
-                    <span id="status-text">Polling active</span>
+                    <span id="status-indicator" class="status-dot idle"></span>
+                    <span id="status-text">Connecting…</span>
                 </div>
                 <a href="/settings" title="Settings" class="settings-link"><i class="fa">&#xf1de;</i></a>
             </div>
@@ -185,7 +185,7 @@
         <span id="input-format-count"></span> in | <span id="output-format-count"></span> out
     </div>
     <!-- Server-side configuration for script.js. A data block (not executed) keeps inline scripts out so the CSP can forbid them. -->
-    <script type="application/json" id="app-config">{{ {"conversionTools": conversion_tools, "user": user, "local_only_mode": local_only_mode} | tojson }}</script>
+    <script type="application/json" id="app-config">{{ {"conversionTools": conversion_tools, "uploadLimits": upload_limits, "user": user, "local_only_mode": local_only_mode} | tojson }}</script>
 
     <script src="{{ url_for('static', path='/vendor/choices/choices.min.js') }}?v={{ static_version }}"></script>
     <script src="{{ url_for('static', path='/js/script.js') }}?v={{ static_version }}"></script>

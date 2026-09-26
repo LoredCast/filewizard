@@ -53,7 +53,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from huey import SqliteHuey, crontab
 from pydantic import BaseModel, ConfigDict, field_serializer
 from sqlalchemy import (Column, DateTime, Index, Integer, String, Text,
-                        create_engine, delete, event, func, text)
+                        create_engine, delete, event, func, inspect, text)
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import NullPool
 from sqlalchemy.exc import OperationalError
@@ -2300,6 +2300,9 @@ def run_conversion_task(job_id: str,
         except Exception:
             logger.exception("Failed to send webhook notification after conversion.")
 
+OCR_IMAGE_EXTENSIONS = frozenset({'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.webp'})
+
+
 def dispatch_single_file_job(original_filename: str, input_filepath: str, task_type: str, user: dict, db: Session, app_config: Dict, base_url: str, job_id: str | None = None, options: Dict = None, parent_job_id: str | None = None) -> Optional[str]:
     """Helper to create and dispatch a job for a single file. Returns the job id, or None if no job was created."""
     if options is None:
@@ -2352,8 +2355,7 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
         run_tts_task(job_data.id, str(final_path), str(processed_path), options.get("model_name"), tts_config, app_config, base_url)
     elif task_type == "ocr":
         stem, suffix = Path(safe_filename).stem, Path(safe_filename).suffix.lower()
-        IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.webp'}
-        if suffix not in IMAGE_EXTENSIONS and suffix != '.pdf':
+        if suffix not in OCR_IMAGE_EXTENSIONS and suffix != '.pdf':
             logger.warning(f"Skipping unsupported file type for OCR: {original_filename}")
             # Clean up the orphaned file from the zip extraction
             final_path.unlink(missing_ok=True)
@@ -2368,7 +2370,7 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
         processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.pdf"
         job_data.processed_filepath = str(processed_path)
         create_job(db=db, job=job_data)
-        if suffix in IMAGE_EXTENSIONS:
+        if suffix in OCR_IMAGE_EXTENSIONS:
             run_image_ocr_task(job_data.id, str(final_path), str(processed_path), app_config, base_url, ocr_language)
         else:
             run_pdf_ocr_task(job_data.id, str(final_path), str(processed_path), dict(ocr_settings, language=ocr_language), app_config, base_url)
@@ -2641,6 +2643,8 @@ def recover_interrupted_jobs(started_before: datetime) -> None:
     and the page kept polling them. Marks them failed. Queued ('pending') jobs are left alone:
     their tasks are still in the queue.
     """
+    if not inspect(engine).has_table(Job.__tablename__):
+        return  # fresh install: the web server has not created the database yet
     db = SessionLocal()
     try:
         interrupted = (db.query(Job)
@@ -3880,16 +3884,24 @@ async def get_index(request: Request):
     user = get_current_user(request)
     admin_status = is_admin(request)
     whisper_models = APP_CONFIG.get("transcription_settings", {}).get("whisper", {}).get("allowed_models", [])
-    # The browser only needs names and output formats; command templates stay server-side.
+    # The browser only needs names, inputs and output formats; command templates stay server-side.
     conversion_tools = {
-        tool_id: {"name": tool.get("name", tool_id), "formats": tool.get("formats") or {}}
+        tool_id: {"name": tool.get("name", tool_id), "formats": tool.get("formats") or {},
+                  "supported_input": sorted({str(ext).lower() for ext in tool.get("supported_input") or []})}
         for tool_id, tool in APP_CONFIG.get("conversion_tools", {}).items()
         if isinstance(tool, dict) and tool_id not in UNAVAILABLE_TOOLS
+    }
+    app_settings = APP_CONFIG.get("app_settings", {})
+    # Lets the page reject files the server would refuse before uploading them.
+    upload_limits = {
+        "max_file_size_bytes": _max_upload_bytes(),
+        "allowed_extensions": sorted(str(ext).lower() for ext in app_settings.get("allowed_all_extensions") or []),
+        "ocr_extensions": sorted(OCR_IMAGE_EXTENSIONS | {".pdf"}),
     }
     return templates.TemplateResponse(request, "index.html", {
         "user": user, "is_admin": admin_status,
         "whisper_models": sorted(list(whisper_models)),
-        "conversion_tools": conversion_tools, "local_only_mode": LOCAL_ONLY_MODE
+        "conversion_tools": conversion_tools, "upload_limits": upload_limits, "local_only_mode": LOCAL_ONLY_MODE
     })
 
 # --- Settings page & API ---
