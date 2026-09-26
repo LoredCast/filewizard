@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Faster
+
+- The job history only fetches jobs that changed, polls less often while nothing changes, and pauses in background tabs.
+- Jobs start within a second of being submitted (the background worker could take up to 10 s after a quiet spell).
+- Image OCR runs Tesseract once per page instead of twice, and multi-page TIFFs no longer have to fit in memory. PDF OCR no longer reads the whole result to build its preview.
+- Output formats for the chosen files appear instantly; with several files, only formats that work for all of them are offered.
+- Up to 3 files upload at a time and the rest wait in a queue, so the first ones are processed sooner.
+- Pages, scripts and job lists are compressed, and scripts and styles are cached by the browser until the next update.
+- The TTS voice list no longer stalls the page (offline it could take ~90 s), is cached for all workers, and also lists voices that are already downloaded.
+- "Download Selected as ZIP" streams to disk and skips re-compressing media, PDF and Office files.
+
+### More reliable
+
+- Jobs interrupted by a restart of the container or worker are marked as failed instead of staying "processing" forever.
+- Upload chunks are retried after network errors; files that are too large, not allowed, or not valid for OCR are rejected before uploading. Uploads can be cancelled, and closing the tab mid-upload asks first.
+- Webhook callbacks are retried after connection errors and 5xx responses.
+- ZIP batches skip files the chosen converter does not accept instead of failing them, and big batches no longer push their own entry out of the history.
+- The File Size column shows the output size as soon as a job finishes; cancelling shows immediately; "Clear History" stops running jobs.
+- Leftover temporary files of interrupted uploads and conversions are cleaned up.
+
 ## 0.5.0
 
 FileWizard 0.5 is about security, reliability and a rebuilt Docker image. The image now also runs on arm64 (Raspberry Pi 4/5, Apple Silicon, ARM servers), no longer runs as root, and the GPU image works again. Many conversions that failed in 0.4 now work. It also adds the most requested features from the issue tracker.

@@ -4284,7 +4284,7 @@ def cancel_job(job_id: str, db: Session = Depends(get_db), user: dict = Depends(
     if job.status in ["pending", "processing"]:
         job = update_job_status(db, job_id, status="cancelled")
         # The updated job lets the page show the new state without waiting for its next poll.
-        return {"message": "Job cancellation requested.", "job": JobSchema.model_validate(job).model_dump()}
+        return {"message": "Job cancellation requested.", "job": JobSchema.model_validate(job).model_dump() if job else None}
     raise HTTPException(status_code=400, detail=f"Job is already in a final state ({job.status}).")
 
 JOB_HISTORY_LIMIT = 100
