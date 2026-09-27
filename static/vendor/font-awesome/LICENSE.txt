@@ -1,0 +1,4 @@
+Font Awesome 4.7.0 by @davegandy - http://fontawesome.io
+Font: SIL OFL 1.1 (http://scripts.sil.org/OFL)
+CSS:  MIT License (http://opensource.org/licenses/mit-license.html)
+Only the woff2/woff font files are vendored; the other formats are not needed by current browsers.

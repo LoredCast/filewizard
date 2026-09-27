@@ -5,8 +5,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const clearHistoryBtn = document.getElementById('clear-history-btn');
     const deleteFilesBtn = document.getElementById('delete-files-btn');
 
-    // --- Save Settings --- 
-    settingsForm.addEventListener('submit', async (event) => {
+    // --- Save Settings --- (the form is only rendered for administrators)
+    if (settingsForm) settingsForm.addEventListener('submit', async (event) => {
         event.preventDefault();
         saveStatus.textContent = 'Saving...';
         saveStatus.classList.remove('success', 'error');
@@ -25,7 +25,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 value = el.checked;
             } else if (el.name.endsWith('.command_template')) {
                 value = el.value;
-            } else if (el.name.endsWith('.supported_input') || el.name === 'app_settings.allowed_all_extensions' || el.name === 'auth_settings.admin_users' || el.name === 'webhook_settings.allowed_callback_urls') {
+            } else if (el.name.endsWith('.supported_input') || el.name === 'app_settings.allowed_all_extensions' || el.name === 'auth_settings.admin_users' || el.name === 'auth_settings.allowed_users' || el.name === 'auth_settings.allowed_domains' || el.name === 'webhook_settings.allowed_callback_urls') {
                 // Convert comma-separated text into an array of strings
                 value = el.value.split(',')
                     .map(item => item.trim())
@@ -81,7 +81,7 @@ document.addEventListener('DOMContentLoaded', () => {
             });
 
             if (!response.ok) {
-                const errorData = await response.json();
+                const errorData = await response.json().catch(() => ({}));
                 throw new Error(errorData.detail || 'Failed to save settings.');
             }
 
@@ -102,14 +102,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- Clear History --- 
     clearHistoryBtn.addEventListener('click', async () => {
-        if (!confirm('ARE YOU SURE?\n\nThis will permanently delete all job history records from the database.')) {
+        if (!confirm('ARE YOU SURE?\n\nThis will permanently delete all your job history records and their processed files.')) {
             return;
         }
         try {
             const response = await fetch('/settings/clear-history', { method: 'POST' });
             if (!response.ok) throw new Error('Server responded with an error.');
             const result = await response.json();
-            alert(`Success: ${result.deleted_count} job records have been deleted.`);
+            alert(`Success: ${result.deleted_count} job records and ${result.files_deleted ?? 0} files have been deleted.`);
         } catch (error) {
             alert('An error occurred while clearing history.');
             console.error(error);
@@ -118,7 +118,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- Delete Files --- 
     deleteFilesBtn.addEventListener('click', async () => {
-        if (!confirm('ARE YOU SURE?\n\nThis will permanently delete all files in the "processed" folder.')) {
+        if (!confirm('ARE YOU SURE?\n\nThis will permanently delete the processed files of all your jobs.')) {
             return;
         }
         try {

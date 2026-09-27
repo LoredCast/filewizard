@@ -1,39 +1,10 @@
-# Git
-.git
-.gitignore
-
-# Docker
-Dockerfile
-docker-compose.yml
-.dockerignore
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-venv/
-*.egg-info/
-req.txt
-my.settings.yml
-
-
-# IDE files
-.vscode/
-.idea/
-
-# Application files
-config/
-models/
-uploads/
-processed/
-app.log*
-core/
-test_chunks/
-test_processed/
-test_uploads/
-jobs.db-*
-huey.*
-*.db
-.env
-
+# Whitelist: only what the Dockerfile copies is sent to the builder, so local files
+# (config, uploads, databases, venvs, ...) can neither leak into nor change the image.
+*
+!main.py
+!settings.default.yml
+!templates/
+!static/
+!locks/
+!docker/
+**/*.old

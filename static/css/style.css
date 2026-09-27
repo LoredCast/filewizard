@@ -176,6 +176,14 @@ header p {
     background-color: #bafaff; /* Error color */
 }
 
+.status-dot.idle {
+    background-color: var(--muted-text);
+}
+
+.status-dot.error {
+    background-color: var(--error-color);
+}
+
 .header-actions div {
     position: fixed;
     left: 0;
@@ -430,6 +438,13 @@ input[type="file"] {
     text-align: left;
 }
 
+.history-actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
 .history-header {
     display: flex;
     justify-content: space-between;
@@ -517,7 +532,7 @@ input[type="file"] {
     display: inline-block;
     white-space: nowrap;
 }
-.status-pending, .status-processing {
+.status-pending, .status-processing, .status-queued, .status-uploading {
     background-color: rgba(0,180,255,0.15);
     color: var(--primary-hover);
 }
@@ -590,9 +605,11 @@ input[type="file"] {
     cursor: pointer;
 }
 
-#download-selected-btn {
+#download-selected-btn,
+#delete-selected-btn {
     width: auto;
     white-space: nowrap;
+    margin-top: 0;
  }
 
 .download-button {

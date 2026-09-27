@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Settings - File Wizard</title>
-    <link rel="stylesheet" href="{{ url_for('static', path='/css/style.css') }}">
-    <link rel="stylesheet" href="{{ url_for('static', path='/css/settings.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='/css/style.css') }}?v={{ static_version }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='/css/settings.css') }}?v={{ static_version }}">
 
 </head>
 <body>
@@ -18,6 +18,7 @@
         </header>
 
         <main>
+            {% if is_admin %}
             <form id="settings-form">
                 <div class="settings-main-grid">
                     <fieldset class="settings-group">
@@ -41,6 +42,11 @@
                     <fieldset class="settings-group">
                         <legend><h2>Performance Tuning</h2></legend>
                          <div class="form-control">
+                            <label for="app-retention-days">Delete Finished Jobs After (days)</label>
+                            <p class="field-description">Finished jobs and their files are deleted automatically after this many days. 0 keeps everything.</p>
+                            <input type="number" min="0" step="1" id="app-retention-days" name="app_settings.retention_days" value="{{ config.app_settings.get('retention_days', 0) or 0 }}" class="form-input">
+                        </div>
+                         <div class="form-control">
                             <label for="perf-model-concurrency">Model Concurrency Limit</label>
                             <p class="field-description">Maximum number of AI models (e.g., Piper TTS) that can run in parallel. Helps prevent CPU/GPU overload.</p>
                             <input type="number" id="perf-model-concurrency" name="app_settings.model_concurrency" value="{{ config.app_settings.get('model_concurrency', 1) }}" class="form-input">
@@ -60,6 +66,11 @@
                 
                 <fieldset class="settings-group">
                     <legend><h2>OCR (ocrmypdf)</h2></legend>
+                    <div class="form-control">
+                        <label for="ocr-language">Default Language</label>
+                        <p class="field-description">Tesseract language code(s) used when a job doesn't choose one, e.g. <code>eng</code> or <code>eng+spa</code>.{% if ocr_languages %} Installed: {{ ocr_languages | join(', ') }}.{% endif %}</p>
+                        <input type="text" id="ocr-language" name="ocr_settings.ocrmypdf.language" value="{{ config.ocr_settings.ocrmypdf.get('language', 'eng') }}" class="form-input">
+                    </div>
                      <div class="form-control checkbox-group">
                         <input type="checkbox" id="ocr-deskew" name="ocr_settings.ocrmypdf.deskew" {% if config.ocr_settings.ocrmypdf.deskew %}checked{% endif %}>
                         <label for="ocr-deskew">Deskew (correct tilted pages)</label>
@@ -80,7 +91,7 @@
                     <div class="form-control">
                         <label for="whisper-compute-type">Compute Type</label>
                         <select id="whisper-compute-type" name="transcription_settings.whisper.compute_type" class="form-select">
-                            {% for ctype in ["default", "int8", "int8_float16", "int16", "float16", "float32"] %}
+                            {% for ctype in ["auto", "default", "int8", "int8_float16", "int16", "float16", "float32"] %}
                                 <option value="{{ ctype }}" {% if config.transcription_settings.whisper.compute_type == ctype %}selected{% endif %}>{{ ctype }}</option>
                             {% endfor %}
                         </select>
@@ -96,7 +107,7 @@
                     </div>
                     <div class="form-control">
                         <label for="auth-client-secret">Client Secret</label>
-                        <input type="password" id="auth-client-secret" name="auth_settings.oidc_client_secret" value="{{ config.auth_settings.get('oidc_client_secret', '') }}" class="form-input">
+                        <input type="password" id="auth-client-secret" name="auth_settings.oidc_client_secret" value="" autocomplete="new-password" placeholder="{{ 'Stored – leave empty to keep the current secret' if secrets_set.get('oidc_client_secret') else 'Not set' }}" class="form-input">
                     </div>
                     <div class="form-control">
                         <label for="auth-metadata-url">Server Metadata URL</label>
@@ -106,6 +117,16 @@
                         <label for="auth-admin-users">Admin User Emails</label>
                         <p class="field-description">Comma-separated list of email addresses for users who should have admin rights.</p>
                         <textarea id="auth-admin-users" name="auth_settings.admin_users" class="form-textarea" rows="2">{{ config.auth_settings.get('admin_users', []) | join(', ') }}</textarea>
+                    </div>
+                    <div class="form-control">
+                        <label for="auth-allowed-users">Allowed User Emails</label>
+                        <p class="field-description">Comma-separated. If this and "Allowed Email Domains" are both empty, every account your identity provider accepts can use FileWizard. Admins are always allowed.</p>
+                        <textarea id="auth-allowed-users" name="auth_settings.allowed_users" class="form-textarea" rows="2">{{ config.auth_settings.get('allowed_users', []) | join(', ') }}</textarea>
+                    </div>
+                    <div class="form-control">
+                        <label for="auth-allowed-domains">Allowed Email Domains</label>
+                        <p class="field-description">Comma-separated, e.g. example.com. Users with a verified email address in one of these domains can log in.</p>
+                        <textarea id="auth-allowed-domains" name="auth_settings.allowed_domains" class="form-textarea" rows="2">{{ config.auth_settings.get('allowed_domains', []) | join(', ') }}</textarea>
                     </div>
                 </fieldset>
 
@@ -128,7 +149,7 @@
                     <div class="form-control">
                         <label for="webhook-token">Callback Bearer Token</label>
                         <p class="field-description">If set, this token will be sent in the `Authorization` header for all callback requests.</p>
-                        <input type="password" id="webhook-token" name="webhook_settings.callback_bearer_token" value="{{ config.webhook_settings.get('callback_bearer_token', '') }}" class="form-input">
+                        <input type="password" id="webhook-token" name="webhook_settings.callback_bearer_token" value="" autocomplete="new-password" placeholder="{{ 'Stored – leave empty to keep the current token' if secrets_set.get('callback_bearer_token') else 'Not set' }}" class="form-input">
                     </div>
                 </fieldset>
 
@@ -158,16 +179,26 @@
                         Edit the command line templates for each conversion tool. The following placeholders are available: <code>{input}</code>, <code>{output}</code>, <code>{output_dir}</code>, <code>{output_ext}</code>.
                         Some tools may have additional placeholders; refer to the sourcecode or documentation for details.
                     </p>
+                    {% if not allow_command_edits %}
+                    <p class="field-description">Command templates are read-only here because they decide which programs the server runs. Edit <code>config/settings.yml</code>, or start the app with <code>ALLOW_COMMAND_EDITS=true</code> to edit them in this page.</p>
+                    {% endif %}
                     <div class="tool-grid">
                         {% for tool_id, tool in config.conversion_tools.items() %}
                         <div class="tool-card">
+                            {% if tool_id in unavailable_tools %}
+                            <p class="field-description">Not installed: <code>{{ unavailable_tools[tool_id] }}</code> was not found, so this tool is hidden from the converter.</p>
+                            {% endif %}
                             <div class="form-control">
                                 <label for="tool-{{ tool_id }}-name">Tool Name</label>
                                 <input type="text" id="tool-{{ tool_id }}-name" name="conversion_tools.{{ tool_id }}.name" value="{{ tool.name }}" class="form-input">
                             </div>
                             <div class="form-control">
                                 <label for="tool-{{ tool_id }}-cmd">Command Template</label>
-                                <textarea id="tool-{{ tool_id }}-cmd" name="conversion_tools.{{ tool_id }}.command_template" class="form-textarea" rows="3">{{ tool.command_template }}</textarea>
+                                <textarea id="tool-{{ tool_id }}-cmd" name="conversion_tools.{{ tool_id }}.command_template" class="form-textarea" rows="3"{% if not allow_command_edits %} readonly{% endif %}>{{ tool.command_template }}</textarea>
+                            </div>
+                            <div class="form-control">
+                                <label for="tool-{{ tool_id }}-timeout">Timeout (seconds)</label>
+                                <input type="number" min="1" id="tool-{{ tool_id }}-timeout" name="conversion_tools.{{ tool_id }}.timeout" value="{{ tool.get('timeout', 300) }}" class="form-input">
                             </div>
                             <div class="form-control">
                                 <label for="tool-{{ tool_id }}-supported-input">Accepted File Formats (comma-separated)</label>
@@ -188,8 +219,11 @@
                      <div id="save-status" class="save-status"></div>
                 </div>
             </form>
-            
+
             <hr class="divider">
+            {% else %}
+            <p class="field-description">Only administrators can view or change the application configuration.</p>
+            {% endif %}
 
             <div id="history-management" class="settings-group">
                 <h2>History Management</h2>
@@ -198,14 +232,14 @@
                    <div class="danger-action">
                         <div>
                             <strong>Clear Job History</strong>
-                            <p>Deletes all job records from the database. Files remain in the filesystem but cannot be deleted through the app anymore.</p>
+                            <p>Deletes all your job records and their processed files.</p>
                         </div>
                         <button id="clear-history-btn" class="button-danger">Clear History</button>
                    </div>
                    <div class="danger-action">
                         <div>
                             <strong>Delete Processed Files</strong>
-                            <p>Deletes all files from the 'processed' directory. Database records will remain but download links will be broken.</p>
+                            <p>Deletes the processed files of all your jobs. The job records remain, but their download links will stop working.</p>
                         </div>
                         <button id="delete-files-btn" class="button-danger">Delete Files</button>
                    </div>
@@ -214,6 +248,6 @@
         </main>
     </div>
     
-    <script src="{{ url_for('static', path='/js/settings.js') }}"></script>
+    <script src="{{ url_for('static', path='/js/settings.js') }}?v={{ static_version }}"></script>
 </body>
 </html>

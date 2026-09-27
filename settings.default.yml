@@ -6,6 +6,10 @@ auth_settings:
   oidc_end_session_endpoint: https://accounts.example.com/oidc/session/end
   admin_users:
     - user@example.com
+  # Who may log in. Leave both empty to allow every account your identity provider accepts.
+  # Admins are always allowed. Emails the provider marks as unverified never match.
+  allowed_users: []
+  allowed_domains: []
 webhook_settings:
   enabled: False
   allow_chunked_api_uploads: False
@@ -221,6 +225,8 @@ app_settings:
     - .zimwiki
 ocr_settings:
   ocrmypdf:
+    # Default Tesseract language(s), e.g. "eng" or "eng+spa". Users can pick others per job.
+    language: eng
     deskew: true
     clean: true
     optimize: 1
@@ -235,7 +241,8 @@ academic_settings:
       chicago-fullnote: https://www.zotero.org/styles/chicago-fullnote-bibliography
 transcription_settings:
   whisper:
-    compute_type: int8
+    # auto: the fastest type the device supports (int8 on CPUs, float16/int8_float16 on GPUs)
+    compute_type: auto
     # device: cuda
     # device_index: 0
     allowed_models:
@@ -770,6 +777,19 @@ conversion_tools:
       - .svgz
     formats:
       png: PNG from SVG
+  rsvg:
+    name: librsvg (rsvg-convert)
+    command_template: rsvg-convert --format {output_ext} --output {output} {input}
+    timeout: 60
+    supported_input:
+      - .svg
+      - .svgz
+    formats:
+      png: PNG Image
+      pdf: PDF Document
+      ps: PostScript
+      eps: Encapsulated PostScript
+      svg: SVG (Plain)
   potrace:
     name: Potrace
     command_template: potrace {input} --svg -o {output}

@@ -1,0 +1,201 @@
+# Builds the FileWizard images and publishes them to Docker Hub.
+#
+# - Pushing a version tag (git tag 0.5.0 && git push origin 0.5.0; "v0.5.0" and "0.5" work too)
+#   publishes
+#     full:  0.5.0  0.5  0.5-latest  latest
+#     small: 0.5.0-small  0.5-small  small
+#     cuda:  0.5.0-cuda   0.5-cuda   cuda  latest-cuda
+#   Pre-release tags (0.5.0-rc1) only get their version tags. scripts/docker-release.sh
+#   computes the tags and does the same from your own machine.
+# - Pull requests that touch the image build the small image without pushing.
+# - "Run workflow" builds all images; with "push" checked they are published as
+#   edge, edge-small and edge-cuda.
+#
+# Publishing needs the repository secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (a Docker Hub
+# access token with read/write scope); without them the images are only built and tested.
+# Optional repository variable DOCKERHUB_IMAGE (default: loredcast/filewizard). See docs/docker.md.
+name: Docker image
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+*", "[0-9]+.[0-9]+*"]
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker/**
+      - locks/**
+      - .github/workflows/docker-publish.yml
+  workflow_dispatch:
+    inputs:
+      push:
+        description: Publish the images as edge, edge-small and edge-cuda
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ${{ vars.DOCKERHUB_IMAGE || 'loredcast/filewizard' }}
+  PUBLISH: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push) }}
+  PUSH: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push)) && secrets.DOCKERHUB_TOKEN != '' }}
+
+jobs:
+  build:
+    name: build (${{ matrix.variant }}, ${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      push: ${{ env.PUSH }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { variant: full,  platform: linux/amd64, runner: ubuntu-24.04 }
+          - { variant: full,  platform: linux/arm64, runner: ubuntu-24.04-arm }
+          - { variant: small, platform: linux/amd64, runner: ubuntu-24.04 }
+          - { variant: small, platform: linux/arm64, runner: ubuntu-24.04-arm }
+          - { variant: cuda,  platform: linux/amd64, runner: ubuntu-24.04 }
+    steps:
+      - name: Note missing Docker Hub credentials
+        if: env.PUBLISH == 'true' && env.PUSH != 'true' && matrix.variant == 'small' && matrix.platform == 'linux/amd64'
+        run: echo "::warning::DOCKERHUB_USERNAME/DOCKERHUB_TOKEN are not set, so the images are built and tested but not published."
+
+      - name: Skip all but the small amd64 image on pull requests
+        id: scope
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && { [ "${{ matrix.variant }}" != small ] || [ "${{ matrix.platform }}" != linux/amd64 ]; }; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Free disk space (the full images need ~25 GB while building)
+        if: steps.scope.outputs.skip != 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - uses: actions/checkout@v4
+        if: steps.scope.outputs.skip != 'true'
+
+      - name: Prepare build metadata
+        if: steps.scope.outputs.skip != 'true'
+        run: |
+          # Timestamps inside the image come from the commit, so rebuilding a commit gives the same image.
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+          if [ "${{ github.ref_type }}" = "tag" ]; then echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"; else echo "VERSION=edge-${GITHUB_SHA::7}" >> "$GITHUB_ENV"; fi
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${{ matrix.variant }}-${platform//\//-}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.scope.outputs.skip != 'true'
+
+      - uses: docker/login-action@v3
+        if: steps.scope.outputs.skip != 'true' && env.PUSH == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Every image is smoke-tested before anything is published; the push below reuses the build cache.
+      - name: Build for testing
+        if: steps.scope.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VARIANT=${{ matrix.variant }}
+            VERSION=${{ env.VERSION }}
+            SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+          load: true
+          tags: filewizard:test
+
+      - name: Smoke test
+        if: steps.scope.outputs.skip != 'true'
+        run: docker/smoke-test.sh filewizard:test
+
+      - name: Build and push by digest
+        id: build
+        if: steps.scope.outputs.skip != 'true' && env.PUSH == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VARIANT=${{ matrix.variant }}
+            VERSION=${{ env.VERSION }}
+            SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true,rewrite-timestamp=true
+          provenance: mode=max
+          sbom: true
+
+      - name: Export digest
+        if: steps.scope.outputs.skip != 'true' && env.PUSH == 'true'
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.scope.outputs.skip != 'true' && env.PUSH == 'true'
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: publish (${{ matrix.variant }})
+    needs: build
+    if: needs.build.outputs.push == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - { variant: full,  suffix: "" }
+          - { variant: small, suffix: "-small" }
+          - { variant: cuda,  suffix: "-cuda" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.variant }}-*
+          merge-multiple: true
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Compute tags
+        id: tags
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            names="$(scripts/docker-release.sh tags "${GITHUB_REF_NAME}" "${{ matrix.variant }}")"
+          else
+            names="edge${{ matrix.suffix }}"
+          fi
+          tags=""
+          for name in ${names}; do tags="${tags} ${IMAGE}:${name}"; done
+          tags="${tags# }"
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "Publishing: ${tags}"
+
+      - name: Create multi-arch manifests
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          args=()
+          for tag in ${{ steps.tags.outputs.tags }}; do args+=(-t "${tag}"); done
+          sources=()
+          for digest in *; do sources+=("${IMAGE}@sha256:${digest}"); done
+          docker buildx imagetools create "${args[@]}" "${sources[@]}"
+
+      - name: Inspect
+        run: |
+          for tag in ${{ steps.tags.outputs.tags }}; do docker buildx imagetools inspect "${tag}"; done

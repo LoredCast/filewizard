@@ -1,5 +1,7 @@
 # main.py (merged)
+import asyncio
 import html
+import json
 import threading
 import logging
 import shutil
@@ -11,8 +13,6 @@ import yaml
 import os
 import httpx
 import glob
-import cv2
-import numpy as np
 import secrets
 import hashlib
 from contextlib import asynccontextmanager
@@ -20,15 +20,20 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 import resource
+import fcntl
+import signal
+import tempfile
+import gc
 from threading import Semaphore
 from logging.handlers import RotatingFileHandler
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlencode, quote
 from io import BytesIO
 import zipfile
 import sys
 import re
 import importlib
 import collections.abc
+import copy
 import time
 import ocrmypdf
 import pypdf
@@ -38,16 +43,17 @@ from pytesseract import TesseractNotFoundError
 from PIL import Image, UnidentifiedImageError
 from faster_whisper import WhisperModel
 from fastapi import (Depends, FastAPI, File, Form, HTTPException, Request,
-                     UploadFile, status, Body, WebSocket, Query, WebSocketDisconnect)
+                     UploadFile, status, Body)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from huey import SqliteHuey, crontab
 from pydantic import BaseModel, ConfigDict, field_serializer
-from sqlalchemy import (Column, DateTime, Integer, String, Text,
-                        create_engine, delete, event, text)
+from sqlalchemy import (Column, DateTime, Index, Integer, String, Text,
+                        create_engine, delete, event, func, inspect, text)
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import NullPool
 from sqlalchemy.exc import OperationalError
@@ -55,17 +61,25 @@ from string import Formatter
 from werkzeug.utils import secure_filename
 from typing import List as TypingList
 from starlette.middleware.sessions import SessionMiddleware
-from authlib.integrations.starlette_client import OAuth
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.datastructures import Headers, MutableHeaders
+import warnings
+import authlib.deprecate  # installs Authlib's "always show" filter, which ours has to come after
+with warnings.catch_warnings():
+    # Authlib 1.8 deprecates its httpx integration, which its own Starlette client still imports.
+    warnings.filterwarnings("ignore", message="The httpx module is deprecated")
+    from authlib.integrations.starlette_client import OAuth
 from dotenv import load_dotenv
 from piper import PiperVoice
 import wave
 import io
 import mimetypes
 
-ENABLE_WEBSOCKETS = False
-
-
 load_dotenv()
+
+# Converters process untrusted documents. kpathsea reads texmf.cnf overrides from the
+# environment, so this disables TeX's \write18 shell escape for every child process.
+os.environ.setdefault("shell_escape", "f")
 
 # --- Optional Dependency Handling for Piper TTS ---
 try:
@@ -95,12 +109,6 @@ except ImportError:
     find_voice = None
     VoiceNotFoundError = None
 
-
-try:
-    from PyPDF2 import PdfMerger
-    _HAS_PYPDF2 = True
-except Exception:
-    _HAS_PYPDF2 = False
 
 # Instantiate OAuth object (was referenced in code)
 oauth = OAuth()
@@ -138,6 +146,147 @@ def sanitize_filename(filename: str) -> str:
     # Sanitize for HTML output
     return html.escape(safe_name)
 
+_SAFE_SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,10}$")
+
+
+def safe_basename(filename: Optional[str]) -> str:
+    """
+    Filesystem-safe version of a user supplied file name that keeps a usable extension.
+    secure_filename() alone drops non-ASCII characters, so "文件.pdf" became "pdf" and
+    lost its extension; here the stem falls back to "file" instead.
+    """
+    name = re.split(r"[\\/]", filename or "")[-1]
+    suffix = Path(name).suffix.lower()
+    if not _SAFE_SUFFIX_RE.fullmatch(suffix):
+        suffix = ""
+    stem = secure_filename(name[: len(name) - len(suffix)] if suffix else name)[:100].strip("._") or "file"
+    return f"{stem}{suffix}"
+
+
+# --- Upload sessions ---
+UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+MAX_UPLOAD_CHUNKS = 100_000
+
+
+def chunk_dir_for(user: dict, upload_id: str) -> Path:
+    """
+    Temp directory for a chunked upload, namespaced per user so one user can neither
+    write into nor finalize another user's upload. Upload ids are validated strictly:
+    an id that sanitized to "" used to resolve to the shared chunk root itself.
+    """
+    if not isinstance(upload_id, str) or not UPLOAD_ID_RE.fullmatch(upload_id):
+        raise HTTPException(status_code=400, detail="Invalid upload_id (8-128 letters, digits, '-' or '_').")
+    user_key = hashlib.sha256(str(user.get("sub", "")).encode()).hexdigest()[:16]
+    path = PATHS.CHUNK_TMP_DIR / f"{user_key}_{upload_id}"
+    ensure_path_is_safe(path, [PATHS.CHUNK_TMP_DIR])
+    return path
+
+
+# --- ZIP archives ---
+ZIP_JUNK_RE = re.compile(r"(^|/)(__MACOSX/|\._|\.DS_Store$|Thumbs\.db$)")
+
+
+def safe_extract_zip(zip_path: Path, dest: Path, app_settings: dict) -> List[Path]:
+    """
+    Extracts regular files from an uploaded ZIP with limits on member count and total
+    uncompressed size (zip bombs). Directory, symlink and OS metadata entries are skipped.
+    zipfile.extract() already strips absolute paths and '..' components.
+    """
+    max_members = int(app_settings.get("max_zip_members") or 500)
+    max_file_mb = float(app_settings.get("max_file_size_bytes", 100 * 1024 * 1024)) / (1024 * 1024)
+    max_total_mb = float(app_settings.get("max_zip_uncompressed_mb") or max(4 * max_file_mb, 1024))
+    with zipfile.ZipFile(zip_path) as zf:
+        members = [
+            info for info in zf.infolist()
+            if not info.is_dir()
+            and not ZIP_JUNK_RE.search(info.filename)
+            and (info.external_attr >> 16) & 0o170000 != 0o120000  # symlink entries
+        ]
+        if len(members) > max_members:
+            raise ValueError(f"ZIP archive has {len(members)} files; the limit is {max_members} (app_settings.max_zip_members).")
+        total_mb = sum(info.file_size for info in members) / (1024 * 1024)
+        if total_mb > max_total_mb:
+            raise ValueError(f"ZIP archive would extract to {total_mb:.0f} MB; the limit is {max_total_mb:.0f} MB "
+                             "(app_settings.max_zip_uncompressed_mb).")
+        dest.mkdir(parents=True, exist_ok=True)
+        extracted = []
+        for info in members:
+            target = Path(zf.extract(info, dest))
+            ensure_path_is_safe(target, [dest])
+            extracted.append(target)
+    return extracted
+
+
+# --- Model / voice names coming from requests ---
+_TTS_NAME_PART_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def resolve_whisper_model(model_size: Optional[str], whisper_settings: dict) -> str:
+    """
+    Only models listed in transcription_settings.whisper.allowed_models may be used.
+    faster-whisper also accepts local paths and arbitrary Hugging Face repo ids, which
+    must not be reachable from a request.
+    """
+    allowed = [str(m) for m in (whisper_settings.get("allowed_models") or [])]
+    if not model_size:
+        if "base" in allowed:
+            return "base"
+        if allowed:
+            return allowed[0]
+        raise ValueError("No Whisper models are allowed (transcription_settings.whisper.allowed_models).")
+    if model_size not in allowed:
+        raise ValueError(f"Invalid model size '{model_size}'. Allowed: {', '.join(allowed)}")
+    return model_size
+
+
+def validate_tts_model_name(model_name: Optional[str]) -> str:
+    """Accepts 'piper/<voice>', '<voice>' (Piper) or 'kokoro/<lang>/<voice>'."""
+    if not isinstance(model_name, str) or not model_name:
+        raise ValueError("A TTS voice (model_name) is required.")
+    parts = model_name.split("/")
+    engine, names = (parts[0], parts[1:]) if len(parts) > 1 else ("piper", parts)
+    expected = {"piper": 1, "kokoro": 2}.get(engine)
+    if expected != len(names) or not all(_TTS_NAME_PART_RE.fullmatch(n) and ".." not in n for n in names):
+        raise ValueError(f"Invalid TTS voice '{model_name}'.")
+    return model_name
+
+
+# --- OCR languages ---
+_OCR_LANG_RE = re.compile(r"^[A-Za-z0-9_]{2,32}$")
+_ocr_languages_cache: Optional[List[str]] = None
+
+
+def installed_ocr_languages() -> List[str]:
+    """Tesseract languages installed on this server (cached; empty if tesseract is unavailable)."""
+    global _ocr_languages_cache
+    if _ocr_languages_cache is None:
+        try:
+            languages = pytesseract.get_languages(config="")
+        except Exception as e:
+            logger.warning(f"Could not list Tesseract languages: {e}")
+            return []
+        _ocr_languages_cache = sorted(l for l in languages if l != "osd" and _OCR_LANG_RE.fullmatch(l))
+    return _ocr_languages_cache
+
+
+def resolve_ocr_language(requested: Optional[str], ocr_settings: dict) -> str:
+    """
+    Returns a validated Tesseract language spec such as 'eng' or 'eng+spa'. Falls back to
+    ocr_settings.language (default 'eng') and rejects languages that are not installed.
+    """
+    spec = requested or ocr_settings.get("language") or "eng"
+    if isinstance(spec, (list, tuple)):
+        spec = "+".join(str(part) for part in spec)
+    parts = [part.strip() for part in str(spec).split("+") if part.strip()]
+    if not parts or len(parts) > 8 or not all(_OCR_LANG_RE.fullmatch(part) for part in parts):
+        raise ValueError(f"Invalid OCR language '{spec}'.")
+    installed = installed_ocr_languages()
+    missing = [part for part in parts if installed and part not in installed]
+    if missing:
+        raise ValueError(f"OCR language(s) not installed: {', '.join(missing)}. Installed: {', '.join(installed)}")
+    return "+".join(parts)
+
+
 def sanitize_output(output: str) -> str:
     """Sanitize output to prevent XSS"""
     if not output:
@@ -168,19 +317,19 @@ def get_supported_output_formats_for_file(filename: str, conversion_tools_config
     """
     file_ext = get_file_extension(filename)
     supported_formats = []
-    
+
     for tool_name, tool_config in conversion_tools_config.items():
-        supported_inputs = tool_config.get("supported_input", [])
-        # Convert supported inputs to lowercase for comparison
-        supported_inputs_lower = [ext.lower() for ext in supported_inputs]
-        
+        if not isinstance(tool_config, dict) or tool_name in UNAVAILABLE_TOOLS:
+            continue
+        supported_inputs_lower = [str(ext).lower() for ext in tool_config.get("supported_input") or []]
+
         if file_ext in supported_inputs_lower:
             # Add all available formats for this tool
-            for format_key, format_label in tool_config.get("formats", {}).items():
+            for format_key, format_label in (tool_config.get("formats") or {}).items():
                 full_format_key = f"{tool_name}_{format_key}"
                 supported_formats.append({
                     "value": full_format_key,
-                    "label": f"{tool_config['name']} - {format_label}",
+                    "label": f"{tool_config.get('name', tool_name)} - {format_label}",
                     "tool": tool_name,
                     "format": format_key
                 })
@@ -188,16 +337,71 @@ def get_supported_output_formats_for_file(filename: str, conversion_tools_config
     return supported_formats
 
 # --- Resource Limiting ---
+def _compute_child_rlimits() -> list:
+    """
+    Limits for converter processes, computed once in the parent and clamped to the
+    current hard limits (raising a hard limit fails without privileges).
+    CHILD_CPU_LIMIT_SECONDS (default 6000) and CHILD_MEMORY_LIMIT_MB (default 4096, 0 = no limit).
+    The memory limit is RLIMIT_DATA (memory a process can actually write to), not RLIMIT_AS:
+    Chromium-based tools such as Calibre's PDF output reserve far more address space than
+    they use and fail under an address-space limit.
+    """
+    wanted = [(resource.RLIMIT_CPU, int(os.environ.get("CHILD_CPU_LIMIT_SECONDS", "6000")))]
+    memory_mb = int(os.environ.get("CHILD_MEMORY_LIMIT_MB", "4096"))
+    if memory_mb > 0:
+        wanted.append((resource.RLIMIT_DATA, memory_mb * 1024 * 1024))
+    limits = []
+    for res, value in wanted:
+        if value <= 0:
+            continue
+        try:
+            _soft, hard = resource.getrlimit(res)
+            if hard != resource.RLIM_INFINITY:
+                value = min(value, hard)
+            limits.append((res, value))
+        except (ValueError, OSError):
+            pass
+    return limits
+
+
+_CHILD_RLIMITS = _compute_child_rlimits()
+
+
 def _limit_resources_preexec():
-    """Set resource limits for child processes to prevent DoS attacks."""
+    """
+    Runs in the forked child before exec. The parent is multi-threaded (gunicorn/huey),
+    so this must not log or take locks, which could deadlock the child.
+    """
+    for res, value in _CHILD_RLIMITS:
+        try:
+            resource.setrlimit(res, (value, value))
+        except (ValueError, OSError):
+            pass
+
+
+def _kill_process_tree(proc: subprocess.Popen):
+    """Kills a child started with start_new_session=True together with everything it spawned."""
     try:
-        # 6000s CPU, 4GB address space
-        resource.setrlimit(resource.RLIMIT_CPU, (6000, 6000))
-        resource.setrlimit(resource.RLIMIT_AS, (4 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024))
-    except Exception as e:
-        # This may fail in some environments (e.g. Windows, some containers)
-        logging.getLogger(__name__).warning(f"Could not set resource limits: {e}")
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
         pass
+    except Exception:
+        proc.kill()
+    try:
+        proc.wait(timeout=10)  # reap, so no zombies are left behind
+    except subprocess.TimeoutExpired:
+        logger.warning("Process %s did not exit after SIGKILL.", proc.pid)
+
+
+def _read_tail(f, limit: int = 64 * 1024) -> str:
+    """Returns the last `limit` bytes written to a temp file as text."""
+    try:
+        f.flush()
+        size = f.seek(0, os.SEEK_END)
+        f.seek(max(0, size - limit))
+        return f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
 
 # --- Model concurrency semaphore (lazily initialized) ---
 _model_semaphore: Optional[Semaphore] = None
@@ -216,10 +420,6 @@ def get_model_semaphore() -> Semaphore:
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-_log_handler = RotatingFileHandler("app.log", maxBytes=10*1024*1024, backupCount=1)
-_log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s')
-_log_handler.setFormatter(_log_formatter)
-logging.getLogger().addHandler(_log_handler)
 logger = logging.getLogger(__name__)
 
 # --- Environment Mode ---
@@ -232,12 +432,14 @@ class AppPaths(BaseModel):
     UPLOADS_DIR: Path = UPLOADS_BASE
     PROCESSED_DIR: Path = PROCESSED_BASE
     CHUNK_TMP_DIR: Path = CHUNK_TMP_BASE
+    # Job database, task queue and log. Defaults to the app directory; the Docker image uses a volume.
+    DATA_DIR: Path = Path(os.environ.get("DATA_DIR") or BASE_DIR).resolve()
     TTS_MODELS_DIR: Path = BASE_DIR / "models" / "tts"
     KOKORO_TTS_MODELS_DIR: Path = BASE_DIR / "models" / "tts" / "kokoro"
     KOKORO_MODEL_FILE: Path = KOKORO_TTS_MODELS_DIR / "kokoro-v1.0.onnx"
     KOKORO_VOICES_FILE: Path = KOKORO_TTS_MODELS_DIR / "voices-v1.0.bin"
-    DATABASE_URL: str = f"sqlite:///{BASE_DIR / 'jobs.db'}"
-    HUEY_DB_PATH: str = str(BASE_DIR / "huey.db")
+    DATABASE_URL: str = f"sqlite:///{DATA_DIR / 'jobs.db'}"
+    HUEY_DB_PATH: str = str(DATA_DIR / "huey.db")
     CONFIG_DIR: Path = BASE_DIR / "config"
     SETTINGS_FILE: Path = CONFIG_DIR / "settings.yml"
     DEFAULT_SETTINGS_FILE: Path = BASE_DIR / "settings.default.yml"
@@ -248,166 +450,16 @@ PATHS.UPLOADS_DIR.mkdir(exist_ok=True, parents=True)
 PATHS.PROCESSED_DIR.mkdir(exist_ok=True, parents=True)
 PATHS.CHUNK_TMP_DIR.mkdir(exist_ok=True, parents=True)
 PATHS.CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+PATHS.DATA_DIR.mkdir(exist_ok=True, parents=True)
 PATHS.TTS_MODELS_DIR.mkdir(exist_ok=True, parents=True)
 PATHS.KOKORO_TTS_MODELS_DIR.mkdir(exist_ok=True, parents=True)
 
-# --- WebSocket Connection Manager ---
-import json
-import asyncio
-import threading
-from typing import Dict, List
-from collections import defaultdict
-import time
-
-class ConnectionManager:
-    def __init__(self):
-        # Maps user_id to list of WebSocket connections
-        self.active_connections: Dict[str, List[WebSocket]] = defaultdict(list)
-        # Maps WebSocket to user_id
-        self.connection_to_user: Dict[WebSocket, str] = {}
-        # Maps WebSocket to connection metadata
-        self.connection_metadata: Dict[WebSocket, dict] = {}
-        # Logger
-        self.logger = logging.getLogger(__name__)
-
-    async def connect(self, websocket: WebSocket, user_id: str, connection_id: str = None):
-        await websocket.accept()
-        self.connection_to_user[websocket] = user_id
-        self.connection_metadata[websocket] = {"connection_id": connection_id or str(uuid.uuid4())}
-        self.active_connections[user_id].append(websocket)
-
-    def disconnect(self, websocket: WebSocket):
-        user_id = self.connection_to_user.pop(websocket, None)
-        if user_id and websocket in self.active_connections[user_id]:
-            self.active_connections[user_id].remove(websocket)
-        self.connection_metadata.pop(websocket, None)
-
-    async def send_personal_message(self, message: str, websocket: WebSocket):
-        await websocket.send_text(message)
-
-    async def broadcast_user_jobs(self, user_id: str, message: str):
-        """Send message to all connections for a specific user"""
-        self.logger.debug(f"Broadcasting message to user {user_id}: {message}")
-        if user_id in self.active_connections:
-            disconnected = []
-            sent_count = 0
-            for websocket in self.active_connections[user_id]:
-                try:
-                    await websocket.send_text(message)
-                    sent_count += 1
-                except WebSocketDisconnect:
-                    disconnected.append(websocket)
-            
-            # Remove disconnected connections
-            for websocket in disconnected:
-                self.disconnect(websocket)
-            
-            if sent_count > 0:
-                self.logger.info(f"Sent WebSocket message to {sent_count} connections for user {user_id}")
-        else:
-            self.logger.info(f"No active connections for user {user_id}")
-
-    async def broadcast_job_status_update(self, user_id: str, job_data: dict):
-        """Send job status update to user's connections"""
-        logger = logging.getLogger(__name__)
-        logger.info(f"Broadcasting job update to user {user_id}: job_id={job_data.get('id')}, status={job_data.get('status')}")
-        
-        message = json.dumps({
-            "type": "job_update",
-            "job": job_data,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        })
-        await self.broadcast_user_jobs(user_id, message)
-        logger.info(f"Finished broadcasting job update to user {user_id}")
-
-    async def broadcast_multiple_jobs_update(self, user_id: str, jobs_data: List):
-        """Send multiple job updates to user's connections"""
-        message = json.dumps({
-            "type": "batch_job_update",
-            "jobs": jobs_data,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        })
-        await self.broadcast_user_jobs(user_id, message)
-
-    def sync_broadcast_job_status_update(self, user_id: str, job_data: dict):
-        """Synchronously broadcast job status update - for use from sync contexts like Huey tasks"""
-        logger = logging.getLogger(__name__)
-        job_id = job_data.get('id')
-        status = job_data.get('status')
-        progress = job_data.get('progress')
-        logger.info(f"Queueing WebSocket notification for user {user_id}: job_id={job_id}, status={status}, progress={progress}")
-        
-        try:
-            db = SessionLocal()
-            notification = Notification(
-                user_id=user_id,
-                job_data=json.dumps(job_data)
-            )
-            db.add(notification)
-            db.commit()
-            logger.info(f"Queued WebSocket notification for user {user_id}, job {job_id}")
-        except Exception as e:
-            logger.warning(f"Could not queue WebSocket notification for user {user_id}, job {job_id}: {e}")
-        finally:
-            if db:
-                db.close()
-
-    async def process_notification_queue(self):
-        """Process queued notifications and send them to WebSocket clients"""
-        db = SessionLocal()
-        claimed_notification_data = None
-        try:
-            # Find a notification to process
-            notification_to_process = db.query(Notification).order_by(Notification.created_at).first()
-            if not notification_to_process:
-                return
-
-            # Try to "claim" it by deleting it.
-            notification_id = notification_to_process.id
-            
-            # We need to copy the data before deleting.
-            claimed_notification_data = {
-                "id": notification_id,
-                "user_id": notification_to_process.user_id,
-                "job_data": notification_to_process.job_data
-            }
-
-            deleted_count = db.query(Notification).filter_by(id=notification_id).delete(synchronize_session=False)
-            db.commit()
-
-            if deleted_count == 0:
-                # Another worker got it first.
-                self.logger.debug(f"Notification {notification_id} was already claimed by another worker.")
-                claimed_notification_data = None # Do not process
-        
-        except Exception as e:
-            self.logger.error(f"Error claiming notification from DB: {e}")
-            db.rollback()
-            claimed_notification_data = None # Do not process
-        finally:
-            db.close()
-
-        # --- Process the claimed notification outside the DB transaction ---
-        if claimed_notification_data:
-            try:
-                user_id = claimed_notification_data["user_id"]
-                notification_id = claimed_notification_data["id"]
-                self.logger.debug(f"Processing claimed notification {notification_id} for user {user_id}")
-
-                if user_id in self.active_connections:
-                    job_data = json.loads(claimed_notification_data["job_data"])
-                    message = json.dumps({
-                        "type": "job_update",
-                        "job": job_data,
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    })
-                    await self.broadcast_user_jobs(user_id, message)
-                    self.logger.info(f"Sent claimed notification {notification_id} to user {user_id}")
-            except Exception as e:
-                self.logger.warning(f"Error sending claimed notification {claimed_notification_data['id']}: {e}")
-
-# Initialize manager
-manager = ConnectionManager()
+try:
+    _log_handler = RotatingFileHandler(PATHS.DATA_DIR / "app.log", maxBytes=10*1024*1024, backupCount=1)
+    _log_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
+    logging.getLogger().addHandler(_log_handler)
+except OSError as e:
+    logger.warning(f"File logging disabled: {e}")
 
 
 def deep_merge(source: dict, dest: dict) -> dict:
@@ -437,13 +489,60 @@ def initialize_settings_file():
             logger.error(f"CRITICAL: Failed to copy default settings file: {e}")
             PATHS.SETTINGS_FILE.touch()
 
+_config_mtimes: Optional[tuple] = None
+# tool id -> executable that is missing on this server; such tools are hidden and rejected.
+UNAVAILABLE_TOOLS: Dict[str, str] = {}
+
+
+def _compute_unavailable_tools(conversion_tools: dict) -> Dict[str, str]:
+    missing = {}
+    for tool_id, tool_cfg in conversion_tools.items():
+        if not isinstance(tool_cfg, dict):
+            continue
+        try:
+            parts = shlex.split(str(tool_cfg.get("command_template") or ""))
+        except ValueError:
+            parts = []
+        executable = parts[0] if parts else ""
+        if not executable or shutil.which(executable) is None:
+            missing[tool_id] = executable or "(no command)"
+        elif tool_id == "mozjpeg" and shutil.which("vips") is None:
+            missing[tool_id] = "vips"
+    return missing
+
+
+def _settings_mtimes() -> tuple:
+    result = []
+    for settings_path in (PATHS.SETTINGS_FILE, PATHS.DEFAULT_SETTINGS_FILE):
+        try:
+            result.append(settings_path.stat().st_mtime_ns)
+        except OSError:
+            result.append(None)
+    return tuple(result)
+
+
+def reload_app_config_if_changed():
+    """
+    Each gunicorn worker (and the huey consumer) holds its own APP_CONFIG. Settings saved
+    through one worker, or edited on disk, are picked up by the others on their next request.
+    """
+    if _settings_mtimes() == _config_mtimes:
+        return
+    try:
+        load_app_config()
+    except Exception:
+        logger.exception("Could not reload settings; keeping the previous configuration.")
+
+
 def load_app_config():
     """
     Loads configuration by deeply merging settings from hardcoded defaults,
     settings.default.yml, and settings.yml, then applies environment variable
     overrides.
     """
-    global APP_CONFIG
+    global APP_CONFIG, UNAVAILABLE_TOOLS, _config_mtimes
+    # Recorded before reading, so a write that races with this load triggers another reload.
+    _config_mtimes = _settings_mtimes()
 
     # --- 1. Hardcoded Defaults ---
     hardcoded_defaults = {
@@ -454,7 +553,7 @@ def load_app_config():
             "kokoro": {"model_dir": str(PATHS.KOKORO_TTS_MODELS_DIR), "command_template": "kokoro-tts {input} {output} --model {model_path} --voices {voices_path} --lang {lang} --voice {model_name}"}
         },
         "conversion_tools": {},
-        "ocr_settings": {"ocrmypdf": {}},
+        "ocr_settings": {"ocrmypdf": {"language": "eng"}},
         "auth_settings": {"oidc_client_id": "", "oidc_client_secret": "", "oidc_server_metadata_url": "", "admin_users": []},
         "webhook_settings": {"enabled": False, "allow_chunked_api_uploads": False, "allowed_callback_urls": [], "callback_bearer_token": ""}
     }
@@ -502,13 +601,22 @@ def load_app_config():
 
     # --- 5. Final Processing & Assignment ---
     app_settings = config.get("app_settings", {})
-    max_mb = app_settings.get("max_file_size_mb", 100)
-    app_settings["max_file_size_bytes"] = int(max_mb) * 1024 * 1024
+    try:
+        max_mb = float(app_settings.get("max_file_size_mb", 100))
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid max_file_size_mb {app_settings.get('max_file_size_mb')!r}; using 100.")
+        max_mb = 100
+    app_settings["max_file_size_bytes"] = int(max_mb * 1024 * 1024)
     allowed = app_settings.get("allowed_all_extensions", [])
     if not isinstance(allowed, (list, set)):
         allowed = []
     app_settings["allowed_all_extensions"] = set(allowed)
     config["app_settings"] = app_settings
+
+    UNAVAILABLE_TOOLS = _compute_unavailable_tools(config.get("conversion_tools", {}) or {})
+    if UNAVAILABLE_TOOLS:
+        logger.info("Conversion tools hidden because their program is not installed: "
+                    + ", ".join(f"{t} ({exe})" for t, exe in sorted(UNAVAILABLE_TOOLS.items())))
 
     APP_CONFIG = config
     logger.info("Application configuration loaded.")
@@ -552,6 +660,14 @@ class Job(Base):
     callback_url = Column(String, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        # The job history (newest first) and its incremental polling (changed since ...).
+        Index("ix_jobs_user_created", "user_id", "created_at"),
+        Index("ix_jobs_user_updated", "user_id", "updated_at"),
+        # Downloads look up the job that owns a file.
+        Index("ix_jobs_processed_filepath", "processed_filepath"),
+    )
 
 def get_db():
     db = SessionLocal()
@@ -599,17 +715,12 @@ class FinalizeUploadPayload(BaseModel):
     model_name: str = ""
     output_format: str = ""
     generate_timestamps: bool = False
+    ocr_language: str = ""  # e.g. "eng" or "eng+spa"; defaults to ocr_settings.ocrmypdf.language
     callback_url: Optional[str] = None # For API chunked uploads
 
 class JobSelection(BaseModel):
     job_ids: List[str]
 
-class Notification(Base):
-    __tablename__ = "notifications"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String, index=True, nullable=False)
-    job_data = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 # --------------------------------------------------------------------------------
 # --- 3. CRUD OPERATIONS & WEBHOOKS
@@ -623,11 +734,12 @@ def get_job(db: Session, job_id: str):
     # return db.query(Job).filter(Job.id == job_id).first()
     return  db.query(Job).filter(Job.id == job_id).first()
 
-def get_jobs(db: Session, user_id: str | None = None, skip: int = 0, limit: int = 100):
+def get_jobs(db: Session, user_id: str | None = None, skip: int = 0, limit: int | None = 100):
     query = db.query(Job)
     if user_id:
         query = query.filter(Job.user_id == user_id)
-    return query.order_by(Job.created_at.desc()).offset(skip).limit(limit).all()
+    query = query.order_by(Job.created_at.desc()).offset(skip)
+    return (query.limit(limit) if limit else query).all()
 
 
 def create_job(db: Session, job: JobCreate):
@@ -635,31 +747,26 @@ def create_job(db: Session, job: JobCreate):
     db.add(db_job)
     db.commit()
     db.refresh(db_job)
-    # Broadcast the new job to UI clients via Huey task
-    job_schema = JobSchema.model_validate(db_job)
     return db_job
 
 def update_job_status(db: Session, job_id: str, status: str, progress: int = None, error: str = None):
+    # End the current transaction so the committed row is read (e.g. a cancellation by the web process).
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
     db_job = get_job(db, job_id)
     if db_job:
-        old_status = db_job.status
-        old_progress = db_job.progress
-
+        if db_job.status == "cancelled" and status != "cancelled":
+            # A cancelled job stays cancelled even if its task later finishes or fails.
+            return db_job
         db_job.status = status
         if progress is not None:
             db_job.progress = progress
         if error:
             db_job.error_message = error
 
-        status_changed = old_status != status
-        progress_changed = progress is not None and old_progress != progress
-
         db.commit()
-
-        job_schema = JobSchema.model_validate(db_job)
-
-        if (status_changed or progress_changed) and db_job.user_id:
-            manager.sync_broadcast_job_status_update(db_job.user_id, job_schema.model_dump())
     return db_job
 
 def mark_job_as_completed(db: Session, job_id: str, output_filepath_str: str | None = None, preview: str | None = None):
@@ -678,8 +785,14 @@ def mark_job_as_completed(db: Session, job_id: str, output_filepath_str: str | N
         update_job_status(db, job_id, "completed", progress=100)
     return db_job
 
+WEBHOOK_ATTEMPTS = 3
+
+
 def send_webhook_notification(job_id: str, app_config: Dict[str, Any], base_url: str):
-    """Sends a notification to the callback URL if one is configured for the job."""
+    """
+    Sends a notification to the callback URL if one is configured for the job. Connection errors,
+    5xx and 429 responses are retried (3 attempts in total, 2 s and 4 s apart).
+    """
     webhook_config = app_config.get("webhook_settings", {})
     if not webhook_config.get("enabled", False):
         return
@@ -700,6 +813,7 @@ def send_webhook_notification(job_id: str, app_config: Dict[str, Any], base_url:
             else:
                 download_url = urljoin(public_url, f"/download/{filename}")
 
+        callback_url = job.callback_url
         payload = {
             "job_id": job.id,
             "status": job.status,
@@ -709,26 +823,36 @@ def send_webhook_notification(job_id: str, app_config: Dict[str, Any], base_url:
             "created_at": job.created_at.isoformat() + "Z",
             "updated_at": job.updated_at.isoformat() + "Z",
         }
-
-        headers = {"Content-Type": "application/json", "User-Agent": "FileProcessor-Webhook/1.0"}
-        token = webhook_config.get("callback_bearer_token")
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-
-        try:
-            with httpx.Client() as client:
-                response = client.post(job.callback_url, json=payload, headers=headers, timeout=15)
-                response.raise_for_status()
-            logger.info(f"Sent webhook notification for job {job_id} to {job.callback_url} (Status: {response.status_code})")
-        except httpx.RequestError as e:
-            logger.error(f"Failed to send webhook for job {job_id} to {job.callback_url}: {e}")
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Webhook for job {job_id} received non-2xx response {e.response.status_code} from {job.callback_url}")
-
     except Exception as e:
         logger.exception(f"An unexpected error occurred in send_webhook_notification for job {job_id}: {e}")
+        return
     finally:
-        db.close()
+        db.close()  # not held open while the callback (and its retries) run
+
+    headers = {"Content-Type": "application/json", "User-Agent": "FileProcessor-Webhook/1.0"}
+    token = webhook_config.get("callback_bearer_token")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    for attempt in range(1, WEBHOOK_ATTEMPTS + 1):
+        try:
+            with httpx.Client() as client:
+                response = client.post(callback_url, json=payload, headers=headers, timeout=15)
+            if response.is_success:
+                logger.info(f"Sent webhook notification for job {job_id} to {callback_url} (Status: {response.status_code})")
+                return
+            problem = f"non-2xx response {response.status_code}"
+            retryable = response.status_code >= 500 or response.status_code == 429
+        except httpx.RequestError as e:
+            problem, retryable = f"request error: {e}", True
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred sending the webhook for job {job_id}: {e}")
+            return
+        if not retryable or attempt == WEBHOOK_ATTEMPTS:
+            logger.error(f"Webhook for job {job_id} to {callback_url} failed after {attempt} attempt(s): {problem}")
+            return
+        logger.warning(f"Webhook for job {job_id} to {callback_url} failed ({problem}); retrying.")
+        time.sleep(2 ** attempt)
 
 
 # --------------------------------------------------------------------------------
@@ -737,7 +861,6 @@ def send_webhook_notification(job_id: str, app_config: Dict[str, Any], base_url:
 huey = SqliteHuey(filename=PATHS.HUEY_DB_PATH)
 WHISPER_MODELS_CACHE: Dict[str, WhisperModel] = {}
 PIPER_VOICES_CACHE: Dict[str, "PiperVoice"] = {}
-AVAILABLE_TTS_VOICES_CACHE: Dict[str, Any] | None = None
 WHISPER_MODELS_LAST_USED: Dict[str, float] = {}
 
 # --- Cache Eviction Settings ---
@@ -1294,48 +1417,181 @@ def list_kokoro_languages_cli(timeout: int = 60) -> List[str]:
         return []
 
 
+# ---------------------------
+# Voice list for the UI
+# ---------------------------
+PIPER_VOICES_JSON_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/voices.json?download=true"
+TTS_VOICES_CACHE_FILE = PATHS.DATA_DIR / "tts_voices.json"
+TTS_VOICES_TTL_SECONDS = 24 * 3600
+TTS_VOICES_RETRY_SECONDS = 300  # after an incomplete listing (offline, Kokoro models still downloading, ...)
+_tts_voices_memo: Optional[tuple] = None  # (expires_at, voices)
+_tts_voices_lock = threading.Lock()
+
+
+def installed_tts_engines() -> List[str]:
+    engines = []
+    if PiperVoice is not None:
+        engines.append("piper")
+    if shutil.which("kokoro-tts"):
+        engines.append("kokoro")
+    return engines
+
+
+def _piper_model_dir() -> Path:
+    configured = APP_CONFIG.get("tts_settings", {}).get("piper", {}).get("model_dir")
+    return Path(configured) if configured else PATHS.TTS_MODELS_DIR
+
+
+def _local_piper_voices(model_dir: Path) -> List[dict]:
+    """Voices already downloaded into model_dir; they work without internet access."""
+    try:
+        return [{"id": onnx.stem, "name": onnx.stem, "local": True}
+                for onnx in sorted(model_dir.glob("*.onnx")) if onnx.with_name(onnx.name + ".json").exists()]
+    except OSError:
+        return []
+
+
+def _remote_piper_voices() -> List[dict]:
+    """Piper's voice catalogue (voices.json on Hugging Face), with language names to group the voices by."""
+    response = httpx.get(PIPER_VOICES_JSON_URL, follow_redirects=True, timeout=20)
+    response.raise_for_status()
+    voices = []
+    for voice_id, meta in response.json().items():
+        meta = meta if isinstance(meta, dict) else {}
+        language = meta.get("language") if isinstance(meta.get("language"), dict) else {}
+        language_name = language.get("name_english") or language.get("code") or voice_id.split("-")[0]
+        if language.get("country_english"):
+            language_name = f"{language_name} ({language['country_english']})"
+        name = f"{meta['name']} ({meta['quality']})" if meta.get("name") and meta.get("quality") else voice_id
+        voices.append({"id": voice_id, "name": name, "language": {"name": language_name}, "local": False})
+    return voices
+
+
+def list_piper_voices(model_dir: Path) -> tuple:
+    """Returns (voices, complete); complete is False when only the downloaded voices could be listed."""
+    complete = True
+    try:
+        # Older piper releases have a Python API for this; piper-tts >= 1.3 only a CLI, which fetches
+        # the same catalogue without a timeout.
+        remote = safe_get_voices(model_dir) if get_voices else _remote_piper_voices()
+    except Exception as e:
+        logger.warning("Could not fetch the Piper voice catalogue (%s); only downloaded voices are offered.", e)
+        remote, complete = [], False
+    voices = {v["id"]: dict(v) for v in remote if isinstance(v, dict) and v.get("id")}
+    for local in _local_piper_voices(model_dir):
+        voices.setdefault(local["id"], local)["local"] = True
+    return list(voices.values()), complete
+
+
+def _collect_tts_voices() -> tuple:
+    """Returns (voices, complete) for all installed engines."""
+    voices, complete = [], True
+    if PiperVoice is not None:
+        piper_voices, complete = list_piper_voices(_piper_model_dir())
+        for voice in piper_voices:
+            voice["name"] = f"Piper: {voice.get('name') or voice['id']}"
+            voice["id"] = f"piper/{voice['id']}"
+            voices.append(voice)
+    if shutil.which("kokoro-tts"):
+        kokoro_voices, kokoro_langs = list_kokoro_voices_cli(), list_kokoro_languages_cli()
+        if not (kokoro_voices and kokoro_langs):
+            complete = False  # e.g. the model files are still being downloaded
+        for lang in kokoro_langs:
+            for voice in kokoro_voices:
+                voices.append({"id": f"kokoro/{lang}/{voice}", "name": f"Kokoro ({lang}): {voice}",
+                               "language": {"name": f"Kokoro: {lang}"}, "local": True})
+    return sorted(voices, key=lambda v: v["name"]), complete
+
+
+def _read_tts_voices_cache(engines: List[str]) -> Optional[tuple]:
+    try:
+        data = json.loads(TTS_VOICES_CACHE_FILE.read_text(encoding="utf8"))
+        if data.get("engines") == engines and float(data["expires"]) > time.time() and isinstance(data["voices"], list):
+            return float(data["expires"]), data["voices"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def available_tts_voices() -> List[dict]:
+    """
+    The voices of the installed TTS engines. Listing them is slow, so the result is kept in memory
+    and in DATA_DIR, shared by all worker processes: for a day, or for a few minutes when the
+    listing was incomplete. Blocking; call it from a thread.
+    """
+    global _tts_voices_memo
+    memo = _tts_voices_memo
+    if memo and memo[0] > time.time():
+        return memo[1]
+    with _tts_voices_lock:
+        memo = _tts_voices_memo
+        if memo and memo[0] > time.time():
+            return memo[1]
+        engines = installed_tts_engines()
+        cached = _read_tts_voices_cache(engines)
+        if cached is None:
+            with open(PATHS.DATA_DIR / ".tts_voices.lock", "w") as lock_file:
+                # One process lists the voices; the others wait for its result instead of repeating the work.
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                cached = _read_tts_voices_cache(engines)
+                if cached is None:
+                    try:
+                        voices, complete = _collect_tts_voices()
+                    except Exception:
+                        logger.exception("Could not list TTS voices.")
+                        voices, complete = [], False
+                    expires = time.time() + (TTS_VOICES_TTL_SECONDS if complete and voices else TTS_VOICES_RETRY_SECONDS)
+                    tmp_file = TTS_VOICES_CACHE_FILE.with_name(f"{TTS_VOICES_CACHE_FILE.name}.tmp-{os.getpid()}")
+                    try:
+                        tmp_file.write_text(json.dumps({"engines": engines, "expires": expires, "voices": voices}), encoding="utf8")
+                        tmp_file.replace(TTS_VOICES_CACHE_FILE)
+                    except OSError as e:
+                        logger.warning(f"Could not cache the TTS voice list: {e}")
+                    cached = (expires, voices)
+        _tts_voices_memo = cached
+        return cached[1]
+
+
 def run_command(
     argv: List[str],
-    timeout: int = 300
+    timeout: int = 300,
+    cwd: Optional[Path] = None,
 ) -> subprocess.CompletedProcess:
     """
-    Executes a command, captures its output, and handles timeouts and errors.
-    Uses resource limits for child processes. This is a simplified, more robust
-    implementation using subprocess.run.
+    Executes a command with resource limits and a timeout. Output goes to temp files, not
+    pipes (a chatty tool can't block on a full pipe), and on timeout the whole process
+    group is killed. Returns the tail of stdout/stderr; raises Exception on failure.
     """
-    logger.debug("Executing command: %s with timeout=%ss", " ".join(shlex.quote(s) for s in argv), timeout)
-
-    preexec = globals().get("_limit_resources_preexec", None)
-
-    try:
-        # subprocess.run handles timeout, output capturing, and error checking.
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=True,  # Raises CalledProcessError on non-zero exit
-            preexec_fn=preexec
-        )
-        logger.debug("Command completed successfully: %s", " ".join(shlex.quote(s) for s in argv))
-        return result
-    except FileNotFoundError:
-        msg = f"Command not found: {argv[0]}"
+    printable = " ".join(shlex.quote(s) for s in argv)
+    logger.debug("Executing command: %s with timeout=%ss", printable, timeout)
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        try:
+            proc = subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f, cwd=cwd,
+                preexec_fn=_limit_resources_preexec, start_new_session=True,
+            )
+        except FileNotFoundError:
+            msg = f"Command not found: {argv[0]}"
+            logger.error(msg)
+            raise Exception(msg) from None
+        except Exception as e:
+            msg = f"Unexpected error launching command: {e}"
+            logger.exception(msg)
+            raise Exception(msg) from e
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            msg = f"Command timed out after {timeout}s: {printable}"
+            logger.error(msg)
+            raise Exception(msg) from None
+        stdout, stderr = _read_tail(out_f), _read_tail(err_f)
+    if returncode != 0:
+        msg = f"Command failed with exit code {returncode}. Stderr: {stderr[-1000:]}"
         logger.error(msg)
-        raise Exception(msg) from None
-    except subprocess.TimeoutExpired as e:
-        msg = f"Command timed out after {timeout}s: {' '.join(shlex.quote(s) for s in argv)}"
-        logger.error(msg)
-        raise Exception(msg) from e
-    except subprocess.CalledProcessError as e:
-        snippet = (e.stderr or "")[:1000]
-        msg = f"Command failed with exit code {e.returncode}. Stderr: {snippet}"
-        logger.error(msg)
-        raise Exception(msg) from e
-    except Exception as e:
-        msg = f"Unexpected error launching command: {e}"
-        logger.exception(msg)
-        raise Exception(msg) from e
+        raise Exception(msg)
+    logger.debug("Command completed successfully: %s", printable)
+    return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr=stderr)
 
 def validate_and_build_command(template_str: str, mapping: Dict[str, str]) -> TypingList[str]:
     fmt = Formatter()
@@ -1399,6 +1655,9 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
         if job.status == 'cancelled':
             logger.info(f"Job {job_id} was already cancelled before starting. Aborting.")
             return
+        allowed_models = whisper_settings.get("allowed_models")
+        if allowed_models is not None and model_size not in allowed_models:
+            raise ValueError(f"Whisper model '{model_size}' is not in allowed_models.")
 
         update_job_status(db, job_id, "processing", progress=0)
 
@@ -1415,8 +1674,6 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
         logger.info(f"Detected language: {info.language} with probability {info.language_probability:.2f} for a duration of {info.duration:.2f}s")
 
         last_update_time = time.time()
-        last_db_refresh_time = time.time()
-        DB_REFRESH_INTERVAL = 30
 
         update_job_status(db, job_id, "processing", progress=5)
         logger.info(f"Transcription job {job_id} started, progress at 5%")
@@ -1426,58 +1683,31 @@ def run_transcription_task(job_id: str, input_path_str: str, output_path_str: st
         preview_segments = []
         PREVIEW_MAX_LENGTH = 1000
         current_preview_length = 0
+        srt_formatter = SrtFormatter() if generate_timestamps else None
 
         with tmp_output_path.open("w", encoding="utf-8") as f:
-            if generate_timestamps:
-                srt_formatter = SrtFormatter()
-                for segment in segments_generator:
-                    formatted_srt = srt_formatter.format_segment(segment)
-                    f.write(formatted_srt)
-                    
-                    segment_text = segment.text.strip()
-                    if current_preview_length < PREVIEW_MAX_LENGTH:
-                        preview_segments.append(segment_text)
-                        current_preview_length += len(segment_text)
-                    
-                    current_time = time.time()
-                    if current_time - last_db_refresh_time > DB_REFRESH_INTERVAL:
-                        db.close()
-                        db = SessionLocal()
-                        last_db_refresh_time = current_time
+            for segment in segments_generator:
+                segment_text = segment.text.strip()
+                f.write(srt_formatter.format_segment(segment) if srt_formatter else segment_text + "\n")
 
-                    if current_time - last_update_time > DB_POLL_INTERVAL_SECONDS:
-                        last_update_time = current_time
-                        job_check = get_job(db, job_id)
-                        if job_check and job_check.status == 'cancelled':
-                            logger.info(f"Job {job_id} cancelled during transcription. Stopping.")
-                            return
-                        if info.duration > 0:
-                            progress = int((segment.end / info.duration) * 100)
-                            update_job_status(db, job_id, "processing", progress=progress)
-            else:
-                for segment in segments_generator:
-                    segment_text = segment.text.strip()
-                    f.write(segment_text + "\n")
+                if current_preview_length < PREVIEW_MAX_LENGTH:
+                    preview_segments.append(segment_text)
+                    current_preview_length += len(segment_text)
 
-                    if current_preview_length < PREVIEW_MAX_LENGTH:
-                        preview_segments.append(segment_text)
-                        current_preview_length += len(segment_text)
-
-                    current_time = time.time()
-                    if current_time - last_db_refresh_time > DB_REFRESH_INTERVAL:
-                        db.close()
-                        db = SessionLocal()
-                        last_db_refresh_time = current_time
-
-                    if current_time - last_update_time > DB_POLL_INTERVAL_SECONDS:
-                        last_update_time = current_time
-                        job_check = get_job(db, job_id)
-                        if job_check and job_check.status == 'cancelled':
-                            logger.info(f"Job {job_id} cancelled during transcription. Stopping.")
-                            return
-                        if info.duration > 0:
-                            progress = int((segment.end / info.duration) * 100)
-                            update_job_status(db, job_id, "processing", progress=progress)
+                current_time = time.time()
+                if current_time - last_update_time > DB_POLL_INTERVAL_SECONDS:
+                    last_update_time = current_time
+                    # Still in use: the idle-model eviction must not unload it (the next job would
+                    # then load a second copy while this one still holds the first).
+                    with _cache_lock:
+                        if model_size in WHISPER_MODELS_CACHE:
+                            WHISPER_MODELS_LAST_USED[model_size] = current_time
+                    if _current_job_status(db, job_id) in (None, 'cancelled'):
+                        logger.info(f"Job {job_id} cancelled or deleted during transcription. Stopping.")
+                        return
+                    if info.duration > 0:
+                        progress = min(99, int((segment.end / info.duration) * 100))
+                        update_job_status(db, job_id, "processing", progress=progress)
 
         tmp_output_path.replace(output_path)
 
@@ -1538,6 +1768,7 @@ def run_tts_task(job_id: str, input_path_str: str, output_path_str: str, model_n
         if not job or job.status == 'cancelled':
             return
 
+        validate_tts_model_name(model_name)
         update_job_status(db, job_id, "processing")
 
         engine, actual_model_name = "piper", model_name
@@ -1623,6 +1854,27 @@ def run_tts_task(job_id: str, input_path_str: str, output_path_str: str, model_n
 
         send_webhook_notification(job_id, app_config, base_url)
 
+PREVIEW_MAX_CHARS = 2000
+
+
+def _pdf_text_preview(pdf_path: str, limit: int = PREVIEW_MAX_CHARS) -> str:
+    """
+    Text of the first pages of a PDF, for the job preview. Stops once `limit` characters are
+    collected: extracting every page of a large document took longer than the OCR itself.
+    """
+    parts, collected = [], 0
+    try:
+        for page in pypdf.PdfReader(pdf_path).pages:
+            text = page.extract_text() or ""
+            parts.append(text)
+            collected += len(text)
+            if collected >= limit:
+                break
+    except Exception:
+        logger.warning("Could not extract a text preview from %s", pdf_path, exc_info=True)
+    return "\n".join(parts)
+
+
 @huey.task()
 def run_pdf_ocr_task(job_id: str, input_path_str: str, output_path_str: str, ocr_settings: dict, app_config: dict, base_url: str):
     db = SessionLocal()
@@ -1639,15 +1891,13 @@ def run_pdf_ocr_task(job_id: str, input_path_str: str, output_path_str: str, ocr
         update_job_status(db, job_id, "processing")
         logger.info(f"Starting PDF OCR for job {job_id}")
         ocrmypdf.ocr(str(input_path), str(output_path_str),
+                     language=resolve_ocr_language(None, ocr_settings).split('+'),
                      deskew=ocr_settings.get('deskew', True),
                      force_ocr=ocr_settings.get('force_ocr', True),
                      clean=ocr_settings.get('clean', True),
                      optimize=ocr_settings.get('optimize', 1),
                      progress_bar=False)
-        with open(output_path_str, "rb") as f:
-            reader = pypdf.PdfReader(f)
-            preview = "\n".join(page.extract_text() or "" for page in reader.pages)
-        mark_job_as_completed(db, job_id, output_filepath_str=output_path_str, preview=preview)
+        mark_job_as_completed(db, job_id, output_filepath_str=output_path_str, preview=_pdf_text_preview(output_path_str))
         logger.info(f"PDF OCR for job {job_id} completed.")
     except Exception as e:
         logger.exception(f"ERROR during PDF OCR for job {job_id}")
@@ -1672,7 +1922,7 @@ def run_pdf_ocr_task(job_id: str, input_path_str: str, output_path_str: str, ocr
         send_webhook_notification(job_id, app_config, base_url)
 
 @huey.task()
-def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, app_config: dict, base_url: str):
+def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, app_config: dict, base_url: str, ocr_language: Optional[str] = None):
     db = SessionLocal()
     input_path = Path(input_path_str)
     out_path = Path(output_path_str)
@@ -1688,81 +1938,55 @@ def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, a
             return
 
         update_job_status(db, job_id, "processing", progress=10)
-        logger.info(f"Starting Image OCR for job {job_id} - {input_path}")
+        lang = resolve_ocr_language(ocr_language, app_config.get("ocr_settings", {}).get("ocrmypdf", {}))
+        logger.info(f"Starting Image OCR for job {job_id} ({lang}) - {input_path}")
 
-        # open image and gather frames (support multi-frame TIFF)
         try:
             pil_img = Image.open(str(input_path))
         except UnidentifiedImageError as e:
             raise RuntimeError(f"Cannot identify/open input image: {e}")
 
-        frames = []
-        try:
-            # some images support n_frames (multi-page TIFF); iterate safely
-            n_frames = getattr(pil_img, "n_frames", 1)
-            for i in range(n_frames):
-                pil_img.seek(i)
-                # copy the frame to avoid problems when the original image object is closed
-                frames.append(pil_img.convert("RGB").copy())
-        except Exception:
-            # fallback: single frame
-            frames = [pil_img.convert("RGB")]
-
-        update_job_status(db, job_id, "processing", progress=30)
-
-        pdf_bytes_list = []
-        text_parts = []
-        for idx, frame in enumerate(frames):
-            # produce searchable PDF bytes for the frame and plain text as well
-            try:
-                pdf_bytes = pytesseract.image_to_pdf_or_hocr(frame, extension="pdf")
-            except TesseractNotFoundError as e:
-                raise RuntimeError("Tesseract not found. Ensure Tesseract OCR is installed and in PATH.") from e
-            except Exception as e:
-                raise RuntimeError(f"Failed to run Tesseract on frame {idx}: {e}") from e
-
-            pdf_bytes_list.append(pdf_bytes)
-
-            # also extract plain text for preview and possible fallback
-            try:
-                page_text = pytesseract.image_to_string(frame)
-            except Exception:
-                page_text = ""
-            text_parts.append(page_text)
-
-            # update progress incrementally
-            prog = 30 + int((idx + 1) / max(1, len(frames)) * 50)
-            update_job_status(db, job_id, "processing", progress=min(prog, 80))
-
-        # merge per-page pdfs if multiple frames
-        final_pdf_bytes = None
-        if len(pdf_bytes_list) == 1:
-            final_pdf_bytes = pdf_bytes_list[0]
-        else:
-            if _HAS_PYPDF2:
-                merger = PdfMerger()
-                for b in pdf_bytes_list:
-                    merger.append(io.BytesIO(b))
-                out_buffer = io.BytesIO()
-                merger.write(out_buffer)
-                merger.close()
-                final_pdf_bytes = out_buffer.getvalue()
-            else:
-                # PyPDF2 not installed — try a simple concatenation (not valid PDF merge),
-                # better to fail loudly so user can install PyPDF2; but as a fallback
-                # write the first page only and include a warning in job preview.
-                logger.warning("PyPDF2 not available; only the first frame will be written to output PDF.")
-                final_pdf_bytes = pdf_bytes_list[0]
-                text_parts.insert(0, "[WARNING] Multiple frames detected but PyPDF2 not available; only first page saved.\n")
+        writer = pypdf.PdfWriter()  # merges the pages of multi-frame images
+        single_page_pdf: Optional[bytes] = None
+        text_parts: List[str] = []
+        with pil_img:
+            n_frames = max(1, getattr(pil_img, "n_frames", 1))  # multi-page TIFFs have several
+            for idx in range(n_frames):
+                if idx and _current_job_status(db, job_id) in (None, "cancelled"):
+                    logger.info(f"Image OCR job {job_id} cancelled or deleted. Stopping.")
+                    return
+                # One frame at a time: converting every page of a large TIFF up front used GBs of memory.
+                pil_img.seek(idx)
+                frame = pil_img.convert("RGB")
+                try:
+                    # A single Tesseract run produces both the searchable PDF and the plain text
+                    # (running it once per output doubled the OCR time).
+                    pdf_bytes, page_text = pytesseract.run_and_get_multiple_output(frame, extensions=["pdf", "txt"], lang=lang)
+                except TesseractNotFoundError:
+                    raise
+                except Exception as e:
+                    raise RuntimeError(f"Failed to run Tesseract on frame {idx}: {e}") from e
+                finally:
+                    frame.close()
+                text_parts.append(page_text or "")
+                if n_frames == 1:
+                    single_page_pdf = pdf_bytes
+                else:
+                    writer.append(io.BytesIO(pdf_bytes))
+                update_job_status(db, job_id, "processing", progress=min(80, 30 + int((idx + 1) / n_frames * 50)))
 
         # write out atomically
         tmp_out = out_path.with_name(f"{out_path.stem}.tmp-{uuid.uuid4().hex}{out_path.suffix or '.pdf'}")
         try:
             tmp_out.parent.mkdir(parents=True, exist_ok=True)
             with tmp_out.open("wb") as f:
-                f.write(final_pdf_bytes)
+                if single_page_pdf is not None:
+                    f.write(single_page_pdf)
+                else:
+                    writer.write(f)
             tmp_out.replace(out_path)
         except Exception as e:
+            tmp_out.unlink(missing_ok=True)
             raise RuntimeError(f"Failed writing output PDF to {out_path}: {e}") from e
 
         # create a preview from the recognized text (limit length)
@@ -1770,7 +1994,6 @@ def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, a
         preview = full_text[:1000] + ("…" if len(full_text) > 1000 else "")
 
         mark_job_as_completed(db, job_id, output_filepath_str=str(out_path), preview=preview)
-        update_job_status(db, job_id, "completed", progress=100)
         logger.info(f"Image OCR for job {job_id} completed. Output: {out_path}")
 
     except TesseractNotFoundError:
@@ -1807,6 +2030,39 @@ def run_image_ocr_task(job_id: str, input_path_str: str, output_path_str: str, a
             logger.exception("Failed to send webhook notification after Image OCR.")
 
 
+# Executables of LibreOffice; each conversion gets a private profile (see run_conversion_task).
+LIBREOFFICE_BINARIES = {"libreoffice", "soffice", "lowriter", "localc", "loimpress", "lodraw"}
+# Output keys in the default config whose pandoc writer has a different name.
+PANDOC_WRITERS = {"txt": "plain", "md": "markdown", "tex": "latex"}
+GHOSTSCRIPT_PDF_PRESETS = {"screen", "ebook", "printer", "prepress", "default"}
+SOX_SAMPLE_RATES = {"11k": "11025", "22k": "22050", "44k": "44100", "88k": "88200", "176k": "176400"}
+
+
+def _find_tool_output(out_dir: Path, input_stem: str, output_ext: str) -> Optional[Path]:
+    """Finds the result of a tool that picks its own output file name inside out_dir."""
+    files = [p for p in out_dir.rglob("*") if p.is_file()]
+    exact = [p for p in files if p.name == f"{input_stem}.{output_ext}"]
+    if exact:
+        return exact[0]
+    same_ext = [p for p in files if p.suffix.lower() == f".{output_ext}".lower()]
+    if len(same_ext) == 1:
+        return same_ext[0]
+    if len(files) == 1:
+        return files[0]
+    return None
+
+
+def _current_job_status(db: Session, job_id: str) -> Optional[str]:
+    """
+    Reads the job's status as currently committed. Ending the session's transaction first
+    matters: inside one SQLite read transaction (and SQLAlchemy's identity map) a
+    cancellation written by the web process would never become visible.
+    """
+    db.rollback()
+    job = get_job(db, job_id)
+    return job.status if job else None
+
+
 @huey.task()
 def run_conversion_task(job_id: str,
                         input_path_str: str,
@@ -1817,31 +2073,34 @@ def run_conversion_task(job_id: str,
                         app_config: dict,
                         base_url: str):
     """
-    Drop-in replacement for conversion task.
-    - Uses improved run_command for short operations (resource-limited).
-    - Uses cancellable Popen runner for long-running conversion to respond to DB cancellations.
+    Runs a configured conversion tool for a job.
+    - The tool runs in its own process group with resource limits; cancel/timeout kill the whole group.
+    - Output is written to temp files instead of pipes, so verbose tools can't block on a full pipe.
+    - Tools that ignore {output} and write into {output_dir} (LibreOffice, docling) get a private
+      directory whose result is moved into place.
     """
     db = SessionLocal()
     input_path = Path(input_path_str)
     output_path = Path(output_path_str)
 
-    # localize helpers for speed
-    _get_job = get_job
-    _update_job_status = update_job_status
-    _validate_build = validate_and_build_command
-    _mark_completed = mark_job_as_completed
-    _ensure_safe = ensure_path_is_safe
-    _send_webhook = send_webhook_notification
-
     temp_input_file: Optional[Path] = None
     temp_output_file: Optional[Path] = None
+    job_output_dir: Optional[Path] = None
+    lo_profile_dir: Optional[Path] = None
 
     POLL_INTERVAL = 1.0
     STDERR_SNIPPET = 4000
 
     def _parse_task_key(tool_name: str, tk: str, tool_cfg: dict, mapping: dict):
         try:
-            if tool_name.startswith("ghostscript"):
+            if tool_name == "ghostscript_pdf":
+                preset = ""
+                if tk in GHOSTSCRIPT_PDF_PRESETS:
+                    preset = f"-dPDFSETTINGS=/{tk}"
+                elif tk == "pdfa":
+                    preset = "-dPDFA=2"
+                mapping.update({"preset": preset})
+            elif tool_name.startswith("ghostscript"):
                 parts = tk.split("_", 1)
                 device = parts[0] if parts and parts[0] else ""
                 setting = parts[1] if len(parts) > 1 else ""
@@ -1864,7 +2123,7 @@ def run_conversion_task(job_id: str,
                 else:
                     rate_token = ""
                     depth_token = ""
-                rate_val = rate_token.replace("k", "000") if rate_token else ""
+                rate_val = SOX_SAMPLE_RATES.get(rate_token) or (rate_token.replace("k", "000") if rate_token else "")
                 if depth_token:
                     depth_val = ('-b' + depth_token.replace('b', '')) if 'b' in depth_token else depth_token
                 else:
@@ -1881,83 +2140,45 @@ def run_conversion_task(job_id: str,
                 if not filter_val:
                     filter_val = target_ext
                 mapping["filter"] = filter_val
+            elif tool_name == "pandoc":
+                mapping["output_ext"] = PANDOC_WRITERS.get(mapping["output_ext"], mapping["output_ext"])
         except Exception:
             logger.exception("Failed to parse task_key for tool %s; continuing with defaults.", tool_name)
 
-    def _run_cancellable_command(command: List[str], timeout: int):
-        """
-        Run command with Popen and poll the DB for cancellation. Enforce timeout.
-        Returns CompletedProcess-like on success. Raises Exception on failure/timeout/cancel.
-        """
-        preexec = globals().get("_limit_resources_preexec", None)
+    def _run_cancellable_command(command: List[str], timeout: int) -> subprocess.CompletedProcess:
+        """Runs the tool, polling the DB for cancellation. Raises Exception on failure/timeout/cancel."""
         logger.debug("Launching conversion subprocess: %s", " ".join(shlex.quote(c) for c in command))
-        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, preexec_fn=preexec)
-
-        start = time.monotonic()
-        stderr_accum = []
-        stderr_len = 0
-        STDERR_LIMIT = STDERR_SNIPPET
-
-        try:
+        with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+            proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f,
+                                    preexec_fn=_limit_resources_preexec, start_new_session=True)
+            start = time.monotonic()
             while True:
-                ret = proc.poll()
-                # Check job status
-                job_check = _get_job(db, job_id)
-                if job_check is None:
-                    logger.warning("Job %s disappeared; killing conversion process.", job_id)
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    raise Exception("Job disappeared during conversion")
-                if job_check.status == "cancelled":
-                    logger.info("Job %s cancelled; terminating conversion process.", job_id)
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    raise Exception("Conversion cancelled")
-
+                try:
+                    ret = proc.wait(timeout=POLL_INTERVAL)
+                except subprocess.TimeoutExpired:
+                    ret = None
                 if ret is not None:
-                    # process done - read remaining stderr/stdout safely
-                    try:
-                        out, err = proc.communicate(timeout=2)
-                    except Exception:
-                        out, err = "", ""
-                        try:
-                            if proc.stderr:
-                                err = proc.stderr.read(STDERR_LIMIT)
-                        except Exception:
-                            pass
-                    if err and len(err) > STDERR_LIMIT:
-                        err = err[-STDERR_LIMIT:]
+                    err = _read_tail(err_f, STDERR_SNIPPET)
                     if ret != 0:
-                        msg = (err or "")[:STDERR_LIMIT]
-                        raise Exception(f"Conversion command failed (rc={ret}): {msg}")
-                    return subprocess.CompletedProcess(args=command, returncode=ret, stdout=out, stderr=err)
+                        raise Exception(f"Conversion command failed (rc={ret}): {err}")
+                    return subprocess.CompletedProcess(args=command, returncode=ret, stdout=_read_tail(out_f, STDERR_SNIPPET), stderr=err)
 
-                # timeout check
-                elapsed = time.monotonic() - start
-                if timeout and elapsed > timeout:
+                job_status = _current_job_status(db, job_id)
+                if job_status is None:
+                    logger.warning("Job %s disappeared; killing conversion process.", job_id)
+                    _kill_process_tree(proc)
+                    raise Exception("Job disappeared during conversion")
+                if job_status == "cancelled":
+                    logger.info("Job %s cancelled; terminating conversion process.", job_id)
+                    _kill_process_tree(proc)
+                    raise Exception("Conversion cancelled")
+                if timeout and time.monotonic() - start > timeout:
                     logger.warning("Conversion command timed out after %ss; terminating.", timeout)
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    raise Exception("Conversion command timed out")
-
-                time.sleep(POLL_INTERVAL)
-        finally:
-            try:
-                if proc.stdout:
-                    proc.stdout.close()
-                if proc.stderr:
-                    proc.stderr.close()
-            except Exception:
-                pass
+                    _kill_process_tree(proc)
+                    raise Exception(f"Conversion command timed out after {timeout}s")
 
     try:
-        job = _get_job(db, job_id)
+        job = get_job(db, job_id)
         if not job:
             logger.warning("Job %s not found; aborting conversion.", job_id)
             return
@@ -1965,7 +2186,7 @@ def run_conversion_task(job_id: str,
             logger.info("Job %s already cancelled; aborting conversion.", job_id)
             return
 
-        _update_job_status(db, job_id, "processing", progress=25)
+        update_job_status(db, job_id, "processing", progress=25)
         logger.info("Starting conversion for job %s using %s with task %s", job_id, tool, task_key)
 
         tool_config = conversion_tools_config.get(tool)
@@ -1974,7 +2195,7 @@ def run_conversion_task(job_id: str,
 
         current_input_path = input_path
 
-        # Pre-conversion step for mozjpeg uses improved run_command (resource-limited)
+        # Pre-conversion step for mozjpeg uses run_command (resource-limited)
         if tool == "mozjpeg":
             temp_input_file = input_path.with_suffix('.temp.ppm')
             logger.info("Pre-converting for MozJPEG: %s -> %s", input_path, temp_input_file)
@@ -1983,22 +2204,24 @@ def run_conversion_task(job_id: str,
             try:
                 run_command(pre_conv_cmd, timeout=int(tool_config.get("timeout", 300)))
             except Exception as ex:
-                err_msg = str(ex)
-                short_err = (err_msg or "")[:STDERR_SNIPPET]
+                short_err = (str(ex) or "")[:STDERR_SNIPPET]
                 logger.exception("MozJPEG pre-conversion failed: %s", short_err)
                 raise Exception(f"MozJPEG pre-conversion to PPM failed: {short_err}")
             current_input_path = temp_input_file
 
-        _update_job_status(db, job_id, "processing", progress=50)
+        update_job_status(db, job_id, "processing", progress=50)
 
         # Prepare atomic temp output on same FS
         output_path.parent.mkdir(parents=True, exist_ok=True)
         temp_output_file = output_path.with_name(f"{output_path.stem}.tmp-{uuid.uuid4().hex}{output_path.suffix}")
+        job_output_dir = PATHS.PROCESSED_DIR / f".tmp-{job_id}"
+        shutil.rmtree(job_output_dir, ignore_errors=True)
+        job_output_dir.mkdir(parents=True)
 
         mapping = {
             "input": str(current_input_path),
             "output": str(temp_output_file),
-            "output_dir": str(current_input_path.parent),
+            "output_dir": str(job_output_dir),
             "output_ext": output_path.suffix.lstrip('.'),
         }
 
@@ -2007,77 +2230,56 @@ def run_conversion_task(job_id: str,
         command_template_str = tool_config.get("command_template")
         if not command_template_str:
             raise ValueError(f"Tool '{tool}' missing 'command_template' in configuration.")
-        command = _validate_build(command_template_str, mapping)
+        command = validate_and_build_command(command_template_str, mapping)
         if not isinstance(command, (list, tuple)) or not command:
             raise ValueError("validate_and_build_command must return a non-empty list/tuple command.")
         command = [str(x) for x in command]
 
+        # LibreOffice instances sharing a profile hand documents to whichever instance is already
+        # running and exit without converting, so concurrent jobs silently failed.
+        if Path(command[0]).name in LIBREOFFICE_BINARIES and not any(a.startswith("-env:UserInstallation=") for a in command):
+            lo_profile_dir = Path(tempfile.mkdtemp(prefix="filewizard-lo-"))
+            command.insert(1, f"-env:UserInstallation={lo_profile_dir.as_uri()}")
+
         logger.info("Executing command: %s", " ".join(shlex.quote(c) for c in command))
+        _run_cancellable_command(command, timeout=int(tool_config.get("timeout", 300)))
 
-        # Run main conversion in cancellable manner
-        timeout_val = int(tool_config.get("timeout", 300))
-
-        result = _run_cancellable_command(command, timeout=timeout_val)
-
-        # Wait for output file to be created and non-empty, with retry for long-running operations
-        max_wait_time = 30  # seconds
-        wait_interval = 0.5  # seconds
-        elapsed_time = 0
-        
-        while elapsed_time < max_wait_time:
-            if temp_output_file.exists() and temp_output_file.stat().st_size > 0:
-                break
-            time.sleep(wait_interval)
-            elapsed_time += wait_interval
-            
-            # Check if job was cancelled during wait
-            job_check = _get_job(db, job_id)
-            if job_check is None:
-                raise Exception("Job disappeared during file creation wait")
-            if job_check.status == "cancelled":
-                raise Exception("Conversion cancelled during file creation wait")
-
-        # Final check after waiting
+        if not (temp_output_file.exists() and temp_output_file.stat().st_size > 0):
+            produced = _find_tool_output(job_output_dir, current_input_path.stem, output_path.suffix.lstrip('.'))
+            if produced:
+                produced.replace(temp_output_file)
         if not temp_output_file.exists() or temp_output_file.stat().st_size == 0:
-            raise Exception("Conversion failed: The tool produced an empty or missing output file after waiting.")
+            raise Exception("Conversion failed: The tool produced an empty or missing output file.")
 
-        # If successful and temp output exists, move it into place atomically
-        if temp_output_file and temp_output_file.exists():
-            temp_output_file.replace(output_path)
-
-        _mark_completed(db, job_id, output_filepath_str=str(output_path), preview="Successfully converted file.")
+        temp_output_file.replace(output_path)
+        mark_job_as_completed(db, job_id, output_filepath_str=str(output_path), preview="Successfully converted file.")
         logger.info("Conversion for job %s completed.", job_id)
 
     except Exception as e:
         logger.exception("ERROR during conversion for job %s: %s", job_id, e)
         try:
-            _update_job_status(db, job_id, "failed", error=f"Conversion failed: {e}")
+            update_job_status(db, job_id, "failed", error=f"Conversion failed: {e}")
         except Exception:
             logger.exception("Failed to update job status to failed after conversion error.")
     finally:
         # clean main input
         try:
-            _ensure_safe(input_path, [PATHS.UPLOADS_DIR, PATHS.CHUNK_TMP_DIR])
+            ensure_path_is_safe(input_path, [PATHS.UPLOADS_DIR, PATHS.CHUNK_TMP_DIR])
             input_path.unlink(missing_ok=True)
         except Exception:
             logger.exception("Failed to cleanup main input file after conversion.")
 
-        # cleanup temp input
-        if temp_input_file:
-            try:
-                temp_input_file_path = Path(temp_input_file)
-                _ensure_safe(temp_input_file_path, [PATHS.UPLOADS_DIR, PATHS.PROCESSED_DIR])
-                temp_input_file_path.unlink(missing_ok=True)
-            except Exception:
-                logger.exception("Failed to cleanup temp input file after conversion.")
+        for temp_file in (temp_input_file, temp_output_file):
+            if temp_file:
+                try:
+                    ensure_path_is_safe(Path(temp_file), [PATHS.UPLOADS_DIR, PATHS.PROCESSED_DIR])
+                    Path(temp_file).unlink(missing_ok=True)
+                except Exception:
+                    logger.exception("Failed to cleanup temp file %s after conversion.", temp_file)
 
-        if temp_output_file:
-            try:
-                temp_output_file_path = Path(temp_output_file)
-                _ensure_safe(temp_output_file_path, [PATHS.UPLOADS_DIR, PATHS.PROCESSED_DIR])
-                temp_output_file_path.unlink(missing_ok=True)
-            except Exception:
-                logger.exception("Failed to cleanup temp output file after conversion.")
+        for temp_dir in (job_output_dir, lo_profile_dir):
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
         try:
             db.close()
@@ -2094,17 +2296,15 @@ def run_conversion_task(job_id: str,
             db_for_check.close()
 
         try:
-            gc.collect()
-        except Exception:
-            pass
-
-        try:
-            _send_webhook(job_id, app_config, base_url)
+            send_webhook_notification(job_id, app_config, base_url)
         except Exception:
             logger.exception("Failed to send webhook notification after conversion.")
 
-def dispatch_single_file_job(original_filename: str, input_filepath: str, task_type: str, user: dict, db: Session, app_config: Dict, base_url: str, job_id: str | None = None, options: Dict = None, parent_job_id: str | None = None):
-    """Helper to create and dispatch a job for a single file."""
+OCR_IMAGE_EXTENSIONS = frozenset({'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.webp'})
+
+
+def dispatch_single_file_job(original_filename: str, input_filepath: str, task_type: str, user: dict, db: Session, app_config: Dict, base_url: str, job_id: str | None = None, options: Dict = None, parent_job_id: str | None = None) -> Optional[str]:
+    """Helper to create and dispatch a job for a single file. Returns the job id, or None if no job was created."""
     if options is None:
         options = {}
 
@@ -2112,28 +2312,41 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
     if job_id is None:
         job_id = uuid.uuid4().hex
 
-    safe_filename = secure_filename(original_filename)
+    safe_filename = safe_basename(original_filename)
     final_path = Path(input_filepath)
 
     # Ensure the input file exists before creating a job
     if not final_path.exists():
         logger.error(f"Input file does not exist, cannot dispatch job: {input_filepath}")
-        return
+        return None
 
     job_data = JobCreate(
         id=job_id, user_id=user['sub'], task_type=task_type,
         original_filename=original_filename, input_filepath=str(final_path),
         input_filesize=final_path.stat().st_size,
-        parent_job_id=parent_job_id
+        parent_job_id=parent_job_id, callback_url=options.get("callback_url")
     )
 
     if task_type == 'transcription':
+        whisper_settings = app_config.get("transcription_settings", {}).get("whisper", {})
+        try:
+            model_size = resolve_whisper_model(options.get("model_size"), whisper_settings)
+        except ValueError as e:
+            logger.warning(f"Not dispatching transcription for '{original_filename}': {e}")
+            final_path.unlink(missing_ok=True)
+            return None
         output_suffix = '.srt' if options.get('generate_timestamps', False) else '.txt'
         processed_path = PATHS.PROCESSED_DIR / f"{Path(safe_filename).stem}_{job_id[:8]}{output_suffix}"
         job_data.processed_filepath = str(processed_path)
         create_job(db=db, job=job_data)
-        run_transcription_task(job_data.id, str(final_path), str(processed_path), options.get("model_size", "base"), app_config.get("transcription_settings", {}).get("whisper", {}), app_config, base_url, generate_timestamps=options.get('generate_timestamps', False))
+        run_transcription_task(job_data.id, str(final_path), str(processed_path), model_size, whisper_settings, app_config, base_url, generate_timestamps=options.get('generate_timestamps', False))
     elif task_type == "tts":
+        try:
+            validate_tts_model_name(options.get("model_name"))
+        except ValueError as e:
+            logger.warning(f"Not dispatching TTS for '{original_filename}': {e}")
+            final_path.unlink(missing_ok=True)
+            return None
         tts_config = app_config.get("tts_settings", {})
         stem = Path(safe_filename).stem
         processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.wav"
@@ -2142,19 +2355,25 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
         run_tts_task(job_data.id, str(final_path), str(processed_path), options.get("model_name"), tts_config, app_config, base_url)
     elif task_type == "ocr":
         stem, suffix = Path(safe_filename).stem, Path(safe_filename).suffix.lower()
-        IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.webp'}
-        if suffix not in IMAGE_EXTENSIONS and suffix != '.pdf':
+        if suffix not in OCR_IMAGE_EXTENSIONS and suffix != '.pdf':
             logger.warning(f"Skipping unsupported file type for OCR: {original_filename}")
             # Clean up the orphaned file from the zip extraction
             final_path.unlink(missing_ok=True)
-            return
+            return None
+        ocr_settings = app_config.get("ocr_settings", {}).get("ocrmypdf", {})
+        try:
+            ocr_language = resolve_ocr_language(options.get("ocr_language"), ocr_settings)
+        except ValueError as e:
+            logger.warning(f"Not dispatching OCR for '{original_filename}': {e}")
+            final_path.unlink(missing_ok=True)
+            return None
         processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.pdf"
         job_data.processed_filepath = str(processed_path)
         create_job(db=db, job=job_data)
-        if suffix in IMAGE_EXTENSIONS:
-            run_image_ocr_task(job_data.id, str(final_path), str(processed_path), app_config, base_url)
+        if suffix in OCR_IMAGE_EXTENSIONS:
+            run_image_ocr_task(job_data.id, str(final_path), str(processed_path), app_config, base_url, ocr_language)
         else:
-            run_pdf_ocr_task(job_data.id, str(final_path), str(processed_path), app_config.get("ocr_settings", {}).get("ocrmypdf", {}), app_config, base_url)
+            run_pdf_ocr_task(job_data.id, str(final_path), str(processed_path), dict(ocr_settings, language=ocr_language), app_config, base_url)
     elif task_type == "conversion":
         try:
             logger.info(f"Preparing to dispatch conversion job for file '{original_filename}' with requested format '{options.get('output_format')}'")
@@ -2166,13 +2385,20 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
             if parent_job_id:
                 logger.warning(f"Skipping file '{original_filename}' from batch job '{parent_job_id}' as it is not applicable for the selected conversion format '{options.get('output_format')}'.")
                 final_path.unlink(missing_ok=True)
-                return
+                return None
             else:
                 logger.error(f"Invalid or missing output_format for conversion of {original_filename}")
                 final_path.unlink(missing_ok=True)
-                return
+                return None
 
         original_stem = Path(safe_filename).stem
+
+        supported_inputs = {str(ext).lower() for ext in app_config.get("conversion_tools", {}).get(tool, {}).get("supported_input") or []}
+        if parent_job_id and supported_inputs and Path(safe_filename).suffix.lower() not in supported_inputs:
+            # Archives often mix file types; only the ones the chosen tool accepts become sub-jobs.
+            logger.info(f"Skipping '{original_filename}' from batch job '{parent_job_id}': {tool} does not accept this file type.")
+            final_path.unlink(missing_ok=True)
+            return None
 
         if tool == 'pandoc_academic':
             processed_path = PATHS.PROCESSED_DIR / f"{original_stem}_{job_id}.pdf"
@@ -2190,6 +2416,8 @@ def dispatch_single_file_job(original_filename: str, input_filepath: str, task_t
     else:
         logger.error(f"Invalid task type '{task_type}' for file {original_filename}")
         final_path.unlink(missing_ok=True)
+        return None
+    return job_id
 
 @huey.task()
 def run_academic_pandoc_task(job_id: str, input_path_str: str, output_path_str: str, task_key: str, app_config: dict, base_url: str):
@@ -2221,8 +2449,7 @@ def run_academic_pandoc_task(job_id: str, input_path_str: str, output_path_str: 
         if not zipfile.is_zipfile(input_path):
             raise ValueError("Input is not a valid ZIP archive.")
         unzip_dir.mkdir()
-        with zipfile.ZipFile(input_path, 'r') as zip_ref:
-            zip_ref.extractall(unzip_dir)
+        safe_extract_zip(input_path, unzip_dir, app_config.get("app_settings", {}))
 
         update_job_status(db, job_id, "processing", progress=25)
 
@@ -2266,23 +2493,11 @@ def run_academic_pandoc_task(job_id: str, input_path_str: str, output_path_str: 
         update_job_status(db, job_id, "processing", progress=50)
         logger.info(f"Executing Pandoc command for job {job_id}: {' '.join(command)}")
 
-        # 4. Execute command directly to control working directory and error capture
+        # 4. Run pandoc in the unzipped directory so relative resources resolve
         try:
-            process = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                check=True,  # Raise CalledProcessError on non-zero exit
-                cwd=unzip_dir, # Run pandoc in the unzipped directory
-                preexec_fn=globals().get("_limit_resources_preexec", None)
-            )
-        except subprocess.CalledProcessError as e:
-            # Capture the full, detailed error log from pandoc/latex
-            error_log = e.stderr or "No stderr output."
-            logger.error(f"Pandoc compilation failed. Full log:\n{error_log}")
-            # Raise a more informative exception for the user
-            raise Exception(f"Pandoc compilation failed. Please check your document for errors. Log: {error_log[:2000]}") from e
+            run_command(command, timeout=300, cwd=unzip_dir)
+        except Exception as e:
+            raise Exception(f"Pandoc compilation failed. Please check your document for errors. {str(e)[:2000]}") from e
 
         # 5. Verify output
         if not output_path.exists() or output_path.stat().st_size == 0:
@@ -2325,27 +2540,30 @@ def _update_parent_zip_job_progress(parent_job_id: str):
     db = SessionLocal()
     try:
         parent_job = get_job(db, parent_job_id)
-        if not parent_job or parent_job.status not in ['processing', 'pending']:
-            return # Job is already finalized or doesn't exist
+        # The parent stays 'pending' while its sub-jobs are being dispatched; judging completion
+        # before all of them exist would finish it early (or get overwritten back to 'processing').
+        if not parent_job or parent_job.status != 'processing':
+            return # Job is still dispatching, already finalized, or doesn't exist
 
-        child_jobs = db.query(Job).filter(Job.parent_job_id == parent_job.id).all()
-        total_children = len(child_jobs)
+        # Counted in SQL: loading every sub-job each time one finishes is quadratic for big batches.
+        status_counts = dict(db.query(Job.status, func.count(Job.id))
+                             .filter(Job.parent_job_id == parent_job.id)
+                             .group_by(Job.status)
+                             .all())
+        total_children = sum(status_counts.values())
 
         if total_children == 0:
             return # Should not happen if dispatched correctly, but safeguard.
 
-        finished_children = 0
-        for child in child_jobs:
-            if child.status in ['completed', 'failed', 'cancelled']:
-                finished_children += 1
-
-        progress = int((finished_children / total_children) * 100) if total_children > 0 else 100
+        finished_children = sum(status_counts.get(state, 0) for state in FINAL_JOB_STATES)
+        progress = int((finished_children / total_children) * 100)
 
         if finished_children == total_children:
-            failed_count = sum(1 for child in child_jobs if child.status == 'failed')
-            preview = f"Batch processing complete. {total_children - failed_count}/{total_children} tasks succeeded."
-            if failed_count > 0:
-                preview += f" ({failed_count} failed)."
+            succeeded = status_counts.get('completed', 0)
+            preview = f"Batch processing complete. {succeeded}/{total_children} tasks succeeded."
+            unsuccessful = [f"{status_counts[state]} {state}" for state in ('failed', 'cancelled') if status_counts.get(state)]
+            if unsuccessful:
+                preview += f" ({', '.join(unsuccessful)})."
             mark_job_as_completed(db, parent_job.id, preview=preview)
             logger.info(f"Batch job {parent_job.id} marked as completed.")
         else:
@@ -2369,30 +2587,28 @@ def unzip_and_dispatch_task(job_id: str, input_path_str: str, sub_task_type: str
         if not zipfile.is_zipfile(input_path):
             raise ValueError("Uploaded file is not a valid ZIP archive.")
         unzip_dir.mkdir()
-        with zipfile.ZipFile(input_path, 'r') as zip_ref:
-            zip_ref.extractall(unzip_dir)
-        
-        file_count = 0
-        for extracted_file_path in unzip_dir.rglob('*'):
-            if extracted_file_path.is_file():
-                file_count += 1
-                dispatch_single_file_job(
-                    original_filename=extracted_file_path.name,
-                    input_filepath=str(extracted_file_path),
-                    task_type=sub_task_type,
-                    options=sub_task_options,
-                    user=user,
-                    db=db,
-                    app_config=app_config,
-                    base_url=base_url,
-                    parent_job_id=job_id
-                )
-        if file_count > 0:
-            # Mark parent job as processing, to be completed by the periodic task
+        extracted_files = safe_extract_zip(input_path, unzip_dir, app_config.get("app_settings", {}))
+
+        created_jobs = 0
+        for extracted_file_path in extracted_files:
+            if dispatch_single_file_job(
+                original_filename=extracted_file_path.name,
+                input_filepath=str(extracted_file_path),
+                task_type=sub_task_type,
+                options=sub_task_options,
+                user=user,
+                db=db,
+                app_config=app_config,
+                base_url=base_url,
+                parent_job_id=job_id
+            ):
+                created_jobs += 1
+        if created_jobs > 0:
+            # All sub-jobs exist now; from here on their completion drives the parent's progress.
             update_job_status(db, job_id, "processing", progress=0)
+            _update_parent_zip_job_progress(job_id)
         else:
-            # No files found, mark as completed with a note
-            mark_job_as_completed(db, job_id, preview="ZIP archive was empty. No sub-jobs created.")
+            mark_job_as_completed(db, job_id, preview="No files in the ZIP archive could be processed with the selected task.")
 
     except Exception as e:
         logger.exception(f"ERROR during ZIP processing for job {job_id}")
@@ -2410,6 +2626,152 @@ def unzip_and_dispatch_task(job_id: str, input_path_str: str, sub_task_type: str
             logger.exception("Failed to cleanup original ZIP file.")
         db.close()
 
+
+
+_huey_startup_lock = threading.Lock()
+# Everything this process runs is marked 'processing' after this moment (set at import, before
+# the consumer starts its workers).
+_PROCESS_STARTED_AT = datetime.now(timezone.utc).replace(tzinfo=None)
+_interrupted_jobs_recovered = False
+INTERRUPTED_JOB_MESSAGE = "Interrupted: the background worker restarted while this job was running. Please submit it again."
+
+
+def recover_interrupted_jobs(started_before: datetime) -> None:
+    """
+    huey does not re-run a task it had already taken from the queue, so jobs that were running
+    when the worker stopped (container restart, crash, out of memory) stayed 'processing' forever
+    and the page kept polling them. Marks them failed. Queued ('pending') jobs are left alone:
+    their tasks are still in the queue.
+    """
+    if not inspect(engine).has_table(Job.__tablename__):
+        return  # fresh install: the web server has not created the database yet
+    db = SessionLocal()
+    try:
+        interrupted = (db.query(Job)
+                       .filter(Job.status == "processing", Job.task_type != "unzip", Job.updated_at < started_before)
+                       .all())
+        # A batch stays 'pending' while its archive is unpacked; one that already has sub-jobs was cut off.
+        has_sub_jobs = db.query(Job.parent_job_id).filter(Job.parent_job_id.isnot(None))
+        cut_off_batches = (db.query(Job)
+                           .filter(Job.task_type == "unzip", Job.status == "pending", Job.updated_at < started_before,
+                                   Job.id.in_(has_sub_jobs))
+                           .all())
+        if not interrupted and not cut_off_batches:
+            return
+        for job in interrupted:
+            job.status, job.error_message = "failed", INTERRUPTED_JOB_MESSAGE
+        for job in cut_off_batches:
+            job.status = "failed"
+            job.error_message = ("Interrupted while unpacking the archive (the background worker restarted). "
+                                 "The files unpacked before that are still processed.")
+        db.commit()
+        logger.warning(f"Marked {len(interrupted)} interrupted jobs and {len(cut_off_batches)} batches as failed.")
+
+        for job in interrupted:
+            try:
+                ensure_path_is_safe(Path(job.input_filepath), [PATHS.UPLOADS_DIR, PATHS.CHUNK_TMP_DIR]).unlink(missing_ok=True)
+            except Exception:
+                logger.debug(f"Could not remove the input of interrupted job {job.id}", exc_info=True)
+        for parent_id in {job.parent_job_id for job in interrupted if job.parent_job_id}:
+            _update_parent_zip_job_progress.call_local(parent_id)
+        for job in interrupted + cut_off_batches:
+            if job.callback_url:
+                send_webhook_notification(job.id, APP_CONFIG, "")
+    except Exception:
+        logger.exception("Could not check for jobs interrupted by a restart.")
+    finally:
+        db.close()
+
+
+@huey.on_startup()
+def _init_huey_worker():
+    """
+    The huey consumer is a separate process that never runs the FastAPI lifespan: load the
+    settings there, fail the jobs a previous worker left unfinished, and run the Whisper cache
+    eviction where the models are actually loaded. huey calls this in every worker.
+    """
+    global _cache_cleanup_thread, _interrupted_jobs_recovered
+    with _huey_startup_lock:
+        if not APP_CONFIG:
+            try:
+                load_app_config()
+            except Exception:
+                logger.exception("Huey worker could not load settings.")
+        if not _interrupted_jobs_recovered:
+            _interrupted_jobs_recovered = True
+            recover_interrupted_jobs(_PROCESS_STARTED_AT)
+        if _cache_cleanup_thread is None:
+            _cache_cleanup_thread = threading.Thread(target=_whisper_cache_cleanup_worker, daemon=True)
+            _cache_cleanup_thread.start()
+
+
+@huey.periodic_task(crontab(minute="15"))
+def apply_retention_policy():
+    """
+    Deletes finished jobs (and their files) older than app_settings.retention_days.
+    0 or unset keeps everything.
+    """
+    reload_app_config_if_changed()
+    try:
+        days = float(APP_CONFIG.get("app_settings", {}).get("retention_days") or 0)
+    except (TypeError, ValueError):
+        days = 0
+    if days <= 0:
+        return
+    # created_at/updated_at are stored as naive UTC
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None)
+    db = SessionLocal()
+    try:
+        jobs = db.query(Job).filter(Job.status.in_(FINAL_JOB_STATES), Job.updated_at < cutoff).all()
+        if jobs:
+            deleted_ids, files_deleted = delete_jobs_and_files(db, jobs)
+            logger.info(f"Retention: deleted {len(deleted_ids)} jobs older than {days:g} days and {files_deleted} files.")
+    finally:
+        db.close()
+
+
+STALE_UPLOAD_HOURS = float(os.environ.get("STALE_UPLOAD_HOURS", "6"))
+# "<name>.tmp-<uuid hex>[.ext]": partial files written before an atomic rename. Real inputs and
+# results end in "_<job id>.<ext>", so they never match.
+TEMP_FILE_RE = re.compile(r"\.tmp-[0-9a-f]{32}(\.[A-Za-z0-9]{1,10})?$")
+
+
+@huey.periodic_task(crontab(minute="*/30"))
+def cleanup_stale_uploads():
+    """
+    Removes abandoned chunked uploads, ZIP extraction directories of finished batches, and
+    partial files left behind by interrupted uploads and conversions.
+    """
+    cutoff = time.time() - STALE_UPLOAD_HOURS * 3600
+    for base in (PATHS.UPLOADS_DIR, PATHS.PROCESSED_DIR):
+        for entry in base.glob("*.tmp-*"):
+            try:
+                if TEMP_FILE_RE.search(entry.name) and entry.is_file() and not entry.is_symlink() and entry.stat().st_mtime < cutoff:
+                    entry.unlink()
+                    logger.info(f"Removed stale temporary file {entry.name}")
+            except OSError:
+                logger.exception(f"Could not remove stale temporary file {entry}")
+    removed = 0
+    db = SessionLocal()
+    try:
+        candidates = ([p for p in PATHS.CHUNK_TMP_DIR.iterdir()] + list(PATHS.UPLOADS_DIR.glob("unzipped_*"))
+                      + list(PATHS.PROCESSED_DIR.glob(".tmp-*")))
+        for entry in candidates:
+            try:
+                if not entry.is_dir() or entry.is_symlink() or entry.stat().st_mtime >= cutoff:
+                    continue
+                if entry.name.startswith("unzipped_"):
+                    parent = get_job(db, entry.name[len("unzipped_"):])
+                    if parent and parent.status in ("pending", "processing"):
+                        continue  # sub-jobs may still need their input files
+                shutil.rmtree(entry)
+                removed += 1
+            except OSError:
+                logger.exception(f"Could not remove stale upload directory {entry}")
+    finally:
+        db.close()
+    if removed:
+        logger.info(f"Removed {removed} stale upload directories.")
 
 
 # --------------------------------------------------------------------------------
@@ -2441,6 +2803,21 @@ async def download_kokoro_models_if_missing():
             "size": 26124436
         }
     }
+    # All gunicorn workers run this at startup; only one may download, and files appear atomically.
+    lock_file = open(PATHS.KOKORO_TTS_MODELS_DIR / ".download.lock", "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        logger.info("Another worker is checking/downloading the Kokoro TTS models.")
+        return
+    try:
+        await _download_kokoro_files(files_to_download)
+    finally:
+        lock_file.close()
+
+
+async def _download_kokoro_files(files_to_download: dict):
     async with httpx.AsyncClient() as client:
         for name, details in files_to_download.items():
             path, url, expected_size = details["path"], details["url"], details["size"]
@@ -2452,25 +2829,26 @@ async def download_kokoro_models_if_missing():
                 else:
                     logger.info(f"Kokoro TTS {name} file missing. Downloading from {url}...")
 
+                partial_path = path.with_name(path.name + ".part")
                 for attempt in range(3):
                     try:
-                        with path.open("wb") as f:
+                        with partial_path.open("wb") as f:
                             async with client.stream("GET", url, follow_redirects=True, timeout=300) as response:
                                 response.raise_for_status()
                                 total_downloaded = 0
                                 async for chunk in response.aiter_bytes():
                                     f.write(chunk)
                                     total_downloaded += len(chunk)
-                        
+
                         if total_downloaded == expected_size:
+                            partial_path.replace(path)
                             logger.info(f"Successfully downloaded Kokoro TTS {name} file to {path}.")
                             break
                         else:
                             logger.warning(f"Kokoro TTS {name} download incomplete. Expected {expected_size}, got {total_downloaded}. Retrying...")
                     except Exception as e:
                         logger.error(f"Failed to download Kokoro TTS {name} file (attempt {attempt + 1}): {e}")
-                        if path.exists():
-                            path.unlink(missing_ok=True)
+                        partial_path.unlink(missing_ok=True)
                         await asyncio.sleep(5)
                 else:
                     logger.critical(f"Failed to download Kokoro TTS {name} file after 3 attempts. TTS will not be available.")
@@ -2481,8 +2859,6 @@ async def download_kokoro_models_if_missing():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Application starting up...")
-    global AVAILABLE_TTS_VOICES_CACHE
-    AVAILABLE_TTS_VOICES_CACHE = None
     # Base.metadata.create_all(bind=engine)
 
     create_attempts = 3
@@ -2491,6 +2867,9 @@ async def lifespan(app: FastAPI):
             # use engine.begin() to ensure the DDL runs in a connection/transaction context
             with engine.begin() as conn:
                 Base.metadata.create_all(bind=conn)
+                # create_all() skips tables that already exist, including their new indexes.
+                for index in Job.__table__.indexes:
+                    index.create(bind=conn, checkfirst=True)
             logger.info("Database tables ensured (create_all succeeded).")
             break
         except OperationalError as oe:
@@ -2559,46 +2938,8 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"Failed to register OIDC OAuth provider: {e}. Authentication will be disabled.")
                 app.state.oidc_registration_failed = True
-    
-    # Background task for processing WebSocket notification queue
-    async def process_notifications_periodically():
-        """Process WebSocket notification queue periodically"""
-        consecutive_errors = 0
-        max_consecutive_errors = 10
-        
-        while True:
-            try:
-                await manager.process_notification_queue()
-                await asyncio.sleep(0.1)  # Process every 100ms
-                
-                # Reset error counter on success
-                consecutive_errors = 0
-                
-            except Exception as e:
-                consecutive_errors += 1
-                logger.error(f"Error processing WebSocket notifications (consecutive errors: {consecutive_errors}): {e}")
-                
-                # If we have too many consecutive errors, log a warning
-                if consecutive_errors >= max_consecutive_errors:
-                    logger.warning(f"Too many consecutive errors in WebSocket notification processor. Restarting...")
-                    consecutive_errors = 0
-                
-                await asyncio.sleep(min(1 * consecutive_errors, 10))  # Exponential backoff, max 10s
-    
-    if ENABLE_WEBSOCKETS:
-        # Store the task reference so we can cancel it later
-        app.state.notification_processor_task = asyncio.create_task(process_notifications_periodically())
-        logger.info("WebSocket notification processor task started")
-    
+
     yield
-    
-    # Cleanup
-    if ENABLE_WEBSOCKETS and hasattr(app.state, 'notification_processor_task'):
-        app.state.notification_processor_task.cancel()
-        try:
-            await app.state.notification_processor_task
-        except asyncio.CancelledError:
-            pass
 
     if hasattr(app.state, 'download_kokoro_task'):
         app.state.download_kokoro_task.cancel()
@@ -2612,77 +2953,334 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 ENV = os.environ.get('ENV', 'dev').lower()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    return os.environ.get(name, str(default)).strip().lower() in ('true', '1', 't', 'yes', 'y')
+
+
+def _env_list(name: str) -> List[str]:
+    return [v.strip() for v in os.environ.get(name, '').split(',') if v.strip()]
+
+
+def _load_or_create_secret_key() -> str:
+    """
+    Returns a session signing key shared by all workers. A key generated per process
+    would differ between the gunicorn workers, so a login started on one worker would
+    fail its OAuth state check on another. The generated key is persisted next to
+    settings.yml (mode 0600) so sessions also survive restarts.
+    """
+    key_file = PATHS.CONFIG_DIR / ".secret_key"
+    try:
+        existing = key_file.read_text(encoding="utf8").strip()
+        if existing:
+            return existing
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning(f"Could not read {key_file}: {e}")
+
+    new_key = secrets.token_hex(32)
+    try:
+        fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf8") as f:
+            f.write(new_key)
+        logger.info(f"SECRET_KEY is not set; generated a persistent session key in {key_file}.")
+        return new_key
+    except FileExistsError:
+        # Another worker is creating the file right now; wait for its content.
+        for _ in range(50):
+            existing = key_file.read_text(encoding="utf8").strip()
+            if existing:
+                return existing
+            time.sleep(0.1)
+    except OSError as e:
+        logger.warning(f"Could not persist a session key to {key_file}: {e}")
+    logger.warning("Using a temporary per-process session key. Set SECRET_KEY so logins work across workers and restarts.")
+    return new_key
+
+
 SECRET_KEY = os.environ.get('SECRET_KEY')
 if not SECRET_KEY and not LOCAL_ONLY_MODE and ENV != 'dev':
     raise RuntimeError('SECRET_KEY must be set in production when authentication is enabled.')
 if not SECRET_KEY:
-    logger.warning('SECRET_KEY is not set. Generating a temporary key. Sessions will not persist across restarts.')
-    SECRET_KEY = os.urandom(24).hex()
+    SECRET_KEY = _load_or_create_secret_key()
 
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
-    https_only=False, # Set to True if behind HTTPS proxy
+    # Set SESSION_COOKIE_SECURE=true when the app is served over HTTPS (e.g. behind a TLS reverse proxy).
+    https_only=_env_flag('SESSION_COOKIE_SECURE', False),
     same_site='lax',
     max_age=14 * 24 * 60 * 60  # 14 days
 )
 
-# CORS Configuration - allow all in dev, restrict in production
-if ENV == 'production':
-    # Read allowed origins from environment variable
-    allowed_origins_env = os.environ.get('ALLOWED_ORIGINS', 'http://localhost,http://127.0.0.1')
-    allowed_origins = [origin.strip() for origin in allowed_origins_env.split(',') if origin.strip()]
-else:
-    # Allow all in development
-    allowed_origins = ["*"]
+# CORS: the UI is served from the same origin and API clients (curl, n8n, ...) do not need CORS,
+# so no cross-origin access is granted unless origins are listed explicitly.
+CORS_ALLOWED_ORIGINS = [o for o in _env_list('ALLOWED_ORIGINS') if o != '*']
+if '*' in _env_list('ALLOWED_ORIGINS'):
+    logger.warning("ALLOWED_ORIGINS='*' is ignored: credentialed CORS must list explicit origins.")
+if CORS_ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+# Optional Host header allowlist (protects LOCAL_ONLY instances against DNS rebinding).
+ALLOWED_HOSTS = _env_list('ALLOWED_HOSTS')
+if ALLOWED_HOSTS:
+    # Loopback names stay allowed for health checks; a rebinding attack arrives with its own host name.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS + ["localhost", "127.0.0.1", "::1"])
+
+# --- CSRF protection & security headers ---
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
+CSRF_TRUSTED_ORIGINS = _env_list('CSRF_TRUSTED_ORIGINS') + CORS_ALLOWED_ORIGINS
+# Who may embed the UI in a frame (e.g. a dashboard such as Homarr/Organizr): CSP frame-ancestors syntax.
+FRAME_ANCESTORS = os.environ.get('FRAME_ANCESTORS', "'self'").strip() or "'self'"
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; object-src 'none'; "
+    f"base-uri 'self'; form-action 'self'; frame-ancestors {FRAME_ANCESTORS}"
 )
+# The interactive API docs load their assets from a CDN; they get the other headers but no CSP.
+CSP_EXEMPT_PATHS = ("/docs", "/redoc", "/openapi.json")
+
+
+def _host_key(netloc: str) -> str:
+    """Normalizes host[:port] for comparison, dropping default ports."""
+    netloc = (netloc or "").strip().lower()
+    for default_port in (":80", ":443"):
+        if netloc.endswith(default_port):
+            return netloc[: -len(default_port)]
+    return netloc
+
+
+def _csrf_allowed_hosts(headers: Headers) -> set:
+    hosts = {_host_key(headers.get("host", ""))}
+    forwarded_host = headers.get("x-forwarded-host")
+    if forwarded_host:
+        hosts.add(_host_key(forwarded_host.split(",")[0]))
+    public_url = APP_CONFIG.get("app_settings", {}).get("app_public_url")
+    if public_url:
+        hosts.add(_host_key(urlparse(public_url).netloc))
+    for origin in CSRF_TRUSTED_ORIGINS:
+        hosts.add(_host_key(urlparse(origin).netloc or origin))
+    hosts.discard("")
+    return hosts
+
+
+def _is_csrf_safe(method: str, headers: Headers) -> bool:
+    """
+    Rejects state-changing requests that a browser sent on behalf of another site.
+    Browsers always attach Origin to cross-site POSTs; clients that send neither
+    Origin nor Referer (curl, n8n, ...) are not browsers and are let through.
+    """
+    if method in SAFE_METHODS:
+        return True
+    source = headers.get("origin") or headers.get("referer")
+    if not source:
+        return True
+    if source == "null":
+        return False
+    try:
+        netloc = urlparse(source).netloc
+    except ValueError:
+        return False
+    return _host_key(netloc) in _csrf_allowed_hosts(headers)
+
+
+class SecurityMiddleware:
+    """Pure ASGI middleware: CSRF origin check and security response headers."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        reload_app_config_if_changed()
+        headers = Headers(scope=scope)
+        if not _is_csrf_safe(scope["method"], headers):
+            logger.warning(
+                "Blocked cross-origin %s %s (origin=%r, referer=%r, host=%r).",
+                scope["method"], scope.get("path"), headers.get("origin"), headers.get("referer"), headers.get("host"),
+            )
+            response = JSONResponse(
+                {"detail": "Cross-origin request blocked. If FileWizard runs behind a reverse proxy, "
+                           "forward the original Host header, or set app_public_url / CSRF_TRUSTED_ORIGINS."},
+                status_code=403,
+            )
+            await response(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                response_headers = MutableHeaders(scope=message)
+                response_headers.setdefault("X-Content-Type-Options", "nosniff")
+                response_headers.setdefault("Referrer-Policy", "same-origin")
+                if FRAME_ANCESTORS == "'self'":
+                    response_headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+                elif FRAME_ANCESTORS == "'none'":
+                    response_headers.setdefault("X-Frame-Options", "DENY")
+                if not path.startswith(CSP_EXEMPT_PATHS):
+                    response_headers.setdefault("Content-Security-Policy", CONTENT_SECURITY_POLICY)
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
+app.add_middleware(SecurityMiddleware)
+
+# File downloads are served as they are: compressing them on the fly costs CPU (most outputs are
+# compressed already) and drops Content-Length, so browsers could not show download progress.
+UNCOMPRESSED_PATHS = ("/download",)
+
+
+class CompressionMiddleware:
+    """gzip for pages, scripts, styles and API responses."""
+
+    def __init__(self, app):
+        self.app = app
+        self.gzip_app = GZipMiddleware(app, minimum_size=1024, compresslevel=6)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and not scope.get("path", "").startswith(UNCOMPRESSED_PATHS):
+            await self.gzip_app(scope, receive, send)
+        else:
+            await self.app(scope, receive, send)
+
+
+app.add_middleware(CompressionMiddleware)
+
+
+class VersionedStaticFiles(StaticFiles):
+    """
+    The templates request static files with ?v=<hash of all static files>, so those responses can be
+    cached for good and an upgrade still reaches every browser at once. Other requests revalidate.
+    """
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code in (200, 304):
+            versioned = b"v=" in scope.get("query_string", b"")
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable" if versioned else "no-cache"
+        return response
+
+
+def _static_files_version(static_dir: Path) -> str:
+    digest = hashlib.sha256()
+    for file_path in sorted(p for p in static_dir.rglob("*") if p.is_file()):
+        digest.update(str(file_path.relative_to(static_dir)).encode())
+        digest.update(file_path.read_bytes())
+    return digest.hexdigest()[:12]
 
 
 # Static / templates
-app.mount("/static", StaticFiles(directory=str(PATHS.BASE_DIR / "static")), name="static")
+app.mount("/static", VersionedStaticFiles(directory=str(PATHS.BASE_DIR / "static")), name="static")
 templates = Jinja2Templates(directory=str(PATHS.BASE_DIR / "templates"))
+templates.env.globals["static_version"] = _static_files_version(PATHS.BASE_DIR / "static")
 
 # --- AUTH & USER HELPERS ---
 http_bearer = HTTPBearer()
 
+LOCAL_USER = {'sub': 'local_user', 'email': 'local@user.com', 'name': 'Local User'}
+
+
+def _normalized_email_set(values) -> set:
+    if not isinstance(values, (list, tuple, set)):
+        return set()
+    return {v.strip().lower() for v in values if isinstance(v, str) and v.strip()}
+
+
+def _verified_email(user: dict | None) -> str | None:
+    """The user's email, unless the identity provider explicitly marked it as unverified."""
+    if not user:
+        return None
+    email = user.get('email')
+    if not isinstance(email, str) or not email.strip() or user.get('email_verified') is False:
+        return None
+    return email.strip().lower()
+
+
+def is_user_allowed(user: dict | None) -> bool:
+    """
+    Authorization for OIDC users. With auth_settings.allowed_users and allowed_domains both
+    empty, every account the identity provider authenticates may use the app.
+    """
+    if LOCAL_ONLY_MODE:
+        return True
+    if not user:
+        return False
+    auth_settings = APP_CONFIG.get("auth_settings", {})
+    allowed_users = _normalized_email_set(auth_settings.get("allowed_users"))
+    allowed_domains = {d.lstrip('@') for d in _normalized_email_set(auth_settings.get("allowed_domains"))}
+    if not allowed_users and not allowed_domains:
+        return True
+    email = _verified_email(user)
+    if not email:
+        return False
+    if email in allowed_users or email in _normalized_email_set(auth_settings.get("admin_users")):
+        return True
+    return email.rsplit('@', 1)[-1] in allowed_domains
+
+
 def get_current_user(request: Request):
     if LOCAL_ONLY_MODE:
-        return {'sub': 'local_user', 'email': 'local@user.com', 'name': 'Local User'}
-    return request.session.get('user')
+        return LOCAL_USER
+    user = request.session.get('user')
+    # Re-checked on every request so removing someone from the allowlist takes effect immediately.
+    if user and not is_user_allowed(user):
+        return None
+    return user
+
+
+async def _user_from_bearer_token(token: str) -> dict:
+    if not check_oidc_availability():
+        logger.warning("OIDC not available for API authentication")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication system is not properly configured")
+    try:
+        user = dict(await oauth.oidc.userinfo(token={'access_token': token}))
+    except Exception as e:
+        logger.error(f"API token validation failed: {e}")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+    if not user.get('sub') or not is_user_allowed(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This account is not allowed to use this service.")
+    return user
+
 
 async def require_api_user(request: Request, creds: HTTPAuthorizationCredentials = Depends(http_bearer)):
     """Dependency for API routes requiring OIDC bearer token authentication."""
     if LOCAL_ONLY_MODE:
-        return {'sub': 'local_api_user', 'email': 'local@api.user.com', 'name': 'Local API User'}
-
+        # Same identity as the UI, so API jobs show up in the history and their downloads work.
+        return LOCAL_USER
     if not creds:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-    
-    if not check_oidc_availability():
-        logger.warning("OIDC not available for API authentication")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication system is not properly configured")
-    
-    token = creds.credentials
-    try:
-        user = await oauth.oidc.userinfo(token={'access_token': token})
-        return dict(user)
-    except Exception as e:
-        logger.error(f"API token validation failed: {e}")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+    return await _user_from_bearer_token(creds.credentials)
+
+
+async def require_user_or_api(request: Request):
+    """Accepts a browser session or, for API clients, an OIDC bearer token."""
+    user = get_current_user(request)
+    if user:
+        return user
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() == "bearer" and token.strip():
+        return await _user_from_bearer_token(token.strip())
+    raise HTTPException(status_code=401, detail="Not authenticated")
+
 
 def is_admin(request: Request) -> bool:
     if LOCAL_ONLY_MODE: return True
-    user = get_current_user(request)
-    if not user: return False
-    admin_users = APP_CONFIG.get("auth_settings", {}).get("admin_users", [])
-    return user.get('email') in admin_users
+    email = _verified_email(get_current_user(request))
+    if not email: return False
+    return email in _normalized_email_set(APP_CONFIG.get("auth_settings", {}).get("admin_users", []))
 
 def require_user(request: Request):
     user = get_current_user(request)
@@ -2751,6 +3349,10 @@ def is_allowed_file(filename: str, allowed_extensions: set) -> bool:
     return Path(filename).suffix.lower() in allowed_extensions
 
 # --- CHUNKED UPLOADS (for UI) ---
+def _max_upload_bytes() -> int:
+    return int(APP_CONFIG.get("app_settings", {}).get("max_file_size_bytes", 100 * 1024 * 1024))
+
+
 @app.post("/upload/chunk")
 async def upload_chunk(
     chunk: UploadFile = File(...),
@@ -2758,53 +3360,114 @@ async def upload_chunk(
     chunk_number: int = Form(...),
     user: dict = Depends(require_user)
 ):
-    safe_upload_id = secure_filename(upload_id)
-    temp_dir = ensure_path_is_safe(PATHS.CHUNK_TMP_DIR / safe_upload_id, [PATHS.CHUNK_TMP_DIR])
-    temp_dir.mkdir(exist_ok=True)
+    temp_dir = chunk_dir_for(user, upload_id)
+    if not 0 <= chunk_number < MAX_UPLOAD_CHUNKS:
+        raise HTTPException(status_code=400, detail="Invalid chunk_number.")
     chunk_path = temp_dir / f"{chunk_number}.chunk"
+    max_size = _max_upload_bytes()
 
     def save_chunk_sync():
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        # The size limit applies to the whole file, i.e. all chunks received so far.
+        received = sum(p.stat().st_size for p in temp_dir.glob("*.chunk") if p.name != chunk_path.name)
+        partial_path = temp_dir / f"{chunk_number}.part"
         try:
-            with open(chunk_path, "wb") as buffer:
-                shutil.copyfileobj(chunk.file, buffer)
+            with open(partial_path, "wb") as buffer:
+                while True:
+                    block = chunk.file.read(1024 * 1024)
+                    if not block:
+                        break
+                    received += len(block)
+                    if received > max_size:
+                        raise HTTPException(status_code=413, detail=f"File exceeds {max_size / 1024 / 1024:.0f} MB limit")
+                    buffer.write(block)
+            partial_path.replace(chunk_path)  # only complete chunks are ever stitched
+        except HTTPException:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
         finally:
             chunk.file.close()
+            partial_path.unlink(missing_ok=True)
 
     await run_in_threadpool(save_chunk_sync)
 
-    return JSONResponse({"message": f"Chunk {chunk_number} for {safe_upload_id} uploaded."})
+    return JSONResponse({"message": f"Chunk {chunk_number} for {upload_id} uploaded."})
 
 
 async def _stitch_chunks(temp_dir: Path, final_path: Path, total_chunks: int):
     """Stitches chunks together memory-efficiently and cleans up."""
     ensure_path_is_safe(temp_dir, [PATHS.CHUNK_TMP_DIR])
     ensure_path_is_safe(final_path, [PATHS.UPLOADS_DIR])
+    max_size = _max_upload_bytes()
 
     # This is a blocking function that will be run in a threadpool
     def do_stitch():
-        with open(final_path, "wb") as final_file:
-            for i in range(total_chunks):
-                chunk_path = temp_dir / f"{i}.chunk"
-                if not chunk_path.exists():
-                    # Raise an exception that can be caught and handled
-                    raise FileNotFoundError(f"Upload failed: missing chunk {i}")
+        chunk_paths = [temp_dir / f"{i}.chunk" for i in range(total_chunks)]
+        for i, chunk_path in enumerate(chunk_paths):
+            if not chunk_path.exists():
+                # Raise an exception that can be caught and handled
+                raise FileNotFoundError(f"Upload failed: missing chunk {i}")
+        if sum(p.stat().st_size for p in chunk_paths) > max_size:
+            raise HTTPException(status_code=413, detail=f"File exceeds {max_size / 1024 / 1024:.0f} MB limit")
+        # The first chunk becomes the file and the others are appended, so a single-chunk upload
+        # (anything up to the browser's 5 MB chunk size) is moved instead of copied.
+        try:
+            os.replace(chunk_paths[0], final_path)
+            remaining = chunk_paths[1:]
+        except OSError:  # e.g. CHUNK_TMP_DIR on another file system
+            remaining = chunk_paths
+        with open(final_path, "ab" if len(remaining) < len(chunk_paths) else "wb") as final_file:
+            for chunk_path in remaining:
                 with open(chunk_path, "rb") as chunk_file:
-                    # Use copyfileobj for memory efficiency
-                    shutil.copyfileobj(chunk_file, final_file)
+                    shutil.copyfileobj(chunk_file, final_file, 1024 * 1024)
 
     try:
         await run_in_threadpool(do_stitch)
     except FileNotFoundError as e:
         # If a chunk was missing, clean up and re-raise as HTTPException
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        final_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        # For any other error during stitching, clean up and re-raise
+    except Exception:
+        final_path.unlink(missing_ok=True)
+        raise
+    finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
-        raise e # Re-raise the original exception
-    else:
-        # If successful, clean up the temp directory
-        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+UPLOAD_TASK_TYPES = {"conversion", "ocr", "transcription", "tts"}
+
+
+def _require_tool_available(tool: str):
+    if tool in UNAVAILABLE_TOOLS:
+        name = APP_CONFIG.get("conversion_tools", {}).get(tool, {}).get("name", tool)
+        raise HTTPException(status_code=400, detail=f"{name} is not installed on this server ('{UNAVAILABLE_TOOLS[tool]}' not found).")
+
+
+def _validate_task_options(task_type: str, options: dict, is_zip: bool) -> Optional[tuple]:
+    """
+    Validates a processing request before any file is written. Returns (tool, task_key)
+    for conversions. Raises HTTPException(400) for invalid input.
+    """
+    if task_type not in UPLOAD_TASK_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid task_type: '{task_type}'")
+    try:
+        if task_type == "transcription":
+            whisper_settings = APP_CONFIG.get("transcription_settings", {}).get("whisper", {})
+            options["model_size"] = resolve_whisper_model(options.get("model_size"), whisper_settings)
+        elif task_type == "tts":
+            validate_tts_model_name(options.get("model_name"))
+        elif task_type == "ocr":
+            ocr_settings = APP_CONFIG.get("ocr_settings", {}).get("ocrmypdf", {})
+            options["ocr_language"] = resolve_ocr_language(options.get("ocr_language"), ocr_settings)
+        elif task_type == "conversion":
+            all_tools = APP_CONFIG.get("conversion_tools", {}).keys()
+            tool, task_key = _parse_tool_and_task_key(options.get("output_format") or "", all_tools)
+            _require_tool_available(tool)
+            return tool, task_key
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return None
+
 
 def _parse_tool_and_task_key(output_format: str, all_tool_keys: list) -> (str, str):
     """Robustly parses an output_format string to find the matching tool and task key."""
@@ -2817,76 +3480,63 @@ def _parse_tool_and_task_key(output_format: str, all_tool_keys: list) -> (str, s
 
 @app.post("/upload/finalize", response_model=JobSchema, status_code=status.HTTP_202_ACCEPTED)
 async def finalize_upload(request: Request, payload: FinalizeUploadPayload, user: dict = Depends(require_user), db: Session = Depends(get_db)):
-    safe_upload_id = secure_filename(payload.upload_id)
-    temp_dir = ensure_path_is_safe(PATHS.CHUNK_TMP_DIR / safe_upload_id, [PATHS.CHUNK_TMP_DIR])
+    temp_dir = chunk_dir_for(user, payload.upload_id)
     if not temp_dir.is_dir():
         raise HTTPException(status_code=404, detail="Upload session not found or already finalized.")
 
-    webhook_config = APP_CONFIG.get("webhook_settings", {})
-    if payload.callback_url and not is_allowed_callback_url(payload.callback_url, webhook_config.get("allowed_callback_urls", [])):
-        raise HTTPException(status_code=400, detail="Provided callback_url is not allowed.")
+    # Validate everything before stitching, so a rejected request leaves no files behind.
+    try:
+        if not 1 <= payload.total_chunks <= MAX_UPLOAD_CHUNKS:
+            raise HTTPException(status_code=400, detail="Invalid total_chunks.")
 
-    # Validate file type before processing
-    allowed_extensions = APP_CONFIG.get("app_settings", {}).get("allowed_all_extensions", set())
-    if not validate_file_type(payload.original_filename, allowed_extensions):
-        raise HTTPException(status_code=400, detail=f"File type '{Path(payload.original_filename).suffix}' not allowed.")
+        webhook_config = APP_CONFIG.get("webhook_settings", {})
+        if payload.callback_url and not is_allowed_callback_url(payload.callback_url, webhook_config.get("allowed_callback_urls", [])):
+            raise HTTPException(status_code=400, detail="Provided callback_url is not allowed.")
+
+        # Validate file type before processing
+        allowed_extensions = APP_CONFIG.get("app_settings", {}).get("allowed_all_extensions", set())
+        if not validate_file_type(payload.original_filename, allowed_extensions):
+            raise HTTPException(status_code=400, detail=f"File type '{Path(payload.original_filename).suffix}' not allowed.")
+
+        safe_filename = safe_basename(payload.original_filename)
+        is_zip = Path(safe_filename).suffix == '.zip'
+        options = {"model_size": payload.model_size, "model_name": payload.model_name,
+                   "output_format": payload.output_format, "generate_timestamps": payload.generate_timestamps,
+                   "ocr_language": payload.ocr_language, "callback_url": payload.callback_url}
+        tool, task_key = _validate_task_options(payload.task_type, options, is_zip) or (None, None)
+    except HTTPException:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
 
     job_id = uuid.uuid4().hex
-    safe_filename = secure_filename(payload.original_filename)
     final_path = PATHS.UPLOADS_DIR / f"{Path(safe_filename).stem}_{job_id}{Path(safe_filename).suffix}"
     await _stitch_chunks(temp_dir, final_path, payload.total_chunks)
 
     base_url = str(request.base_url)
 
-    # Check if the selected conversion is the new academic pandoc task
-    tool, task_key = None, None
-    if payload.task_type == 'conversion':
-        try:
-            all_tools = APP_CONFIG.get("conversion_tools", {}).keys()
-            tool, task_key = _parse_tool_and_task_key(payload.output_format, all_tools)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid or missing output_format for conversion.")
-
     if tool == 'pandoc_academic':
         # This is a single job that processes a ZIP file as a project.
-        options = {"output_format": payload.output_format}
         dispatch_single_file_job(payload.original_filename, str(final_path), "conversion", user, db, APP_CONFIG, base_url, job_id=job_id, options=options)
 
-    elif Path(safe_filename).suffix.lower() == '.zip':
-        # This is the original batch processing logic for ZIP files.
+    elif is_zip:
+        # Batch processing: every file in the archive becomes a sub-job.
         job_data = JobCreate(
             id=job_id, user_id=user['sub'], task_type="unzip",
             original_filename=payload.original_filename, input_filepath=str(final_path),
-            input_filesize=final_path.stat().st_size
+            input_filesize=final_path.stat().st_size, callback_url=payload.callback_url
         )
         create_job(db=db, job=job_data)
-        sub_task_options = {
-            "model_size": payload.model_size,
-            "model_name": payload.model_name,
-            "output_format": payload.output_format
-        }
-        unzip_and_dispatch_task(job_id, str(final_path), payload.task_type, sub_task_options, user, APP_CONFIG, base_url)
+        unzip_and_dispatch_task(job_id, str(final_path), payload.task_type, options, user, APP_CONFIG, base_url)
     else:
         # This is the logic for all other single-file uploads.
-        options = {"model_size": payload.model_size, "model_name": payload.model_name, "output_format": payload.output_format, "generate_timestamps": payload.generate_timestamps}
         dispatch_single_file_job(payload.original_filename, str(final_path), payload.task_type, user, db, APP_CONFIG, base_url, job_id=job_id, options=options)
 
-    # --- FIX STARTS HERE ---
-    # Instead of returning a minimal object, fetch the newly created job
-    # from the database and return the full serialized object. This ensures
-    # the frontend has all the data it needs to correctly update the UI row.
-    db.flush() # Ensure the job is available to be queried
+    # Return the full job so the frontend can render its row immediately.
+    db.expire_all()
     db_job = get_job(db, job_id)
     if not db_job:
-        # This is an unlikely race condition but we handle it just in case.
-        # The SSE event will still create the row correctly.
-        raise HTTPException(status_code=500, detail="Job was created but could not be retrieved for an immediate response.")
-    
-    # Also, update the function signature to use the response_model
-    # from: @app.post("/upload/finalize", status_code=status.HTTP_202_ACCEPTED)
-    # to:   @app.post("/upload/finalize", response_model=JobSchema, status_code=status.HTTP_202_ACCEPTED)
+        raise HTTPException(status_code=400, detail="This file type is not supported for the selected task.")
     return db_job
-    # --- FIX ENDS HERE ---
 
 
 # --- LEGACY DIRECT-UPLOAD ROUTES (kept for compatibility) ---
@@ -2904,8 +3554,8 @@ async def submit_audio_transcription(
     if model_size not in whisper_config.get("allowed_models", []):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid model size: {model_size}.")
 
-    job_id, safe_basename = uuid.uuid4().hex, secure_filename(file.filename)
-    stem, suffix = Path(safe_basename).stem, Path(safe_basename).suffix
+    job_id, safe_name = uuid.uuid4().hex, safe_basename(file.filename)
+    stem, suffix = Path(safe_name).stem, Path(safe_name).suffix
     upload_path = PATHS.UPLOADS_DIR / f"{stem}_{job_id}{suffix}"
     output_suffix = '.srt' if generate_timestamps else '.txt'
     processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}{output_suffix}"
@@ -2925,16 +3575,17 @@ async def submit_file_conversion(request: Request, file: UploadFile = File(...),
         raise HTTPException(status_code=400, detail=f"File type '{Path(file.filename).suffix}' not allowed.")
     conversion_tools = APP_CONFIG.get("conversion_tools", {})
     try:
-        tool, task_key = output_format.split('_', 1)
-        if tool not in conversion_tools: raise ValueError()
+        # Tool ids may contain '_' (ghostscript_pdf, ffmpeg_audio, ...), so match against the known ids.
+        tool, task_key = _parse_tool_and_task_key(output_format, conversion_tools.keys())
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid output format selected.")
+    _require_tool_available(tool)
 
-    job_id, safe_basename = uuid.uuid4().hex, secure_filename(file.filename)
-    original_stem = Path(safe_basename).stem
+    job_id, safe_name = uuid.uuid4().hex, safe_basename(file.filename)
+    original_stem = Path(safe_name).stem
     target_ext = task_key.split('_')[0]
     if tool == "ghostscript_pdf": target_ext = "pdf"
-    upload_path = PATHS.UPLOADS_DIR / f"{original_stem}_{job_id}{Path(safe_basename).suffix}"
+    upload_path = PATHS.UPLOADS_DIR / f"{original_stem}_{job_id}{Path(safe_name).suffix}"
     processed_path = PATHS.PROCESSED_DIR / f"{original_stem}_{job_id}.{target_ext}"
     input_size = await save_upload_file(file, upload_path)
     base_url = str(request.base_url)
@@ -2949,8 +3600,8 @@ async def submit_file_conversion(request: Request, file: UploadFile = File(...),
 async def submit_pdf_ocr(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db), user: dict = Depends(require_user)):
     if not is_allowed_file(file.filename, {".pdf"}):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file type. Please upload a PDF.")
-    job_id, safe_basename = uuid.uuid4().hex, secure_filename(file.filename)
-    unique_filename = f"{Path(safe_basename).stem}_{job_id}{Path(safe_basename).suffix}"
+    job_id, safe_name = uuid.uuid4().hex, safe_basename(file.filename)
+    unique_filename = f"{Path(safe_name).stem}_{job_id}{Path(safe_name).suffix}"
     upload_path = PATHS.UPLOADS_DIR / unique_filename
     processed_path = PATHS.PROCESSED_DIR / unique_filename
     input_size = await save_upload_file(file, upload_path)
@@ -2968,11 +3619,11 @@ async def submit_image_ocr(request: Request, file: UploadFile = File(...), db: S
     allowed_exts = {".png", ".jpg", ".jpeg", ".tiff", ".tif"}
     if not is_allowed_file(file.filename, allowed_exts):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file type. Please upload a PNG, JPG, or TIFF.")
-    job_id, safe_basename = uuid.uuid4().hex, secure_filename(file.filename)
-    file_ext = Path(safe_basename).suffix
-    unique_filename = f"{Path(safe_basename).stem}_{job_id}{file_ext}"
+    job_id, safe_name = uuid.uuid4().hex, safe_basename(file.filename)
+    file_ext = Path(safe_name).suffix
+    unique_filename = f"{Path(safe_name).stem}_{job_id}{file_ext}"
     upload_path = PATHS.UPLOADS_DIR / unique_filename
-    processed_path = PATHS.PROCESSED_DIR / f"{Path(safe_basename).stem}_{job_id}.pdf"
+    processed_path = PATHS.PROCESSED_DIR / f"{Path(safe_name).stem}_{job_id}.pdf"
     input_size = await save_upload_file(file, upload_path)
     base_url = str(request.base_url)
 
@@ -3005,53 +3656,20 @@ def is_allowed_callback_url(url: str, allowed: List[str]) -> bool:
     except Exception:
         return False
 
+@app.get("/api/v1/ocr-languages")
+async def get_ocr_languages(user: dict = Depends(require_user_or_api)):
+    """Installed Tesseract languages and the configured default."""
+    languages = await run_in_threadpool(installed_ocr_languages)
+    default = APP_CONFIG.get("ocr_settings", {}).get("ocrmypdf", {}).get("language") or "eng"
+    return {"languages": languages, "default": default}
+
+
 @app.get("/api/v1/tts-voices")
 async def get_tts_voices_list(user: dict = Depends(require_user)):
-    global AVAILABLE_TTS_VOICES_CACHE
-
-    if AVAILABLE_TTS_VOICES_CACHE is not None:
-        return AVAILABLE_TTS_VOICES_CACHE
-
-    kokoro_available = shutil.which("kokoro-tts") is not None
-    piper_available = False
-    try:
-        import piper
-        piper_available = True
-    except ImportError:
-        pass
-
-    if not piper_available and not kokoro_available:
-        AVAILABLE_TTS_VOICES_CACHE = []
+    if not installed_tts_engines():
         return JSONResponse(content={"error": "TTS feature not configured on server (no TTS engines found)."}, status_code=501)
-
-    all_voices = []
-    try:
-        if piper_available:
-            logger.info("Fetching available Piper voices list...")
-            piper_voices = safe_get_voices(PATHS.TTS_MODELS_DIR)
-            for voice in piper_voices:
-                voice['id'] = f"piper/{voice.get('id')}"
-                voice['name'] = f"Piper: {voice.get('name', voice.get('id'))}"
-            all_voices.extend(piper_voices)
-
-        if kokoro_available:
-            logger.info("Fetching available Kokoro TTS voices and languages...")
-            kokoro_voices = list_kokoro_voices_cli()
-            kokoro_langs = list_kokoro_languages_cli()
-            for lang in kokoro_langs:
-                for voice in kokoro_voices:
-                    all_voices.append({
-                        "id": f"kokoro/{lang}/{voice}",
-                        "name": f"Kokoro ({lang}): {voice}",
-                        "local": False
-                    })
-
-        AVAILABLE_TTS_VOICES_CACHE = sorted(all_voices, key=lambda x: x['name'])
-        return AVAILABLE_TTS_VOICES_CACHE
-    except Exception as e:
-        logger.exception("Could not fetch list of TTS voices.")
-        AVAILABLE_TTS_VOICES_CACHE = [] # Cache the failure
-        raise HTTPException(status_code=500, detail=f"Could not retrieve voices list: {e}")
+    # Listing can take a while (network, kokoro-tts runs); it must not block the event loop.
+    return await run_in_threadpool(available_tts_voices)
 
 # --- Standard API endpoint (non-chunked) ---
 @app.post("/api/v1/process", status_code=status.HTTP_202_ACCEPTED, tags=["Webhook API"])
@@ -3060,6 +3678,7 @@ async def api_process_file(
     model_size: Optional[str] = Form("base"), model_name: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
     generate_timestamps: bool = Form(False),
+    ocr_language: Optional[str] = Form(None),
     db: Session = Depends(get_db), user: dict = Depends(require_api_user)
 ):
     """
@@ -3075,12 +3694,53 @@ async def api_process_file(
         logger.warning(f"Rejected webhook from user '{user.get('email')}' with disallowed callback URL: {callback_url}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Provided callback_url is not in the list of allowed URLs.")
 
+    # Validate the request before anything is written to disk.
     job_id = uuid.uuid4().hex
-    safe_basename = secure_filename(file.filename)
-    stem, suffix = Path(safe_basename).stem, Path(safe_basename).suffix
-    upload_filename = f"{stem}_{job_id}{suffix}"
-    upload_path = PATHS.UPLOADS_DIR / upload_filename
+    safe_name = safe_basename(file.filename)
+    stem, suffix = Path(safe_name).stem, Path(safe_name).suffix
+    if task_type == "transcription":
+        whisper_config = APP_CONFIG.get("transcription_settings", {}).get("whisper", {})
+        try:
+            model_size = resolve_whisper_model(model_size, whisper_config)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}{'.srt' if generate_timestamps else '.txt'}"
+    elif task_type == "tts":
+        if not is_allowed_file(file.filename, {".txt"}):
+            raise HTTPException(status_code=400, detail="Invalid file type for TTS, requires .txt")
+        try:
+            validate_tts_model_name(model_name)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.wav"
+    elif task_type == "conversion":
+        if not output_format:
+            raise HTTPException(status_code=400, detail="output_format is required for conversion task.")
+        conversion_tools = APP_CONFIG.get("conversion_tools", {})
+        try:
+            tool, task_key = _parse_tool_and_task_key(output_format, conversion_tools.keys())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid output_format selected.")
+        _require_tool_available(tool)
+        target_ext = task_key.split('_')[0]
+        if tool == "ghostscript_pdf": target_ext = "pdf"
+        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.{target_ext}"
+    elif task_type in ("ocr", "ocr-image"):
+        if task_type == "ocr" and not is_allowed_file(file.filename, {".pdf"}):
+            raise HTTPException(status_code=400, detail="Invalid file type for ocr, requires .pdf")
+        if task_type == "ocr-image" and not is_allowed_file(file.filename, {".png", ".jpg", ".jpeg", ".tiff", ".tif"}):
+            raise HTTPException(status_code=400, detail="Invalid file type for ocr-image.")
+        ocr_settings = APP_CONFIG.get("ocr_settings", {}).get("ocrmypdf", {})
+        try:
+            ocr_language = resolve_ocr_language(ocr_language, ocr_settings)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        # Both produce a searchable PDF.
+        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.pdf"
+    else:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid task_type: '{task_type}'")
 
+    upload_path = PATHS.UPLOADS_DIR / f"{stem}_{job_id}{suffix}"
     try:
         input_size = await save_upload_file(file, upload_path)
     except HTTPException as e:
@@ -3090,69 +3750,23 @@ async def api_process_file(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to save file: {e}")
 
     base_url = str(request.base_url)
-    job_data_args = {
-        "id": job_id, "user_id": user['sub'], "original_filename": file.filename,
-        "input_filepath": str(upload_path), "input_filesize": input_size,
-        "callback_url": callback_url, "task_type": task_type,
-    }
+    create_job(db=db, job=JobCreate(
+        id=job_id, user_id=user['sub'], original_filename=file.filename,
+        input_filepath=str(upload_path), input_filesize=input_size,
+        callback_url=callback_url, task_type=task_type, processed_filepath=str(processed_path),
+    ))
 
     # --- API Task Dispatching Logic ---
     if task_type == "transcription":
-        whisper_config = APP_CONFIG.get("transcription_settings", {}).get("whisper", {})
-        if model_size not in whisper_config.get("allowed_models", []):
-            raise HTTPException(status_code=400, detail=f"Invalid model_size '{model_size}'")
-        output_suffix = '.srt' if generate_timestamps else '.txt'
-        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}{output_suffix}"
-        job_data_args["processed_filepath"] = str(processed_path)
-        create_job(db=db, job=JobCreate(**job_data_args))
         run_transcription_task(job_id, str(upload_path), str(processed_path), model_size, whisper_config, APP_CONFIG, base_url, generate_timestamps=generate_timestamps)
-
     elif task_type == "tts":
-        if not is_allowed_file(file.filename, {".txt"}):
-            raise HTTPException(status_code=400, detail="Invalid file type for TTS, requires .txt")
-        if not model_name:
-            raise HTTPException(status_code=400, detail="model_name is required for TTS task.")
-        tts_config = APP_CONFIG.get("tts_settings", {})
-        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.wav"
-        job_data_args["processed_filepath"] = str(processed_path)
-        create_job(db=db, job=JobCreate(**job_data_args))
-        run_tts_task(job_id, str(upload_path), str(processed_path), model_name, tts_config, APP_CONFIG, base_url)
-
+        run_tts_task(job_id, str(upload_path), str(processed_path), model_name, APP_CONFIG.get("tts_settings", {}), APP_CONFIG, base_url)
     elif task_type == "conversion":
-        if not output_format:
-            raise HTTPException(status_code=400, detail="output_format is required for conversion task.")
-        conversion_tools = APP_CONFIG.get("conversion_tools", {})
-        try:
-            tool, task_key = output_format.split('_', 1)
-            if tool not in conversion_tools: raise ValueError("Invalid tool")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid output_format selected.")
-        target_ext = task_key.split('_')[0]
-        if tool == "ghostscript_pdf": target_ext = "pdf"
-        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.{target_ext}"
-        job_data_args["processed_filepath"] = str(processed_path)
-        create_job(db=db, job=JobCreate(**job_data_args))
         run_conversion_task(job_id, str(upload_path), str(processed_path), tool, task_key, conversion_tools, APP_CONFIG, base_url)
-
     elif task_type == "ocr":
-        if not is_allowed_file(file.filename, {".pdf"}):
-            raise HTTPException(status_code=400, detail="Invalid file type for ocr, requires .pdf")
-        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}{suffix}"
-        job_data_args["processed_filepath"] = str(processed_path)
-        create_job(db=db, job=JobCreate(**job_data_args))
-        run_pdf_ocr_task(job_id, str(upload_path), str(processed_path), APP_CONFIG.get("ocr_settings", {}).get("ocrmypdf", {}), APP_CONFIG, base_url)
-
+        run_pdf_ocr_task(job_id, str(upload_path), str(processed_path), dict(ocr_settings, language=ocr_language), APP_CONFIG, base_url)
     elif task_type == "ocr-image":
-        if not is_allowed_file(file.filename, {".png", ".jpg", ".jpeg", ".tiff", ".tif"}):
-             raise HTTPException(status_code=400, detail="Invalid file type for ocr-image.")
-        processed_path = PATHS.PROCESSED_DIR / f"{stem}_{job_id}.txt"
-        job_data_args["processed_filepath"] = str(processed_path)
-        create_job(db=db, job=JobCreate(**job_data_args))
-        run_image_ocr_task(job_id, str(upload_path), str(processed_path), APP_CONFIG, base_url)
-
-    else:
-        upload_path.unlink(missing_ok=True) # Cleanup orphaned file
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid task_type: '{task_type}'")
+        run_image_ocr_task(job_id, str(upload_path), str(processed_path), APP_CONFIG, base_url, ocr_language)
 
     return {"job_id": job_id, "status": "pending"}
 
@@ -3207,12 +3821,16 @@ if not LOCAL_ONLY_MODE:
         
         try:
             token = await oauth.oidc.authorize_access_token(request)
-            user = await oauth.oidc.userinfo(token=token)
-            request.session['user'] = dict(user)
-            request.session['id_token'] = token.get('id_token')
+            user = dict(await oauth.oidc.userinfo(token=token))
         except Exception as e:
             logger.error(f"Authentication failed: {e}")
             raise HTTPException(status_code=401, detail="Authentication failed")
+        if not is_user_allowed(user):
+            logger.warning(f"Login rejected for '{user.get('email')}': not in auth_settings.allowed_users/allowed_domains.")
+            request.session.clear()
+            raise HTTPException(status_code=403, detail="This account is not allowed to use this service.")
+        request.session['user'] = user
+        request.session['id_token'] = token.get('id_token')
         return RedirectResponse(url='/')
 
     @app.get("/logout")
@@ -3222,14 +3840,26 @@ if not LOCAL_ONLY_MODE:
             return RedirectResponse(url="/", status_code=302)
             
         try:
-            logout_endpoint = oauth.oidc.server_metadata.get("end_session_endpoint")
+            # The metadata is fetched lazily; this worker may not have loaded it yet.
+            await oauth.oidc.load_server_metadata()
+            logout_endpoint = (oauth.oidc.server_metadata.get("end_session_endpoint")
+                               or APP_CONFIG.get("auth_settings", {}).get("oidc_end_session_endpoint"))
             if not logout_endpoint:
                 request.session.clear()
                 logger.warning("OIDC 'end_session_endpoint' not found. Performing local-only logout.")
                 return RedirectResponse(url="/", status_code=302)
 
-            post_logout_redirect_uri = str(request.url_for("get_index"))
-            logout_url = f"{logout_endpoint}?post_logout_redirect_uri={post_logout_redirect_uri}"
+            # RP-initiated logout: providers such as Keycloak require id_token_hint (or client_id)
+            # alongside post_logout_redirect_uri.
+            params = {"post_logout_redirect_uri": str(request.url_for("get_index"))}
+            id_token = request.session.get("id_token")
+            if id_token:
+                params["id_token_hint"] = id_token
+            client_id = APP_CONFIG.get("auth_settings", {}).get("oidc_client_id")
+            if client_id:
+                params["client_id"] = client_id
+            separator = "&" if "?" in logout_endpoint else "?"
+            logout_url = f"{logout_endpoint}{separator}{urlencode(params)}"
         except Exception as e:
             logger.warning(f"Could not determine OIDC logout endpoint: {e}. Performing local-only logout.")
             request.session.clear()
@@ -3242,6 +3872,8 @@ if not LOCAL_ONLY_MODE:
 # This is for reverse proxies that use forward auth
 @app.get("/api/authz/forward-auth")
 async def forward_auth(request: Request):
+    if LOCAL_ONLY_MODE:
+        raise HTTPException(status_code=404, detail="Not available in LOCAL_ONLY mode.")
     if not check_oidc_availability():
         raise HTTPException(status_code=401, detail="Authentication system is not properly configured")
     redirect_uri = request.url_for('auth')
@@ -3252,38 +3884,191 @@ async def get_index(request: Request):
     user = get_current_user(request)
     admin_status = is_admin(request)
     whisper_models = APP_CONFIG.get("transcription_settings", {}).get("whisper", {}).get("allowed_models", [])
-    conversion_tools = APP_CONFIG.get("conversion_tools", {})
-    return templates.TemplateResponse("index.html", {
-        "request": request, "user": user, "is_admin": admin_status,
+    # The browser only needs names, inputs and output formats; command templates stay server-side.
+    conversion_tools = {
+        tool_id: {"name": tool.get("name", tool_id), "formats": tool.get("formats") or {},
+                  "supported_input": sorted({str(ext).lower() for ext in tool.get("supported_input") or []})}
+        for tool_id, tool in APP_CONFIG.get("conversion_tools", {}).items()
+        if isinstance(tool, dict) and tool_id not in UNAVAILABLE_TOOLS
+    }
+    app_settings = APP_CONFIG.get("app_settings", {})
+    # Lets the page reject files the server would refuse before uploading them.
+    upload_limits = {
+        "max_file_size_bytes": _max_upload_bytes(),
+        "allowed_extensions": sorted(str(ext).lower() for ext in app_settings.get("allowed_all_extensions") or []),
+        "ocr_extensions": sorted(OCR_IMAGE_EXTENSIONS | {".pdf"}),
+    }
+    return templates.TemplateResponse(request, "index.html", {
+        "user": user, "is_admin": admin_status,
         "whisper_models": sorted(list(whisper_models)),
-        "conversion_tools": conversion_tools, "local_only_mode": LOCAL_ONLY_MODE
+        "conversion_tools": conversion_tools, "upload_limits": upload_limits, "local_only_mode": LOCAL_ONLY_MODE
     })
+
+# --- Settings page & API ---
+# Secrets are never sent to the browser; submitting an empty value keeps the stored one.
+SECRET_SETTINGS = (("auth_settings", "oidc_client_secret"), ("webhook_settings", "callback_bearer_token"))
+# Editing a command template from the browser decides which programs the server executes, so it
+# is off unless explicitly enabled. Templates can always be changed in config/settings.yml.
+ALLOW_COMMAND_EDITS = _env_flag("ALLOW_COMMAND_EDITS", False)
+
+
+def _leaves(*names: str) -> dict:
+    return {name: None for name in names}
+
+
+# Everything the settings form may change. Other keys (TTS command templates, model paths, ...)
+# can only be edited in settings.yml.
+EDITABLE_SETTINGS = {
+    "app_settings": _leaves("app_public_url", "max_file_size_mb", "allowed_all_extensions",
+                            "model_concurrency", "model_inactivity_timeout", "cache_check_interval",
+                            "retention_days"),
+    "ocr_settings": {"ocrmypdf": _leaves("deskew", "clean", "force_ocr", "language")},
+    "transcription_settings": {"whisper": _leaves("compute_type")},
+    "auth_settings": _leaves("oidc_client_id", "oidc_client_secret", "oidc_server_metadata_url",
+                             "admin_users", "allowed_users", "allowed_domains"),
+    "webhook_settings": _leaves("enabled", "allow_chunked_api_uploads", "allowed_callback_urls", "callback_bearer_token"),
+    "tts_settings": {"piper": {"use_cuda": None, "synthesis_config": _leaves("length_scale", "noise_scale", "noise_w")}},
+}
+EDITABLE_TOOL_KEYS = {"name", "command_template", "supported_input", "formats", "timeout"}
+POSITIVE_NUMBER_SETTINGS = (("app_settings", "max_file_size_mb"), ("app_settings", "model_concurrency"),
+                            ("app_settings", "model_inactivity_timeout"), ("app_settings", "cache_check_interval"))
+
+
+def _collapse_whitespace(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _validate_settings_payload(payload: dict) -> List[str]:
+    """Returns a list of problems with a settings update coming from the web UI."""
+    errors: List[str] = []
+
+    def walk(data: dict, schema: dict, path: tuple):
+        for key, value in data.items():
+            key_path = ".".join(path + (key,))
+            if key not in schema:
+                errors.append(f"'{key_path}' cannot be changed from the web UI; edit settings.yml instead.")
+                continue
+            sub_schema = schema[key]
+            if sub_schema is None:
+                continue
+            if not isinstance(value, dict):
+                errors.append(f"'{key_path}' must be an object.")
+                continue
+            walk(value, sub_schema, path + (key,))
+
+    walk({k: v for k, v in payload.items() if k != "conversion_tools"}, EDITABLE_SETTINGS, ())
+
+    for section, key in POSITIVE_NUMBER_SETTINGS:
+        section_data = payload.get(section)
+        if isinstance(section_data, dict) and key in section_data:
+            try:
+                valid = float(section_data[key]) > 0
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                errors.append(f"'{section}.{key}' must be a positive number.")
+
+    app_section = payload.get("app_settings")
+    if isinstance(app_section, dict) and "retention_days" in app_section:
+        try:
+            valid = app_section["retention_days"] is None or float(app_section["retention_days"]) >= 0
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            errors.append("'app_settings.retention_days' must be 0 (keep forever) or a positive number.")
+
+    ocr_language = (payload.get("ocr_settings") or {}).get("ocrmypdf", {}) if isinstance(payload.get("ocr_settings"), dict) else {}
+    if isinstance(ocr_language, dict) and "language" in ocr_language:
+        try:
+            resolve_ocr_language(str(ocr_language["language"] or ""), {})
+        except ValueError as e:
+            errors.append(f"'ocr_settings.ocrmypdf.language': {e}")
+
+    tools = payload.get("conversion_tools")
+    if tools is None:
+        return errors
+    if not isinstance(tools, dict):
+        errors.append("'conversion_tools' must be an object.")
+        return errors
+    current_tools = APP_CONFIG.get("conversion_tools", {})
+    for tool_id, tool in tools.items():
+        if not isinstance(tool, dict):
+            errors.append(f"'conversion_tools.{tool_id}' must be an object.")
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,64}", str(tool_id)):
+            errors.append(f"Invalid tool id '{tool_id}' (letters, digits and underscores only).")
+            continue
+        for key in sorted(set(tool) - EDITABLE_TOOL_KEYS):
+            errors.append(f"'conversion_tools.{tool_id}.{key}' cannot be changed from the web UI; edit settings.yml instead.")
+        if "timeout" in tool:
+            try:
+                valid_timeout = 0 < float(tool["timeout"]) <= 7 * 24 * 3600
+            except (TypeError, ValueError):
+                valid_timeout = False
+            if not valid_timeout:
+                errors.append(f"'conversion_tools.{tool_id}.timeout' must be a positive number of seconds.")
+        current = current_tools.get(tool_id)
+        if current is None and not ALLOW_COMMAND_EDITS:
+            errors.append(f"Adding conversion tools ('{tool_id}') from the web UI is disabled. "
+                          "Edit config/settings.yml or set ALLOW_COMMAND_EDITS=true.")
+            continue
+        if "command_template" not in tool:
+            if current is None:
+                errors.append(f"New tool '{tool_id}' needs a command_template.")
+            continue
+        template = tool["command_template"]
+        unchanged = current is not None and _collapse_whitespace(template) == _collapse_whitespace(current.get("command_template"))
+        if not isinstance(template, str) or not template.strip():
+            errors.append(f"'conversion_tools.{tool_id}.command_template' must be a non-empty string.")
+        elif unchanged:
+            continue  # the form always submits every template; only changes are checked
+        elif not ALLOW_COMMAND_EDITS:
+            errors.append(f"Changing the command of '{tool_id}' from the web UI is disabled. "
+                          "Edit config/settings.yml or set ALLOW_COMMAND_EDITS=true.")
+        else:
+            try:
+                validate_and_build_command(template, {})
+            except ValueError as e:
+                errors.append(f"Invalid command template for '{tool_id}': {e}")
+    return errors
+
+
+def _drop_blank_secrets(payload: dict) -> None:
+    for section, key in SECRET_SETTINGS:
+        section_data = payload.get(section)
+        if isinstance(section_data, dict) and key in section_data:
+            value = section_data[key]
+            if value is None or (isinstance(value, str) and not value.strip()):
+                del section_data[key]
+
 
 @app.get("/settings")
 async def get_settings_page(request: Request):
-    """Displays the contents of the currently active configuration."""
+    """Settings page: configuration for admins, history management for every user."""
     user = get_current_user(request)
+    if not user:
+        return RedirectResponse(url="/", status_code=302)
     admin_status = is_admin(request)
+    context = {"config": {}, "config_source": "", "secrets_set": {}, "user": user, "is_admin": admin_status,
+               "local_only_mode": LOCAL_ONLY_MODE, "allow_command_edits": ALLOW_COMMAND_EDITS,
+               "unavailable_tools": UNAVAILABLE_TOOLS, "ocr_languages": await run_in_threadpool(installed_ocr_languages)}
+    if not admin_status:
+        return templates.TemplateResponse(request, "settings.html", context)
 
-    # Use the globally loaded and merged APP_CONFIG for consistency
-    # Ensure all required keys exist for template rendering
-    current_config = APP_CONFIG.copy()
-    
+    # Deep copy: the normalization below must not mutate the live configuration.
+    current_config = copy.deepcopy(APP_CONFIG)
+    secrets_set = {}
+    for section, key in SECRET_SETTINGS:
+        section_data = current_config.setdefault(section, {})
+        secrets_set[key] = bool(section_data.get(key))
+        section_data[key] = ""
+
     # Ensure all required nested dictionaries exist
-    if "app_settings" not in current_config:
-        current_config["app_settings"] = {}
-    if "transcription_settings" not in current_config:
-        current_config["transcription_settings"] = {"whisper": {}}
-    if "tts_settings" not in current_config:
-        current_config["tts_settings"] = {"piper": {"synthesis_config": {}}}
-    if "conversion_tools" not in current_config:
-        current_config["conversion_tools"] = {}
-    if "ocr_settings" not in current_config:
-        current_config["ocr_settings"] = {"ocrmypdf": {}}
-    if "auth_settings" not in current_config:
-        current_config["auth_settings"] = {}
-    if "webhook_settings" not in current_config:
-        current_config["webhook_settings"] = {}
+    current_config.setdefault("app_settings", {})
+    current_config.setdefault("transcription_settings", {}).setdefault("whisper", {})
+    current_config.setdefault("tts_settings", {}).setdefault("piper", {}).setdefault("synthesis_config", {})
+    current_config.setdefault("conversion_tools", {})
+    current_config.setdefault("ocr_settings", {}).setdefault("ocrmypdf", {})
 
     # Fix potential format issues in conversion tools - ensure 'formats' is always a dict
     for tool_id, tool_config in current_config.get("conversion_tools", {}).items():
@@ -3299,10 +4084,10 @@ async def get_settings_page(request: Request):
                         value = parts[1].strip() if len(parts) > 1 else ""
                         if key:  # Only add if key is not empty
                             formats_dict[key] = value
-                current_config["conversion_tools"][tool_id]["formats"] = formats_dict
+                tool_config["formats"] = formats_dict
             elif not isinstance(formats_data, dict):
                 # If it's neither list nor dict, set to empty dict
-                current_config["conversion_tools"][tool_id]["formats"] = {}
+                tool_config["formats"] = {}
 
     # Determine the source file for display purposes
     config_source = "none"
@@ -3311,21 +4096,8 @@ async def get_settings_page(request: Request):
     elif PATHS.DEFAULT_SETTINGS_FILE.exists():
         config_source = str(PATHS.DEFAULT_SETTINGS_FILE.name)
 
-    return templates.TemplateResponse(
-        "settings.html",
-        {"request": request, "config": current_config, "config_source": config_source,
-         "user": user, "is_admin": admin_status, "local_only_mode": LOCAL_ONLY_MODE}
-    )
-
-def deep_merge(source: dict, destination: dict) -> dict:
-    """Recursively merges dicts."""
-    for key, value in source.items():
-        if isinstance(value, collections.abc.Mapping):
-            node = destination.setdefault(key, {})
-            deep_merge(value, node)
-        else:
-            destination[key] = value
-    return destination
+    context.update({"config": current_config, "config_source": config_source, "secrets_set": secrets_set})
+    return templates.TemplateResponse(request, "settings.html", context)
 
 def _preprocess_settings_for_saving(config: Dict) -> Dict:
     """
@@ -3387,6 +4159,11 @@ async def save_settings(
 
         # Pre-process the incoming config to fix formatting issues
         processed_config = _preprocess_settings_for_saving(new_config_from_ui)
+        _drop_blank_secrets(processed_config)
+        errors = _validate_settings_payload(processed_config)
+        if errors:
+            logger.warning(f"Rejected settings update from admin '{user.get('email')}': {errors}")
+            raise HTTPException(status_code=400, detail=" ".join(errors[:10]))
 
         try:
             with PATHS.SETTINGS_FILE.open("r", encoding="utf8") as f:
@@ -3394,7 +4171,7 @@ async def save_settings(
         except FileNotFoundError:
             current_config_on_disk = {}
 
-        merged_config = deep_merge(source=processed_config, destination=current_config_on_disk)
+        merged_config = deep_merge(processed_config, current_config_on_disk)
 
         with tmp_path.open("w", encoding="utf8") as f:
             yaml.safe_dump(merged_config, f, default_flow_style=False, sort_keys=False, width=float('inf'))
@@ -3404,138 +4181,20 @@ async def save_settings(
         load_app_config()
         return JSONResponse({"message": "Settings saved successfully."})
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"Failed to update settings for admin '{user.get('email')}'")
         if tmp_path.exists(): tmp_path.unlink()
         raise HTTPException(status_code=500, detail=f"Could not save settings.yml: {e}")
 
-# WebSocket endpoint for real-time job updates
-@app.websocket("/ws/jobs")
-async def websocket_job_updates(websocket: WebSocket, 
-                               token: str = Query(None),
-                               request: Request = None):
-    """
-    WebSocket endpoint for real-time job status updates.
-    Requires authentication via token or session.
-    """
-    if not ENABLE_WEBSOCKETS:
-        await websocket.close(code=1008, reason="WebSockets are disabled")
-        return
-
-    # Get user from either token or session
-    user = None
-    if token:
-        # Validate bearer token for API users  
-        try:
-            from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-            http_bearer = HTTPBearer()
-            creds = HTTPAuthorizationCredentials(credentials=token)
-            user = await require_api_user(request, creds) if not LOCAL_ONLY_MODE else {'sub': 'local_api_user', 'email': 'local@api.user.com', 'name': 'Local API User'}
-        except Exception:
-            await websocket.close(code=1008, reason="Invalid token")
-            return
-    elif LOCAL_ONLY_MODE:
-        # In local-only mode, always allow with local user
-        user = {'sub': 'local_user', 'email': 'local@user.com', 'name': 'Local User'}
-    else:
-        # Get from session for UI users
-        user = get_current_user(request) if request else None
-    
-    if not user:
-        await websocket.close(code=1008, reason="Authentication required")
-        return
-    
-    user_id = user['sub']
-    
-    # Establish connection
-    await manager.connect(websocket, user_id)
-    
-    try:
-        # Send initial connection confirmation
-        await websocket.send_text(json.dumps({
-            "type": "connection_established",
-            "user_id": user_id,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }))
-        logger.info(f"WebSocket connection established for user {user_id}")
-        
-        # Send initial job states
-        db = SessionLocal()
-        try:
-            # Get recent jobs for user
-            recent_jobs = get_jobs(db, user_id=user_id, skip=0, limit=50)  # Configurable limit
-            if recent_jobs:
-                jobs_data = [JobSchema.model_validate(job).model_dump() for job in recent_jobs]
-                await manager.broadcast_multiple_jobs_update(user_id, jobs_data)
-                logger.info(f"Sent initial job states to user {user_id}: {len(jobs_data)} jobs")
-            else:
-                logger.info(f"No initial jobs to send to user {user_id}")
-        finally:
-            db.close()
-        
-        # Listen for messages and maintain connection
-        # Add server-side heartbeat to prevent timeout
-        async def send_keepalive():
-            while True:
-                await asyncio.sleep(45)  # Send keepalive every 45 seconds
-                try:
-                    await websocket.send_text(json.dumps({
-                        "type": "keepalive", 
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    }))
-                except Exception:
-                    # Connection likely closed, break the loop
-                    break
-        
-        # Start keepalive task
-        keepalive_task = asyncio.create_task(send_keepalive())
-        
-        try:
-            while True:
-                # WebSocket operations are handled by the manager and job updates
-                data = await websocket.receive_text()
-                # In the basic implementation, client just sends keep-alive or commands
-                try:
-                    message = json.loads(data)
-                    msg_type = message.get("type", "")
-                    if msg_type == "ping":
-                        await websocket.send_text(json.dumps({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()}))
-                except json.JSONDecodeError:
-                    # Ignore malformed messages
-                    pass
-        finally:
-            # Cancel the keepalive task when connection closes
-            keepalive_task.cancel()
-            try:
-                await keepalive_task
-            except asyncio.CancelledError:
-                pass
-    except WebSocketDisconnect as e:
-        manager.disconnect(websocket)
-        logger.info(f"WebSocket disconnected for user {user_id}. Code: {e.code}, Reason: {e.reason}")
-    except Exception as e:
-        logger.error(f"WebSocket error for user {user_id}: {e}", exc_info=True)
-        manager.disconnect(websocket)
-
 # --------------------------------------------------------------------------------
 # --- JOB MANAGEMENT & UTILITY ROUTES
 # --------------------------------------------------------------------------------
-@app.post("/settings/clear-history")
-async def clear_job_history(db: Session = Depends(get_db), user: dict = Depends(require_user)):
-    try:
-        num_deleted = db.query(Job).filter(Job.user_id == user['sub']).delete()
-        db.commit()
-        logger.info(f"Cleared {num_deleted} jobs for user {user['sub']}.")
-        return {"deleted_count": num_deleted}
-    except Exception:
-        db.rollback()
-        logger.exception("Failed to clear job history")
-        raise HTTPException(status_code=500, detail="Database error while clearing history.")
-
-@app.post("/settings/delete-files")
-async def delete_processed_files(db: Session = Depends(get_db), user: dict = Depends(require_user)):
+def _delete_job_files(jobs) -> tuple[int, list]:
+    """Deletes the processed files of the given jobs. Returns (deleted_count, failed_names)."""
     deleted_count, errors = 0, []
-    for job in get_jobs(db, user_id=user['sub']):
+    for job in jobs:
         if job.processed_filepath:
             try:
                 p = ensure_path_is_safe(Path(job.processed_filepath), [PATHS.PROCESSED_DIR])
@@ -3545,27 +4204,133 @@ async def delete_processed_files(db: Session = Depends(get_db), user: dict = Dep
             except Exception:
                 errors.append(Path(job.processed_filepath).name)
                 logger.exception(f"Could not delete file {Path(job.processed_filepath).name}")
+    return deleted_count, errors
+
+
+FINAL_JOB_STATES = ("completed", "failed", "cancelled")
+MAX_SELECTED_JOBS = 1000
+
+
+def delete_jobs_and_files(db: Session, jobs: list) -> tuple[list, int]:
+    """
+    Deletes jobs with their processed files (and the inputs of jobs that never started).
+    Active jobs are cancelled first so running tools get killed. Returns (deleted_ids, files_deleted).
+    """
+    active_ids = [job.id for job in jobs if job.status in ("pending", "processing")]
+    if active_ids:
+        db.query(Job).filter(Job.id.in_(active_ids)).update({"status": "cancelled"}, synchronize_session=False)
+        db.commit()
+    files_deleted, _errors = _delete_job_files(jobs)
+    for job in jobs:
+        if job.id in active_ids and job.input_filepath:
+            try:
+                input_path = ensure_path_is_safe(Path(job.input_filepath), [PATHS.UPLOADS_DIR, PATHS.CHUNK_TMP_DIR])
+                input_path.unlink(missing_ok=True)
+            except Exception:
+                logger.debug(f"Could not remove input of deleted job {job.id}", exc_info=True)
+    deleted_ids = [job.id for job in jobs]
+    for start in range(0, len(deleted_ids), 500):
+        db.query(Job).filter(Job.id.in_(deleted_ids[start:start + 500])).delete(synchronize_session=False)
+    db.commit()
+    return deleted_ids, files_deleted
+
+
+@app.post("/jobs/delete")
+def delete_selected_jobs(payload: JobSelection, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
+    """Deletes the selected jobs of the current user, their files and, for ZIP batches, their sub-jobs."""
+    job_ids = list(dict.fromkeys(payload.job_ids))[:MAX_SELECTED_JOBS]
+    if not job_ids:
+        raise HTTPException(status_code=400, detail="No job IDs provided.")
+    jobs = db.query(Job).filter(Job.id.in_(job_ids), Job.user_id == user['sub']).all()
+    batch_ids = [job.id for job in jobs if job.task_type == "unzip"]
+    if batch_ids:
+        known = {job.id for job in jobs}
+        jobs += [child for child in db.query(Job).filter(Job.parent_job_id.in_(batch_ids), Job.user_id == user['sub']).all()
+                 if child.id not in known]
+    deleted_ids, files_deleted = delete_jobs_and_files(db, jobs)
+    logger.info(f"User {user['sub']} deleted {len(deleted_ids)} jobs and {files_deleted} files.")
+    return {"deleted": deleted_ids, "files_deleted": files_deleted}
+
+
+@app.post("/settings/clear-history")
+def clear_job_history(db: Session = Depends(get_db), user: dict = Depends(require_user)):
+    """
+    Deletes the user's job records together with their processed files (they'd be unreachable
+    otherwise). Running jobs are cancelled first, so their converters are stopped.
+    """
+    try:
+        deleted_ids, files_deleted = delete_jobs_and_files(db, db.query(Job).filter(Job.user_id == user['sub']).all())
+        logger.info(f"Cleared {len(deleted_ids)} jobs and {files_deleted} files for user {user['sub']}.")
+        return {"deleted_count": len(deleted_ids), "files_deleted": files_deleted}
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to clear job history")
+        raise HTTPException(status_code=500, detail="Database error while clearing history.")
+
+@app.post("/settings/delete-files")
+def delete_processed_files(db: Session = Depends(get_db), user: dict = Depends(require_user)):
+    # All of the user's jobs, not just the 100 most recent ones.
+    deleted_count, errors = _delete_job_files(get_jobs(db, user_id=user['sub'], limit=None))
     if errors:
         raise HTTPException(status_code=500, detail=f"Could not delete some files: {', '.join(errors)}")
     logger.info(f"Deleted {deleted_count} files for user {user['sub']}.")
     return {"deleted_count": deleted_count}
 
 @app.post("/job/{job_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
-async def cancel_job(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+def cancel_job(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
     job = get_job(db, job_id)
     if not job or job.user_id != user['sub']:
         raise HTTPException(status_code=404, detail="Job not found.")
     if job.status in ["pending", "processing"]:
-        update_job_status(db, job_id, status="cancelled")
-        return {"message": "Job cancellation requested."}
+        job = update_job_status(db, job_id, status="cancelled")
+        # The updated job lets the page show the new state without waiting for its next poll.
+        return {"message": "Job cancellation requested.", "job": JobSchema.model_validate(job).model_dump() if job else None}
     raise HTTPException(status_code=400, detail=f"Job is already in a final state ({job.status}).")
 
+JOB_HISTORY_LIMIT = 100
+MAX_CHANGED_JOBS = 5000
+
+
+def _parse_timestamp(value: str) -> datetime:
+    """Parses an ISO 8601 timestamp (as sent in JobSchema) into the naive UTC the database stores."""
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"Invalid timestamp '{value}'.")
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
 @app.get("/jobs", response_model=List[JobSchema])
-async def get_all_jobs(db: Session = Depends(get_db), user: dict = Depends(require_user)):
-    return get_jobs(db, user_id=user['sub'])
+def get_all_jobs(since: Optional[str] = None, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+    """
+    Without `since`: the user's most recent jobs, each ZIP batch together with all of its sub-jobs
+    (sub-jobs don't count towards the limit, so a big batch can't push its own parent out of the list).
+    With `since` (an ISO timestamp, e.g. the newest updated_at seen so far): only the jobs created or
+    changed at or after that time, which keeps polling cheap.
+    """
+    if since:
+        return (db.query(Job)
+                .filter(Job.user_id == user['sub'], Job.updated_at >= _parse_timestamp(since))
+                .order_by(Job.updated_at)
+                .limit(MAX_CHANGED_JOBS)
+                .all())
+    jobs = (db.query(Job)
+            .filter(Job.user_id == user['sub'], Job.parent_job_id.is_(None))
+            .order_by(Job.created_at.desc())
+            .limit(JOB_HISTORY_LIMIT)
+            .all())
+    batch_ids = [job.id for job in jobs if job.task_type == "unzip"]
+    for start in range(0, len(batch_ids), 500):
+        jobs += (db.query(Job)
+                 .filter(Job.parent_job_id.in_(batch_ids[start:start + 500]), Job.user_id == user['sub'])
+                 .order_by(Job.created_at.desc())
+                 .all())
+    return jobs
 
 @app.get("/job/{job_id}", response_model=JobSchema)
-async def get_job_status(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+def get_job_status(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
     job = get_job(db, job_id)
     if not job or job.user_id != user['sub']:
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -3577,7 +4342,7 @@ class JobStatusRequest(BaseModel):
     job_ids: TypingList[str]
 
 @app.post("/api/v1/jobs/status", response_model=TypingList[JobSchema])
-async def get_jobs_status(payload: JobStatusRequest, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+def get_jobs_status(payload: JobStatusRequest, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
     """
     Accepts a list of job IDs and returns their current status.
     This is used by the frontend for polling active jobs.
@@ -3592,7 +4357,7 @@ async def get_jobs_status(payload: JobStatusRequest, db: Session = Depends(get_d
 
 
 @app.get("/download/{filename}")
-async def download_file(filename: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+def download_file(filename: str, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
     file_path = ensure_path_is_safe(PATHS.PROCESSED_DIR / filename, [PATHS.PROCESSED_DIR])
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found.")
@@ -3604,26 +4369,76 @@ async def download_file(filename: str, db: Session = Depends(get_db), user: dict
     download_filename = Path(job.original_filename).stem + Path(job.processed_filepath).suffix
     return FileResponse(path=file_path, filename=download_filename, media_type="application/octet-stream")
 
+def _content_disposition(filename: str) -> str:
+    """Attachment header with an ASCII fallback and an RFC 5987 UTF-8 name."""
+    fallback = safe_basename(filename)
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
+
+
+# Formats that are compressed already; they are stored in ZIP downloads as they are.
+PRECOMPRESSED_SUFFIXES = frozenset({
+    ".7z", ".aac", ".avif", ".azw3", ".bz2", ".cbz", ".docx", ".epub", ".flac", ".gif", ".gz", ".heic",
+    ".heif", ".jpeg", ".jpg", ".jxl", ".m4a", ".m4v", ".mkv", ".mobi", ".mov", ".mp3", ".mp4", ".odp",
+    ".ods", ".odt", ".ogg", ".opus", ".pdf", ".png", ".pptx", ".webm", ".webp", ".xlsx", ".xz", ".zip",
+})
+
+
+def _zip_files_response(entries: List[tuple], download_name: str) -> StreamingResponse:
+    """
+    Builds a ZIP of (path, archive_name) entries in a spooled temp file (memory up to 32 MB,
+    disk beyond) and streams it. Call via run_in_threadpool: zipping blocks.
+    """
+    spool = tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024)
+    used_names = set()
+    with zipfile.ZipFile(spool, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for file_path, arcname in entries:
+            stem, suffix = Path(arcname).stem, Path(arcname).suffix
+            unique_name, counter = arcname, 1
+            while unique_name in used_names:
+                counter += 1
+                unique_name = f"{stem} ({counter}){suffix}"
+            used_names.add(unique_name)
+            # Deflating media, PDFs or Office files costs a lot of CPU and saves next to nothing.
+            compress_type = zipfile.ZIP_STORED if Path(file_path).suffix.lower() in PRECOMPRESSED_SUFFIXES else zipfile.ZIP_DEFLATED
+            zip_file.write(file_path, arcname=unique_name, compress_type=compress_type)
+    spool.seek(0)
+
+    def iter_file():
+        try:
+            while chunk := spool.read(1024 * 1024):
+                yield chunk
+        finally:
+            spool.close()
+
+    return StreamingResponse(iter_file(), media_type="application/zip",
+                             headers={"Content-Disposition": _content_disposition(download_name)})
+
+
 @app.post("/download/batch", response_class=StreamingResponse)
-async def download_batch(payload: JobSelection, db: Session = Depends(get_db), user: dict = Depends(require_user)):
-    job_ids = payload.job_ids
+async def download_batch(request: Request, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+    """
+    ZIP of the selected jobs' results. Takes JSON ({"job_ids": [...]}) or a form with repeated
+    job_ids fields; the web UI submits a form so the browser streams the download to disk.
+    """
+    if request.headers.get("content-type", "").startswith(("application/x-www-form-urlencoded", "multipart/form-data")):
+        job_ids = [str(v) for v in (await request.form()).getlist("job_ids")]
+    else:
+        try:
+            job_ids = JobSelection.model_validate(await request.json()).job_ids
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Expected {\"job_ids\": [...]}.")
+    job_ids = list(dict.fromkeys(job_ids))[:MAX_SELECTED_JOBS]
     if not job_ids:
         raise HTTPException(status_code=400, detail="No job IDs provided.")
 
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-        for job_id in job_ids:
-            job = get_job(db, job_id)
-            if job and job.user_id == user['sub'] and job.status == 'completed' and job.processed_filepath:
-                file_path = ensure_path_is_safe(Path(job.processed_filepath), [PATHS.PROCESSED_DIR])
-                if file_path.exists():
-                    download_filename = f"{Path(job.original_filename).stem}_{job_id}{file_path.suffix}"
-                    zip_file.write(file_path, arcname=download_filename)
+    entries = []
+    for job in db.query(Job).filter(Job.id.in_(job_ids), Job.user_id == user['sub'], Job.status == 'completed').all():
+        if job.processed_filepath:
+            file_path = ensure_path_is_safe(Path(job.processed_filepath), [PATHS.PROCESSED_DIR])
+            if file_path.exists():
+                entries.append((file_path, f"{Path(safe_basename(job.original_filename)).stem}_{job.id}{file_path.suffix}"))
 
-    zip_buffer.seek(0)
-    return StreamingResponse(zip_buffer, media_type="application/x-zip-compressed", headers={
-        'Content-Disposition': f'attachment; filename="file-wizard-batch-{uuid.uuid4().hex[:8]}.zip"'
-    })
+    return await run_in_threadpool(_zip_files_response, entries, f"file-wizard-batch-{uuid.uuid4().hex[:8]}.zip")
 
 @app.get("/download/zip-batch/{job_id}", response_class=StreamingResponse)
 async def download_zip_batch(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
@@ -3638,29 +4453,19 @@ async def download_zip_batch(job_id: str, db: Session = Depends(get_db), user: d
     if not child_jobs:
         raise HTTPException(status_code=404, detail="No completed sub-jobs found for this batch.")
 
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-        files_added = 0
-        for job in child_jobs:
-            if job.processed_filepath:
-                file_path = ensure_path_is_safe(Path(job.processed_filepath), [PATHS.PROCESSED_DIR])
-                if file_path.exists():
-                    # Create a more user-friendly name inside the zip
-                    download_filename = f"{Path(job.original_filename).stem}{file_path.suffix}"
-                    zip_file.write(file_path, arcname=download_filename)
-                    files_added += 1
+    entries = []
+    for job in child_jobs:
+        if job.processed_filepath:
+            file_path = ensure_path_is_safe(Path(job.processed_filepath), [PATHS.PROCESSED_DIR])
+            if file_path.exists():
+                # Create a more user-friendly name inside the zip
+                entries.append((file_path, f"{Path(safe_basename(job.original_filename)).stem}{file_path.suffix}"))
 
-    if files_added == 0:
+    if not entries:
          raise HTTPException(status_code=404, detail="No processed files found for the completed sub-jobs.")
 
-    zip_buffer.seek(0)
-
-    # Generate a filename for the download
     batch_filename = f"{Path(parent_job.original_filename).stem}_processed.zip"
-
-    return StreamingResponse(zip_buffer, media_type="application/x-zip-compressed", headers={
-        'Content-Disposition': f'attachment; filename="{batch_filename}"'
-    })
+    return await run_in_threadpool(_zip_files_response, entries, batch_filename)
 
 @app.get("/api/v1/supported-formats/{file_extension}")
 async def get_supported_formats_for_file_type(file_extension: str, user: dict = Depends(require_user)):
@@ -3668,61 +4473,28 @@ async def get_supported_formats_for_file_type(file_extension: str, user: dict = 
     Get supported output formats for a given file extension.
     The file_extension should include the dot (e.g., '.pdf', '.docx').
     """
-    # Validate file extension format
     if not file_extension.startswith('.'):
         file_extension = '.' + file_extension
-    
-    file_extension = file_extension.lower()
-    conversion_tools = APP_CONFIG.get("conversion_tools", {})
-    
-    # Find tools that support this input extension
-    supported_formats = []
-    for tool_name, tool_config in conversion_tools.items():
-        supported_inputs = tool_config.get("supported_input", [])
-        # Convert supported inputs to lowercase for comparison
-        supported_inputs_lower = [ext.lower() for ext in supported_inputs]
-        
-        if file_extension in supported_inputs_lower:
-            # Add all available formats for this tool
-            for format_key, format_label in tool_config.get("formats", {}).items():
-                full_format_key = f"{tool_name}_{format_key}"
-                supported_formats.append({
-                    "value": full_format_key,
-                    "label": f"{tool_config['name']} - {format_label}",
-                    "tool": tool_name,
-                    "format": format_key
-                })
-    
+    supported_formats = get_supported_output_formats_for_file(f"file{file_extension}", APP_CONFIG.get("conversion_tools", {}))
     return {"formats": supported_formats}
 
 
 @app.get("/api/formats/count")
 async def get_formats_count():
     """
-    Returns the number of supported input and output formats.
+    Returns the number of supported input and output formats of the installed tools.
     """
-    try:
-        with open(PATHS.DEFAULT_SETTINGS_FILE, 'r') as f:
-            settings = yaml.safe_load(f)
-
-        input_formats = set()
-        output_formats = set()
-
-        for tool, config in settings.get('conversion_tools', {}).items():
-            if 'supported_input' in config:
-                for fmt in config['supported_input']:
-                    input_formats.add(fmt)
-            if 'formats' in config:
-                for fmt in config['formats']:
-                    output_formats.add(fmt)
-
-        return {
-            "input_formats_count": len(input_formats),
-            "output_formats_count": len(output_formats)
-        }
-    except Exception as e:
-        logger.error(f"Error counting formats: {e}")
-        raise HTTPException(status_code=500, detail="Error counting formats")
+    input_formats = set()
+    output_formats = set()
+    for tool, config in APP_CONFIG.get('conversion_tools', {}).items():
+        if not isinstance(config, dict) or tool in UNAVAILABLE_TOOLS:
+            continue
+        input_formats.update(config.get('supported_input') or [])
+        output_formats.update((config.get('formats') or {}).keys())
+    return {
+        "input_formats_count": len(input_formats),
+        "output_formats_count": len(output_formats)
+    }
 
 @app.get("/health")
 async def health():
@@ -3732,23 +4504,8 @@ async def health():
     except Exception:
         logger.exception("Health check failed")
         return JSONResponse({"ok": False}, status_code=500)
-    return {"ok": True}
-
-@app.get("/test-websocket-notification")
-async def test_websocket_notification(request: Request, user: dict = Depends(require_user)):
-    """Test endpoint to trigger a WebSocket notification"""
-    fake_job_data = {
-        "id": "test-notification",
-        "user_id": user['sub'],
-        "status": "processing",
-        "progress": 50,
-        "original_filename": "test.txt",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat()
-    }
-    
-    manager.sync_broadcast_job_status_update(user['sub'], fake_job_data)
-    return {"message": "Test notification sent"}
+    return {"ok": True, "version": os.environ.get("FILEWIZARD_VERSION", "dev"),
+            "variant": os.environ.get("FILEWIZARD_VARIANT", "")}
 
 @app.get('/favicon.ico', include_in_schema=False)
 async def favicon():
