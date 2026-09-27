@@ -4,7 +4,7 @@
 [![Docker Pulls](https://img.shields.io/docker/pulls/loredcast/filewizard.svg)](https://hub.docker.com/r/loredcast/filewizard)
 [![Docker Image Version](https://img.shields.io/docker/v/loredcast/filewizard?sort=semver)](https://hub.docker.com/r/loredcast/filewizard)
 
-A self-hosted, browser-based utility for file conversion, OCR and audio transcription. It wraps common CLI and Python converters (FFmpeg, LibreOffice, Pandoc, ImageMagick, etc.), plus `faster-whisper` and Tesseract OCR.
+A self-hosted, browser-based utility for file conversion, OCR and audio transcription. It wraps common CLI and Python converters (FFmpeg, LibreOffice, Pandoc, ImageMagick, etc.), plus `faster-whisper` and Tesseract OCR. Supports 180+ formats out of the box, 700+ formats theoretically and much more can be configured and extended.
 
 ![Screenshot](screenshot.png)
 
