@@ -28,7 +28,6 @@ pydantic
 pydantic-settings
 python-multipart
 markitdown[pdf,docx,pptx,xlsx,outlook]==0.1.3
-PyPDF2==3.0.1
 
 # Docling
 --extra-index-url https://download.pytorch.org/whl/cpu

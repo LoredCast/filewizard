@@ -168,9 +168,24 @@ tar -xOf build-1.tar index.json; echo; tar -xOf build-2.tar index.json
 
 ### Updating dependencies
 
-- **Python packages:** edit `requirements*.txt`, then run `pip install uv && scripts/lock-requirements.sh` and commit `locks/`. The script resolves against PyPI for Python 3.12 and checks that every package installs from wheels on amd64 and arm64.
-- **Ubuntu packages:** set `UBUNTU_SNAPSHOT` in the Dockerfile to a recent timestamp (`YYYYMMDDTHHMMSSZ`, UTC).
-- **Base images:** update the digests, e.g. from `docker buildx imagetools inspect ubuntu:24.04`.
+[`scripts/update-deps.sh`](../scripts/update-deps.sh) does the updates on your machine; nothing is committed or pushed. It needs `uv` (`pip install uv`), and Docker for `base` and `build`.
+
+```bash
+scripts/update-deps.sh audit        # known vulnerabilities in locks/*.txt (exit code 1 if any)
+scripts/update-deps.sh all          # = base + calibre + security:
+#   base      newest ubuntu/alpine base image digests and today's Ubuntu snapshot (Ubuntu security fixes)
+#   calibre   the latest official Calibre build, pinned with checksums in docker/versions.env
+#   security  upgrades the Python packages that have advisories, then audits again
+git diff --stat                     # review
+scripts/update-deps.sh build        # builds small, full and cuda locally and smoke-tests each
+TEST_TAG=nightly scripts/docker-release.sh test 0.5.2    # optional: publish for testing
+```
+
+The steps also run on their own:
+
+- **Python packages:** `security` upgrades each vulnerable package to the newest release of the same major version that fixes it (a new major version only when the fix needs one, e.g. Pillow 13), plus whatever the new versions require; all other pins stay. `python pillow docling` upgrades the named packages, `python` alone upgrades everything. After editing `requirements*.txt`, run `scripts/lock-requirements.sh`, which keeps existing pins and accepts `uv pip compile` options (`-P pkg`, `--upgrade`). Locks resolve for Python 3.12 and are checked to install from wheels on amd64 and arm64.
+- **Calibre:** with an empty `CALIBRE_VERSION` in [`docker/versions.env`](../docker/versions.env) the image uses Ubuntu's `calibre` package (7.6.0, with Qt WebEngine 6.4). `calibre [VERSION]` switches to the official build from Calibre's GitHub releases, which bundles a current Qt: it downloads the amd64 and arm64 archives once to record their SHA-256 checksums, and the image build refuses archives that don't match. The smoke test converts HTML to PDF with Calibre, which exercises its Qt WebEngine.
+- **Ubuntu packages and base images:** `base [SNAPSHOT]` sets `UBUNTU_SNAPSHOT` (default: today) and the `UBUNTU_IMAGE`/`BOOTSTRAP_CA_IMAGE` digests in the Dockerfile. The build also upgrades the packages already in the base image from that snapshot. arm64 builds use the current ports archive (see above), so they get Ubuntu's latest fixes whenever they are built.
 
 ## Troubleshooting
 

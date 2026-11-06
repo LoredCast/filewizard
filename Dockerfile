@@ -42,12 +42,14 @@ COPY --from=bootstrap-ca /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-ce
 FROM system-base AS system-full
 ARG TARGETARCH UBUNTU_SNAPSHOT TESSERACT_LANGS SOURCE_DATE_EPOCH
 RUN --mount=type=bind,source=docker/install-system-packages.sh,target=/tmp/install-system-packages.sh \
+    --mount=type=bind,source=docker/versions.env,target=/tmp/versions.env \
     --mount=type=secret,id=build_ca,required=false,mode=0444 \
     sh /tmp/install-system-packages.sh full
 
 FROM system-base AS system-small
 ARG TARGETARCH UBUNTU_SNAPSHOT TESSERACT_LANGS SOURCE_DATE_EPOCH
 RUN --mount=type=bind,source=docker/install-system-packages.sh,target=/tmp/install-system-packages.sh \
+    --mount=type=bind,source=docker/versions.env,target=/tmp/versions.env \
     --mount=type=secret,id=build_ca,required=false,mode=0444 \
     sh /tmp/install-system-packages.sh small
 
