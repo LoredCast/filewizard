@@ -16,12 +16,12 @@
 # stored in the image):  docker buildx build --secret id=build_ca,src=/path/to/ca.crt .
 
 ARG VARIANT=full
-ARG UBUNTU_IMAGE=ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3
+ARG UBUNTU_IMAGE=ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
 # Only supplies a CA bundle for the first HTTPS apt update (the Ubuntu base image has none).
 # It is replaced by Ubuntu's own ca-certificates package in the same step.
-ARG BOOTSTRAP_CA_IMAGE=alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+ARG BOOTSTRAP_CA_IMAGE=alpine:3.22@sha256:bfe7ceb9f09ec0566c48fb93356e45a47a00be5a1dd14fa5b909e7709c66b034
 # Ubuntu archive snapshot (https://snapshot.ubuntu.com) for amd64; empty = current archive.
-ARG UBUNTU_SNAPSHOT=20260920T000000Z
+ARG UBUNTU_SNAPSHOT=20261107T000000Z
 # Tesseract OCR language packs (Tesseract codes, e.g. "eng deu spa"), or "all".
 ARG TESSERACT_LANGS="eng deu fra spa ita por nld pol"
 # PyTorch (needed by Docling) comes from this index as a CPU-only build.

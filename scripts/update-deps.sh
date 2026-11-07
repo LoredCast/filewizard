@@ -188,7 +188,8 @@ cmd_calibre() {
     version="${1:-}"
     if [ -z "${version}" ]; then
         # The "latest" page redirects to .../releases/tag/vX.Y.Z.
-        version="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "${CALIBRE_RELEASES}/latest" | sed -n 's#.*/tag/v##p')"
+        version="$(curl -fsSL -o /dev/null -w '%{url_effective}' "${CALIBRE_RELEASES}/latest" | sed -n 's#.*/tag/v##p')" \
+            || die "could not look up the latest Calibre release; pass a version, e.g. scripts/update-deps.sh calibre 9.18.0"
     fi
     echo "${version}" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$' || die "'${version}' is not a Calibre version like 9.18.0"
     echo "=== Calibre ${version}: downloading the official builds to record their checksums"
