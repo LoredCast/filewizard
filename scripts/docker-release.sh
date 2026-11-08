@@ -22,6 +22,11 @@
 #   TEST_TAG     tag the test step pushes and promote reads (default: "test", giving test,
 #                test-small and test-cuda). E.g. TEST_TAG=nightly publishes a nightly build
 #                without replacing the images under the test tags.
+#   KEEP_PLATFORMS_FROM
+#                for a release built for fewer platforms (e.g. PLATFORMS=linux/amd64): an earlier
+#                release, e.g. 0.5.1. promote then adds its images for the platforms that were not
+#                built to the moving tags (latest, small, 0.5, ...), so they keep working there;
+#                the version tag (0.5.2) only gets what was built.
 #   BUILD_FLAGS  extra flags for `docker buildx build`, e.g. "--no-cache" or
 #                "--secret id=build_ca,src=/path/to/proxy-ca.crt"
 #
@@ -33,6 +38,7 @@ VARIANTS="${VARIANTS:-full small cuda}"
 PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
 BUILDER="${BUILDER:-filewizard}"
 TEST_TAG="${TEST_TAG:-test}"
+KEEP_PLATFORMS_FROM="${KEEP_PLATFORMS_FROM:-}"
 BUILD_FLAGS="${BUILD_FLAGS:-}"
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -92,6 +98,13 @@ platforms_for() {
     else
         echo "${PLATFORMS}"
     fi
+}
+
+# "os/arch[/variant] digest" for each image in a multi-platform tag (attestations skipped).
+image_platforms() {
+    docker buildx imagetools inspect "$1" --format \
+        '{{range .Manifest.Manifests}}{{if .Platform}}{{.Platform.OS}}/{{.Platform.Architecture}}{{if .Platform.Variant}}/{{.Platform.Variant}}{{end}} {{.Digest}}{{"\n"}}{{end}}{{end}}' \
+        | grep -v '^unknown/'
 }
 
 ensure_builder() {
@@ -173,13 +186,36 @@ cmd_promote() {
         if [ "${built}" != "${version}" ]; then
             die "${source} was built as version '${built}', not ${version}; run: TEST_TAG=${TEST_TAG} $0 test ${version}"
         fi
-        args=""
-        for name in $(release_tags "${version}" "${variant}"); do
-            args="${args} --tag ${IMAGE}:${name}"
-        done
-        echo "=== ${source} ->$(echo "${args}" | sed 's/ --tag / /g')"
-        # shellcheck disable=SC2086  # args holds several flags
-        docker buildx imagetools create ${args} "${source}"
+        names="$(release_tags "${version}" "${variant}")"
+        version_tag="$(echo "${names}" | cut -d' ' -f1)"
+        moving_tags="$(echo "${names}" | cut -s -d' ' -f2-)"
+        # Images of an earlier release for the platforms this one was not built for.
+        carried=""
+        if [ -n "${KEEP_PLATFORMS_FROM}" ] && [ -n "${moving_tags}" ]; then
+            keep_ref="${IMAGE}:${KEEP_PLATFORMS_FROM#v}$(suffix "${variant}")"
+            built="$(image_platforms "${source}" | cut -d' ' -f1)" || die "could not read the platforms of ${source}"
+            kept="$(image_platforms "${keep_ref}")" || die "could not read ${keep_ref} (KEEP_PLATFORMS_FROM)"
+            while read -r platform digest; do
+                [ -n "${platform}" ] || continue
+                if ! echo "${built}" | grep -qx "${platform}"; then
+                    carried="${carried} ${IMAGE}@${digest}"
+                    echo "    ${platform}: keeping ${keep_ref} for the moving tags"
+                fi
+            done <<KEPT
+${kept}
+KEPT
+        fi
+        echo "=== ${source} -> ${version_tag}"
+        docker buildx imagetools create --tag "${IMAGE}:${version_tag}" "${source}"
+        if [ -n "${moving_tags}" ]; then
+            args=""
+            for name in ${moving_tags}; do
+                args="${args} --tag ${IMAGE}:${name}"
+            done
+            echo "=== ${source}${carried:+ +${carried}} ->$(echo "${args}" | sed 's/ --tag / /g')"
+            # shellcheck disable=SC2086  # args and carried hold several words
+            docker buildx imagetools create ${args} "${source}" ${carried}
+        fi
         released="${released} ${IMAGE}:$(release_tags "${version}" "${variant}" | cut -d' ' -f1)"
     done
     echo

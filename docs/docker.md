@@ -126,7 +126,14 @@ Building under emulation is slow: expect one to two hours for the arm64 images.
    ```
    The tag also starts the workflow below. Without the Docker Hub secrets in the repository it only builds and tests the images; with them, it would publish its own build under the same tags.
 
-Settings (environment variables): `IMAGE` (another repository, default `loredcast/filewizard`), `VARIANTS` (default `full small cuda`), `PLATFORMS` (default `linux/amd64,linux/arm64`), `BUILDER` (default `filewizard`, created if missing), `BUILD_FLAGS` (extra `docker buildx build` flags, e.g. `--no-cache` or `--secret id=build_ca,src=...`) and `TEST_TAG` (default `test`: the tag the test step pushes and promote reads; `TEST_TAG=nightly` publishes `nightly`, `nightly-small` and `nightly-cuda` and leaves the `test` images alone). For example, a quick test of the small amd64 image only: `VARIANTS=small PLATFORMS=linux/amd64 scripts/docker-release.sh test 0.5.0`. The `test` tags stay on Docker Hub until the next test build replaces them; delete them on the repository's *Tags* page if you like.
+**A release for amd64 only** (e.g. when arm64 can't be built or tested): build with `PLATFORMS=linux/amd64` and promote with `KEEP_PLATFORMS_FROM` set to the previous release. The moving tags (`latest`, `small`, `0.5`, ...) then keep that release's arm64 images, so they don't break on arm64; the new version tag is amd64 only:
+
+```bash
+PLATFORMS=linux/amd64 TEST_TAG=nightly scripts/docker-release.sh test 0.5.2
+TEST_TAG=nightly KEEP_PLATFORMS_FROM=0.5.1 scripts/docker-release.sh promote 0.5.2
+```
+
+Settings (environment variables): `IMAGE` (another repository, default `loredcast/filewizard`), `KEEP_PLATFORMS_FROM` (see above), `VARIANTS` (default `full small cuda`), `PLATFORMS` (default `linux/amd64,linux/arm64`), `BUILDER` (default `filewizard`, created if missing), `BUILD_FLAGS` (extra `docker buildx build` flags, e.g. `--no-cache` or `--secret id=build_ca,src=...`) and `TEST_TAG` (default `test`: the tag the test step pushes and promote reads; `TEST_TAG=nightly` publishes `nightly`, `nightly-small` and `nightly-cuda` and leaves the `test` images alone). For example, a quick test of the small amd64 image only: `VARIANTS=small PLATFORMS=linux/amd64 scripts/docker-release.sh test 0.5.0`. The `test` tags stay on Docker Hub until the next test build replaces them; delete them on the repository's *Tags* page if you like.
 
 ### With GitHub Actions
 

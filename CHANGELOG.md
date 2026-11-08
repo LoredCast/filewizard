@@ -4,6 +4,8 @@
 
 A security update; upgrading is recommended for everyone. `docker compose pull && docker compose up -d` is all it takes.
 
+The 0.5.2 images are for amd64 (x86-64) only. On arm64 (Raspberry Pi, Apple Silicon, ARM servers), `latest`, `small`, `0.5` and `0.5-latest` keep providing 0.5.1, so nothing breaks there, but those fixes are not in it yet.
+
 ### Security
 
 - **Calibre 9.18.0** (was Ubuntu's 7.6.0): the official build with a current Qt WebEngine. The old one bundled a Brotli decoder affected by CVE-2026-111497, reachable by converting an EPUB or HTMLZ with a WOFF2 font ([#31](https://github.com/LoredCast/filewizard/issues/31)).
