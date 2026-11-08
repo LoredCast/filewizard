@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.2
+
+A security update; upgrading is recommended for everyone. `docker compose pull && docker compose up -d` is all it takes.
+
+The 0.5.2 images are for amd64 (x86-64) only. On arm64 (Raspberry Pi, Apple Silicon, ARM servers), `latest`, `small`, `0.5` and `0.5-latest` keep providing 0.5.1, so nothing breaks there, but those fixes are not in it yet.
+
+### Security
+
+- **Calibre 9.18.0** (was Ubuntu's 7.6.0): the official build with a current Qt WebEngine. The old one bundled a Brotli decoder affected by CVE-2026-111497, reachable by converting an EPUB or HTMLZ with a WOFF2 font ([#31](https://github.com/LoredCast/filewizard/issues/31)).
+- **Ubuntu packages** from the archive of 2026-11-07, including the fixed system Brotli (1.1.0-2ubuntu0.1), and newer base images. Packages that came with the base image are now updated too.
+- **Python packages** with published advisories: Pillow 13.0.0 (image decoding could take GBs of memory, among others), pypdf 6.21.4, Docling 2.148.0 ([#29](https://github.com/LoredCast/filewizard/pull/29), [#30](https://github.com/LoredCast/filewizard/pull/30)), Authlib 1.9.5, Werkzeug 3.1.9, filelock 4.2.9, certifi, joserfc, msgpack and setuptools. PyPDF2 is no longer installed.
+
+### For maintainers
+
+- `scripts/update-deps.sh` audits the lock files and applies security, Python, Calibre and base-image updates, then builds and smoke-tests the images locally. See [docs/docker.md](docs/docker.md#updating-dependencies).
+
 ## 0.5.1
 
 ### Faster

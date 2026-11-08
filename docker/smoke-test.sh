@@ -82,4 +82,9 @@ convert "${work}/doc.md" doc.md '"task_type": "conversion", "output_format": "pa
 printf 'Hello from LibreOffice\n' > "${work}/note.txt"
 convert "${work}/note.txt" note.txt '"task_type": "conversion", "output_format": "libreoffice_pdf"'
 
+# Calibre's PDF output renders through its Qt WebEngine, the part most likely to break.
+printf '<html><body><h1>Smoke test</h1><p>Hello from Calibre.</p></body></html>\n' > "${work}/page.html"
+convert "${work}/page.html" page.html '"task_type": "conversion", "output_format": "calibre_pdf"'
+echo "ok: $(docker exec "${name}" ebook-convert --version | head -n 1)"
+
 echo "Smoke test passed for ${image}"
