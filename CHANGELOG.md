@@ -12,6 +12,7 @@
 
 ### Maintenance & CI/CD
 
+- **Smaller & faster Docker images:** moved `kokoro-tts` (and 46 transitive packages including `llvmlite`, `numba`, `scipy`, `scikit-learn` and `pymupdf`) out of the `small` image (Piper TTS remains in `small`; Kokoro stays in `full` and `cuda`). Shared base apt layers across `small`/`full`/`cuda`, separated the Calibre download/install layer with retries and HTTP Range resume, skipped apt docs/manpages/non-English locales, trimmed `/opt/venv`, ran `python-deps` in parallel with system packages, and enabled BuildKit caching in GitHub Actions.
 - **Automated test suite & CI:** added `pytest` tests in `tests/` (`requirements-test.txt`) covering OIDC/PKCE, CSRF/security headers, path/ZIP/command validation, and settings, run automatically on every push and PR via `.github/workflows/ci.yml` (plus weekly lockfile vulnerability audits).
 - **Release workflow improvements:** `.github/workflows/docker-publish.yml` now gates Docker builds on `pytest`, runs the `small` image smoke test on app PRs too, and lets *Run workflow* choose a custom test tag and variant subset for native amd64 + arm64 builds.
 - **Minimal code organization:** extracted pure security, OIDC auth, and settings validation helpers out of `main.py` into `filewizard/` (`security.py`, `auth.py`, `settings.py`).

@@ -146,7 +146,20 @@ jobs:
             echo "VERSION=${DISPATCH_TAG}-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
           fi
           platform="${{ matrix.platform }}"
-          echo "PLATFORM_PAIR=${{ matrix.variant }}-${platform//\//-}" >> "$GITHUB_ENV"
+          plat_slug="${platform//\//-}"
+          variant="${{ matrix.variant }}"
+          echo "PLATFORM_PAIR=${variant}-${plat_slug}" >> "$GITHUB_ENV"
+          {
+            echo "CACHE_FROM<<EOF"
+            echo "type=gha,scope=${variant}-${plat_slug}"
+            if [ "${variant}" = "cuda" ]; then
+              echo "type=gha,scope=full-${plat_slug}"
+            fi
+            if [ "${variant}" != "small" ]; then
+              echo "type=gha,scope=small-${plat_slug}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_ENV"
 
       - uses: docker/setup-buildx-action@v3
         if: steps.scope.outputs.skip != 'true'
@@ -168,6 +181,8 @@ jobs:
             VARIANT=${{ matrix.variant }}
             VERSION=${{ env.VERSION }}
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+          cache-from: ${{ env.CACHE_FROM }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
           load: true
           tags: filewizard:test
 
@@ -186,6 +201,7 @@ jobs:
             VARIANT=${{ matrix.variant }}
             VERSION=${{ env.VERSION }}
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+          cache-from: ${{ env.CACHE_FROM }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true,rewrite-timestamp=true
