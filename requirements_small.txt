@@ -14,7 +14,6 @@ ocrmypdf
 pytesseract
 pypdf
 piper-tts
-kokoro-tts
 Pillow
 
 # Configuration & Utilities

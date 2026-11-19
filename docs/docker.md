@@ -5,7 +5,7 @@
 | Variant | Tags | Platforms | Contents |
 |---|---|---|---|
 | full | `latest`, `X.Y.Z`, `X.Y`, `X.Y-latest` | linux/amd64, linux/arm64 | All converters incl. TeX (Pandoc → PDF), Inkscape, Docling, Whisper, OCR, TTS |
-| small | `small`, `X.Y.Z-small`, `X.Y-small` | linux/amd64, linux/arm64 | Without TeX, Inkscape and Docling |
+| small | `small`, `X.Y.Z-small`, `X.Y-small` | linux/amd64, linux/arm64 | Without TeX, Inkscape, Docling and Kokoro TTS (keeps Piper TTS) |
 | cuda | `cuda`, `latest-cuda`, `X.Y.Z-cuda`, `X.Y-cuda` | linux/amd64 | Full image that transcribes on an NVIDIA GPU |
 
 `edge`, `edge-small` and `edge-cuda` are test builds, published only when the workflow is run manually with *push*.

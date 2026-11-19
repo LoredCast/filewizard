@@ -52,7 +52,7 @@ FastAPI, vanilla HTML/JS/CSS frontend.
 ### Recommended — Docker (pull from Docker Hub)
 Images (linux/amd64 and linux/arm64, e.g. Raspberry Pi 4/5 and Apple Silicon):
 - `loredcast/filewizard:latest` — all tools
-- `loredcast/filewizard:small` — without TeX, Inkscape and Docling
+- `loredcast/filewizard:small` — without TeX, Inkscape, Docling and Kokoro TTS (keeps Piper TTS)
 - `loredcast/filewizard:cuda` — transcription on NVIDIA GPUs (amd64 only)
 
 Copy [`docker-compose.yml`](docker-compose.yml) from the repo, adjust as needed, then:
