@@ -84,7 +84,7 @@ ARG VARIANT VERSION
 LABEL org.opencontainers.image.title="FileWizard" \
       org.opencontainers.image.description="Self-hosted file conversion, OCR, transcription and text-to-speech" \
       org.opencontainers.image.source="https://github.com/LoredCast/filewizard" \
-      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.licenses="GPL-3.0-only" \
       org.opencontainers.image.version="${VERSION}"
 
 COPY --from=python-deps /opt/venv /opt/venv
