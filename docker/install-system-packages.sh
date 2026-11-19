@@ -84,13 +84,46 @@ if [ -n "${CALIBRE_VERSION:-}" ]; then
         exit 1
     fi
     calibre_url="https://github.com/kovidgoyal/calibre/releases/download/v${CALIBRE_VERSION}/calibre-${CALIBRE_VERSION}-${calibre_arch}.txz"
-    python3 - "${calibre_url}" /tmp/calibre.txz <<'PY'
-import os, ssl, sys, urllib.request
+    python3 - "${calibre_url}" /tmp/calibre.txz "${calibre_sha256}" <<'PY'
+import hashlib, http.client, os, ssl, sys, time, urllib.error, urllib.request
+
+url, dest, expected_sha = sys.argv[1:4]
 cafile = "/run/secrets/build_ca" if os.path.exists("/run/secrets/build_ca") else None
 context = ssl.create_default_context(cafile=cafile)
-with urllib.request.urlopen(sys.argv[1], context=context, timeout=600) as response, open(sys.argv[2], "wb") as out:
-    while chunk := response.read(1 << 20):
-        out.write(chunk)
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+for attempt in range(1, 6):
+    try:
+        offset = os.path.getsize(dest) if os.path.exists(dest) else 0
+        headers = {"Range": f"bytes={offset}-"} if offset else {}
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, context=context, timeout=60) as response:
+            mode = "ab" if (offset and response.status == 206) else "wb"
+            with open(dest, mode) as out:
+                while chunk := response.read(1 << 20):
+                    out.write(chunk)
+        got = sha256_file(dest)
+        if got == expected_sha:
+            sys.exit(0)
+        print(f"Calibre download attempt {attempt}: checksum mismatch ({got}); retrying", file=sys.stderr)
+        os.unlink(dest)
+    except (OSError, ssl.SSLError, http.client.HTTPException, urllib.error.URLError) as exc:
+        if isinstance(exc, urllib.error.HTTPError) and exc.code == 416:
+            if os.path.exists(dest) and sha256_file(dest) == expected_sha:
+                sys.exit(0)
+            if os.path.exists(dest):
+                os.unlink(dest)
+        print(f"Calibre download attempt {attempt} failed: {exc}", file=sys.stderr)
+    if attempt < 5:
+        time.sleep(min(2 ** attempt, 20))
+
+sys.exit("Failed to download Calibre after 5 attempts")
 PY
     if ! echo "${calibre_sha256}  /tmp/calibre.txz" | sha256sum -c -; then
         echo "Calibre ${CALIBRE_VERSION} (${calibre_arch}) does not match the checksum in docker/versions.env" >&2
