@@ -3,7 +3,7 @@
 # FileWizard container image. Pick the variant with the VARIANT build argument:
 #
 #   full   (default)  all tools incl. TeX, Inkscape, Docling       linux/amd64, linux/arm64
-#   small             without TeX, Inkscape and Docling            linux/amd64, linux/arm64
+#   small             without TeX, Inkscape, Docling and Kokoro TTS linux/amd64, linux/arm64
 #   cuda              full + CUDA runtime for GPU transcription     linux/amd64
 #
 #   docker buildx build --build-arg VARIANT=small -t filewizard:small .
@@ -33,47 +33,83 @@ ARG VERSION=dev
 FROM ${BOOTSTRAP_CA_IMAGE} AS bootstrap-ca
 
 # ==============================================================================
-# System packages (converters, OCR, TeX, ...) and the unprivileged app user
+# System packages (shared base -> variant extras -> Calibre layer)
 # ==============================================================================
 FROM ${UBUNTU_IMAGE} AS system-base
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
 COPY --from=bootstrap-ca /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
-FROM system-base AS system-full
+# Base converters shared by small, full, and cuda.
+FROM system-base AS system-small-apt
 ARG TARGETARCH UBUNTU_SNAPSHOT TESSERACT_LANGS SOURCE_DATE_EPOCH
 RUN --mount=type=bind,source=docker/install-system-packages.sh,target=/tmp/install-system-packages.sh \
-    --mount=type=bind,source=docker/versions.env,target=/tmp/versions.env \
+    --mount=type=cache,id=apt-${TARGETARCH},target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=apt-lists-${TARGETARCH},target=/var/lib/apt/lists,sharing=locked \
     --mount=type=secret,id=build_ca,required=false,mode=0444 \
-    sh /tmp/install-system-packages.sh full
+    sh /tmp/install-system-packages.sh base
 
-FROM system-base AS system-small
-ARG TARGETARCH UBUNTU_SNAPSHOT TESSERACT_LANGS SOURCE_DATE_EPOCH
+# Full-only converters layered on top of system-small-apt so base layers are shared.
+FROM system-small-apt AS system-full-apt
+ARG TARGETARCH SOURCE_DATE_EPOCH
 RUN --mount=type=bind,source=docker/install-system-packages.sh,target=/tmp/install-system-packages.sh \
-    --mount=type=bind,source=docker/versions.env,target=/tmp/versions.env \
+    --mount=type=cache,id=apt-${TARGETARCH},target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=apt-lists-${TARGETARCH},target=/var/lib/apt/lists,sharing=locked \
     --mount=type=secret,id=build_ca,required=false,mode=0444 \
-    sh /tmp/install-system-packages.sh small
+    sh /tmp/install-system-packages.sh full-extra
 
 # The CUDA image has the same system packages as the full one (and shares its layers).
-FROM system-full AS system-cuda
+FROM system-full-apt AS system-cuda-apt
 
-FROM system-${VARIANT} AS system
+# Calibre is installed in its own layer so version bumps in docker/versions.env do not
+# invalidate the apt/TeX layers above.
+FROM system-${VARIANT}-apt AS system
+ARG TARGETARCH SOURCE_DATE_EPOCH
+RUN --mount=type=bind,source=docker/install-system-packages.sh,target=/tmp/install-system-packages.sh \
+    --mount=type=bind,source=docker/versions.env,target=/tmp/versions.env \
+    --mount=type=cache,id=apt-${TARGETARCH},target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=apt-lists-${TARGETARCH},target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=cache,id=calibre-${TARGETARCH},target=/var/cache/calibre,sharing=locked \
+    --mount=type=secret,id=build_ca,required=false,mode=0444 \
+    sh /tmp/install-system-packages.sh calibre
 
 # ==============================================================================
-# Python dependencies in a virtualenv, installed from hash-pinned lock files
+# Python dependencies in a virtualenv (built in parallel with system packages)
 # ==============================================================================
-FROM system AS python-deps
-ARG VARIANT TORCH_INDEX_URL SOURCE_DATE_EPOCH
-COPY locks/ /tmp/locks/
-RUN --mount=type=secret,id=build_ca,required=false,mode=0444 set -eux; \
-    if [ -f /run/secrets/build_ca ]; then export PIP_CERT=/run/secrets/build_ca; fi; \
-    python3 -m venv /opt/venv; \
-    /opt/venv/bin/pip install --no-cache-dir --disable-pip-version-check --no-deps --only-binary :all: \
-        --require-hashes -r "/tmp/locks/${VARIANT}.txt"; \
-    if [ "${VARIANT}" != "small" ]; then \
-        /opt/venv/bin/pip install --no-cache-dir --disable-pip-version-check --no-deps --only-binary :all: \
-            --index-url "${TORCH_INDEX_URL}" -r /tmp/locks/torch-cpu.txt; \
-    fi; \
-    /opt/venv/bin/pip check
+FROM system-base AS python-builder
+ARG TARGETARCH UBUNTU_SNAPSHOT SOURCE_DATE_EPOCH
+RUN --mount=type=bind,source=docker/install-system-packages.sh,target=/tmp/install-system-packages.sh \
+    --mount=type=cache,id=apt-${TARGETARCH},target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=apt-lists-${TARGETARCH},target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=secret,id=build_ca,required=false,mode=0444 \
+    sh /tmp/install-system-packages.sh python-builder
+
+FROM python-builder AS python-deps-small
+ARG TARGETARCH SOURCE_DATE_EPOCH
+COPY locks/small.txt /tmp/locks/requirements.txt
+RUN --mount=type=bind,source=docker/install-python-deps.sh,target=/tmp/install-python-deps.sh \
+    --mount=type=cache,id=pip-${TARGETARCH},target=/root/.cache/pip \
+    --mount=type=secret,id=build_ca,required=false,mode=0444 \
+    sh /tmp/install-python-deps.sh small
+
+FROM python-builder AS python-deps-full
+ARG TARGETARCH TORCH_INDEX_URL SOURCE_DATE_EPOCH
+COPY locks/full.txt /tmp/locks/requirements.txt
+COPY locks/torch-cpu.txt /tmp/locks/torch-cpu.txt
+RUN --mount=type=bind,source=docker/install-python-deps.sh,target=/tmp/install-python-deps.sh \
+    --mount=type=cache,id=pip-${TARGETARCH},target=/root/.cache/pip \
+    --mount=type=secret,id=build_ca,required=false,mode=0444 \
+    sh /tmp/install-python-deps.sh full
+
+FROM python-builder AS python-deps-cuda
+ARG TARGETARCH TORCH_INDEX_URL SOURCE_DATE_EPOCH
+COPY locks/cuda.txt /tmp/locks/requirements.txt
+COPY locks/torch-cpu.txt /tmp/locks/torch-cpu.txt
+RUN --mount=type=bind,source=docker/install-python-deps.sh,target=/tmp/install-python-deps.sh \
+    --mount=type=cache,id=pip-${TARGETARCH},target=/root/.cache/pip \
+    --mount=type=secret,id=build_ca,required=false,mode=0444 \
+    sh /tmp/install-python-deps.sh cuda
+
+FROM python-deps-${VARIANT} AS python-deps
 
 # ==============================================================================
 # Runtime image

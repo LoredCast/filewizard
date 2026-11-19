@@ -48,8 +48,8 @@ jobs:
 
       - name: Shell syntax & shellcheck
         run: |
-          sh -n docker/entrypoint.sh docker/install-system-packages.sh docker/smoke-test.sh \
-            scripts/docker-release.sh scripts/lock-requirements.sh
+          sh -n docker/entrypoint.sh docker/install-system-packages.sh docker/install-python-deps.sh \
+            docker/smoke-test.sh scripts/docker-release.sh scripts/lock-requirements.sh
           bash -n scripts/update-deps.sh run.sh
           shellcheck -S error docker/*.sh scripts/*.sh
 
