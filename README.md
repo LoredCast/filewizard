@@ -30,6 +30,7 @@ Built-in protections:
 - Conversion command templates are read-only on the settings page. Edit `config/settings.yml`, or set `ALLOW_COMMAND_EDITS=true` to edit them in the browser.
 - Secrets (OIDC client secret, webhook token) are never sent to the browser; leave the field empty to keep the stored value.
 - `auth_settings.allowed_users` / `allowed_domains` restrict which accounts of your identity provider may log in (both empty = everyone the provider accepts).
+- To report a security vulnerability privately, see [SECURITY.md](SECURITY.md).
 
 | Variable | Default | Purpose |
 |---|---|---|
