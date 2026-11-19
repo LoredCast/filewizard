@@ -74,6 +74,41 @@ from piper import PiperVoice
 import wave
 import io
 import mimetypes
+from filewizard.security import (
+    CSP_EXEMPT_PATHS,
+    MAX_UPLOAD_CHUNKS,
+    SAFE_METHODS,
+    UPLOAD_ID_RE,
+    ZIP_JUNK_RE,
+    _OCR_LANG_RE,
+    build_csp,
+    csrf_allowed_hosts as _csrf_allowed_hosts_for,
+    ensure_path_is_safe,
+    env_flag as _env_flag,
+    env_list as _env_list,
+    get_file_extension,
+    get_file_mime_type,
+    host_key as _host_key,
+    is_csrf_safe as _is_csrf_safe_for,
+    resolve_whisper_model,
+    safe_basename,
+    safe_extract_zip,
+    sanitize_filename,
+    sanitize_output,
+    validate_and_build_command,
+    validate_file_type,
+    validate_tts_model_name,
+)
+from filewizard.settings import (
+    EDITABLE_SETTINGS,
+    EDITABLE_TOOL_KEYS,
+    POSITIVE_NUMBER_SETTINGS,
+    SECRET_SETTINGS,
+    deep_merge,
+    drop_blank_secrets as _drop_blank_secrets,
+    preprocess_settings_for_saving as _preprocess_settings_for_saving,
+    validate_settings_payload as _validate_settings_payload_for,
+)
 
 load_dotenv()
 
@@ -122,51 +157,6 @@ UPLOADS_BASE = Path(os.environ.get("UPLOADS_DIR", "/app/uploads")).resolve()
 PROCESSED_BASE = Path(os.environ.get("PROCESSED_DIR", "/app/processed")).resolve()
 CHUNK_TMP_BASE = Path(os.environ.get("CHUNK_TMP_DIR", str(UPLOADS_BASE / "tmp"))).resolve()
 
-def ensure_path_is_safe(p: Path, allowed_bases: List[Path]):
-    """Enhanced path safety check with traversal prevention"""
-    try:
-        # Resolve the path first to get the absolute path
-        resolved_p = p.resolve()
-
-        # Check if resolved path is within allowed base directories
-        if not any(resolved_p.is_relative_to(base) for base in allowed_bases):
-            raise ValueError(f"Path {resolved_p} is outside of allowed directories.")
-
-        return resolved_p
-    except Exception as e:
-        logger = logging.getLogger(__name__)
-        logger.error(f"Path safety check failed for {p}: {e}")
-        raise ValueError("Invalid or unsafe path specified.")
-
-def sanitize_filename(filename: str) -> str:
-    """Sanitize filename to prevent path traversal and XSS"""
-    from werkzeug.utils import secure_filename
-    # Use secure_filename and additional sanitization
-    safe_name = secure_filename(filename or "")
-    # Sanitize for HTML output
-    return html.escape(safe_name)
-
-_SAFE_SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,10}$")
-
-
-def safe_basename(filename: Optional[str]) -> str:
-    """
-    Filesystem-safe version of a user supplied file name that keeps a usable extension.
-    secure_filename() alone drops non-ASCII characters, so "文件.pdf" became "pdf" and
-    lost its extension; here the stem falls back to "file" instead.
-    """
-    name = re.split(r"[\\/]", filename or "")[-1]
-    suffix = Path(name).suffix.lower()
-    if not _SAFE_SUFFIX_RE.fullmatch(suffix):
-        suffix = ""
-    stem = secure_filename(name[: len(name) - len(suffix)] if suffix else name)[:100].strip("._") or "file"
-    return f"{stem}{suffix}"
-
-
-# --- Upload sessions ---
-UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
-MAX_UPLOAD_CHUNKS = 100_000
-
 
 def chunk_dir_for(user: dict, upload_id: str) -> Path:
     """
@@ -182,77 +172,7 @@ def chunk_dir_for(user: dict, upload_id: str) -> Path:
     return path
 
 
-# --- ZIP archives ---
-ZIP_JUNK_RE = re.compile(r"(^|/)(__MACOSX/|\._|\.DS_Store$|Thumbs\.db$)")
-
-
-def safe_extract_zip(zip_path: Path, dest: Path, app_settings: dict) -> List[Path]:
-    """
-    Extracts regular files from an uploaded ZIP with limits on member count and total
-    uncompressed size (zip bombs). Directory, symlink and OS metadata entries are skipped.
-    zipfile.extract() already strips absolute paths and '..' components.
-    """
-    max_members = int(app_settings.get("max_zip_members") or 500)
-    max_file_mb = float(app_settings.get("max_file_size_bytes", 100 * 1024 * 1024)) / (1024 * 1024)
-    max_total_mb = float(app_settings.get("max_zip_uncompressed_mb") or max(4 * max_file_mb, 1024))
-    with zipfile.ZipFile(zip_path) as zf:
-        members = [
-            info for info in zf.infolist()
-            if not info.is_dir()
-            and not ZIP_JUNK_RE.search(info.filename)
-            and (info.external_attr >> 16) & 0o170000 != 0o120000  # symlink entries
-        ]
-        if len(members) > max_members:
-            raise ValueError(f"ZIP archive has {len(members)} files; the limit is {max_members} (app_settings.max_zip_members).")
-        total_mb = sum(info.file_size for info in members) / (1024 * 1024)
-        if total_mb > max_total_mb:
-            raise ValueError(f"ZIP archive would extract to {total_mb:.0f} MB; the limit is {max_total_mb:.0f} MB "
-                             "(app_settings.max_zip_uncompressed_mb).")
-        dest.mkdir(parents=True, exist_ok=True)
-        extracted = []
-        for info in members:
-            target = Path(zf.extract(info, dest))
-            ensure_path_is_safe(target, [dest])
-            extracted.append(target)
-    return extracted
-
-
-# --- Model / voice names coming from requests ---
-_TTS_NAME_PART_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-
-
-def resolve_whisper_model(model_size: Optional[str], whisper_settings: dict) -> str:
-    """
-    Only models listed in transcription_settings.whisper.allowed_models may be used.
-    faster-whisper also accepts local paths and arbitrary Hugging Face repo ids, which
-    must not be reachable from a request.
-    """
-    allowed = [str(m) for m in (whisper_settings.get("allowed_models") or [])]
-    if not model_size:
-        if "base" in allowed:
-            return "base"
-        if allowed:
-            return allowed[0]
-        raise ValueError("No Whisper models are allowed (transcription_settings.whisper.allowed_models).")
-    if model_size not in allowed:
-        raise ValueError(f"Invalid model size '{model_size}'. Allowed: {', '.join(allowed)}")
-    return model_size
-
-
-def validate_tts_model_name(model_name: Optional[str]) -> str:
-    """Accepts 'piper/<voice>', '<voice>' (Piper) or 'kokoro/<lang>/<voice>'."""
-    if not isinstance(model_name, str) or not model_name:
-        raise ValueError("A TTS voice (model_name) is required.")
-    parts = model_name.split("/")
-    engine, names = (parts[0], parts[1:]) if len(parts) > 1 else ("piper", parts)
-    expected = {"piper": 1, "kokoro": 2}.get(engine)
-    if expected != len(names) or not all(_TTS_NAME_PART_RE.fullmatch(n) and ".." not in n for n in names):
-        raise ValueError(f"Invalid TTS voice '{model_name}'.")
-    return model_name
-
-
 # --- OCR languages ---
-_OCR_LANG_RE = re.compile(r"^[A-Za-z0-9_]{2,32}$")
 _ocr_languages_cache: Optional[List[str]] = None
 
 
@@ -286,29 +206,6 @@ def resolve_ocr_language(requested: Optional[str], ocr_settings: dict) -> str:
         raise ValueError(f"OCR language(s) not installed: {', '.join(missing)}. Installed: {', '.join(installed)}")
     return "+".join(parts)
 
-
-def sanitize_output(output: str) -> str:
-    """Sanitize output to prevent XSS"""
-    if not output:
-        return ""
-    # Limit length and escape HTML
-    output = output[:2000]  # Limit length
-    return html.escape(output)
-
-def validate_file_type(filename: str, allowed_extensions: set) -> bool:
-    """Validate file type by extension"""
-    if not allowed_extensions:  # If set is empty, allow all
-        return True
-    return Path(filename).suffix.lower() in allowed_extensions
-
-def get_file_mime_type(filename: str) -> str:
-    """Get MIME type from file extension"""
-    mime_type, _ = mimetypes.guess_type(filename)
-    return mime_type or "application/octet-stream"  # Default to binary if unknown
-
-def get_file_extension(filename: str) -> str:
-    """Get file extension in lowercase"""
-    return Path(filename).suffix.lower()
 
 def get_supported_output_formats_for_file(filename: str, conversion_tools_config: dict) -> list:
     """
@@ -461,17 +358,6 @@ try:
 except OSError as e:
     logger.warning(f"File logging disabled: {e}")
 
-
-def deep_merge(source: dict, dest: dict) -> dict:
-    """
-    Recursively merges source dict into dest dict. Modifies dest in place.
-    """
-    for key, value in source.items():
-        if isinstance(value, dict) and key in dest and isinstance(dest[key], dict):
-            deep_merge(value, dest[key])
-        else:
-            dest[key] = value
-    return dest
 
 def initialize_settings_file():
     """
@@ -1592,33 +1478,6 @@ def run_command(
         raise Exception(msg)
     logger.debug("Command completed successfully: %s", printable)
     return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr=stderr)
-
-def validate_and_build_command(template_str: str, mapping: Dict[str, str]) -> TypingList[str]:
-    fmt = Formatter()
-    used = {fname for _, fname, _, _ in fmt.parse(template_str) if fname}
-    ALLOWED_VARS = {
-        "input", "output", "output_dir", "output_ext", "quality", "speed", "preset",
-        "device", "dpi", "samplerate", "bitdepth", "filter", "model_name",
-        "model_path", "voices_path", "lang"
-    }
-    bad = used - ALLOWED_VARS
-    if bad:
-        raise ValueError(f"Command template contains disallowed placeholders: {bad}")
-
-    safe_mapping = dict(mapping)
-    for name in used:
-        if name not in safe_mapping:
-            safe_mapping[name] = safe_mapping.get("output_ext", "") if name == "filter" else ""
-
-    # Securely build the command by splitting the template BEFORE formatting.
-    # This prevents argument injection if a value in the mapping (e.g. a filename)
-    # contains spaces or other shell-special characters.
-    command_parts = shlex.split(template_str)
-
-    formatted_command = [part.format(**safe_mapping) for part in command_parts]
-
-    # Filter out any empty strings that result from empty optional placeholders
-    return [part for part in formatted_command if part]
 
 class SrtFormatter:
     def __init__(self):
@@ -2955,14 +2814,6 @@ app = FastAPI(lifespan=lifespan)
 ENV = os.environ.get('ENV', 'dev').lower()
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    return os.environ.get(name, str(default)).strip().lower() in ('true', '1', 't', 'yes', 'y')
-
-
-def _env_list(name: str) -> List[str]:
-    return [v.strip() for v in os.environ.get(name, '').split(',') if v.strip()]
-
-
 def _load_or_create_secret_key() -> str:
     """
     Returns a session signing key shared by all workers. A key generated per process
@@ -3036,60 +2887,18 @@ if ALLOWED_HOSTS:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS + ["localhost", "127.0.0.1", "::1"])
 
 # --- CSRF protection & security headers ---
-SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 CSRF_TRUSTED_ORIGINS = _env_list('CSRF_TRUSTED_ORIGINS') + CORS_ALLOWED_ORIGINS
 # Who may embed the UI in a frame (e.g. a dashboard such as Homarr/Organizr): CSP frame-ancestors syntax.
 FRAME_ANCESTORS = os.environ.get('FRAME_ANCESTORS', "'self'").strip() or "'self'"
-CONTENT_SECURITY_POLICY = (
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-    "img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; object-src 'none'; "
-    f"base-uri 'self'; form-action 'self'; frame-ancestors {FRAME_ANCESTORS}"
-)
-# The interactive API docs load their assets from a CDN; they get the other headers but no CSP.
-CSP_EXEMPT_PATHS = ("/docs", "/redoc", "/openapi.json")
-
-
-def _host_key(netloc: str) -> str:
-    """Normalizes host[:port] for comparison, dropping default ports."""
-    netloc = (netloc or "").strip().lower()
-    for default_port in (":80", ":443"):
-        if netloc.endswith(default_port):
-            return netloc[: -len(default_port)]
-    return netloc
+CONTENT_SECURITY_POLICY = build_csp(FRAME_ANCESTORS)
 
 
 def _csrf_allowed_hosts(headers: Headers) -> set:
-    hosts = {_host_key(headers.get("host", ""))}
-    forwarded_host = headers.get("x-forwarded-host")
-    if forwarded_host:
-        hosts.add(_host_key(forwarded_host.split(",")[0]))
-    public_url = APP_CONFIG.get("app_settings", {}).get("app_public_url")
-    if public_url:
-        hosts.add(_host_key(urlparse(public_url).netloc))
-    for origin in CSRF_TRUSTED_ORIGINS:
-        hosts.add(_host_key(urlparse(origin).netloc or origin))
-    hosts.discard("")
-    return hosts
+    return _csrf_allowed_hosts_for(headers, APP_CONFIG.get("app_settings", {}).get("app_public_url"), CSRF_TRUSTED_ORIGINS)
 
 
 def _is_csrf_safe(method: str, headers: Headers) -> bool:
-    """
-    Rejects state-changing requests that a browser sent on behalf of another site.
-    Browsers always attach Origin to cross-site POSTs; clients that send neither
-    Origin nor Referer (curl, n8n, ...) are not browsers and are let through.
-    """
-    if method in SAFE_METHODS:
-        return True
-    source = headers.get("origin") or headers.get("referer")
-    if not source:
-        return True
-    if source == "null":
-        return False
-    try:
-        netloc = urlparse(source).netloc
-    except ValueError:
-        return False
-    return _host_key(netloc) in _csrf_allowed_hosts(headers)
+    return _is_csrf_safe_for(method, headers, APP_CONFIG.get("app_settings", {}).get("app_public_url"), CSRF_TRUSTED_ORIGINS)
 
 
 class SecurityMiddleware:
@@ -3905,141 +3714,19 @@ async def get_index(request: Request):
     })
 
 # --- Settings page & API ---
-# Secrets are never sent to the browser; submitting an empty value keeps the stored one.
-SECRET_SETTINGS = (("auth_settings", "oidc_client_secret"), ("webhook_settings", "callback_bearer_token"))
 # Editing a command template from the browser decides which programs the server executes, so it
 # is off unless explicitly enabled. Templates can always be changed in config/settings.yml.
 ALLOW_COMMAND_EDITS = _env_flag("ALLOW_COMMAND_EDITS", False)
 
 
-def _leaves(*names: str) -> dict:
-    return {name: None for name in names}
-
-
-# Everything the settings form may change. Other keys (TTS command templates, model paths, ...)
-# can only be edited in settings.yml.
-EDITABLE_SETTINGS = {
-    "app_settings": _leaves("app_public_url", "max_file_size_mb", "allowed_all_extensions",
-                            "model_concurrency", "model_inactivity_timeout", "cache_check_interval",
-                            "retention_days"),
-    "ocr_settings": {"ocrmypdf": _leaves("deskew", "clean", "force_ocr", "language")},
-    "transcription_settings": {"whisper": _leaves("compute_type")},
-    "auth_settings": _leaves("oidc_client_id", "oidc_client_secret", "oidc_server_metadata_url",
-                             "admin_users", "allowed_users", "allowed_domains"),
-    "webhook_settings": _leaves("enabled", "allow_chunked_api_uploads", "allowed_callback_urls", "callback_bearer_token"),
-    "tts_settings": {"piper": {"use_cuda": None, "synthesis_config": _leaves("length_scale", "noise_scale", "noise_w")}},
-}
-EDITABLE_TOOL_KEYS = {"name", "command_template", "supported_input", "formats", "timeout"}
-POSITIVE_NUMBER_SETTINGS = (("app_settings", "max_file_size_mb"), ("app_settings", "model_concurrency"),
-                            ("app_settings", "model_inactivity_timeout"), ("app_settings", "cache_check_interval"))
-
-
-def _collapse_whitespace(value: Any) -> str:
-    return " ".join(str(value or "").split())
-
-
 def _validate_settings_payload(payload: dict) -> List[str]:
-    """Returns a list of problems with a settings update coming from the web UI."""
-    errors: List[str] = []
-
-    def walk(data: dict, schema: dict, path: tuple):
-        for key, value in data.items():
-            key_path = ".".join(path + (key,))
-            if key not in schema:
-                errors.append(f"'{key_path}' cannot be changed from the web UI; edit settings.yml instead.")
-                continue
-            sub_schema = schema[key]
-            if sub_schema is None:
-                continue
-            if not isinstance(value, dict):
-                errors.append(f"'{key_path}' must be an object.")
-                continue
-            walk(value, sub_schema, path + (key,))
-
-    walk({k: v for k, v in payload.items() if k != "conversion_tools"}, EDITABLE_SETTINGS, ())
-
-    for section, key in POSITIVE_NUMBER_SETTINGS:
-        section_data = payload.get(section)
-        if isinstance(section_data, dict) and key in section_data:
-            try:
-                valid = float(section_data[key]) > 0
-            except (TypeError, ValueError):
-                valid = False
-            if not valid:
-                errors.append(f"'{section}.{key}' must be a positive number.")
-
-    app_section = payload.get("app_settings")
-    if isinstance(app_section, dict) and "retention_days" in app_section:
-        try:
-            valid = app_section["retention_days"] is None or float(app_section["retention_days"]) >= 0
-        except (TypeError, ValueError):
-            valid = False
-        if not valid:
-            errors.append("'app_settings.retention_days' must be 0 (keep forever) or a positive number.")
-
-    ocr_language = (payload.get("ocr_settings") or {}).get("ocrmypdf", {}) if isinstance(payload.get("ocr_settings"), dict) else {}
-    if isinstance(ocr_language, dict) and "language" in ocr_language:
-        try:
-            resolve_ocr_language(str(ocr_language["language"] or ""), {})
-        except ValueError as e:
-            errors.append(f"'ocr_settings.ocrmypdf.language': {e}")
-
-    tools = payload.get("conversion_tools")
-    if tools is None:
-        return errors
-    if not isinstance(tools, dict):
-        errors.append("'conversion_tools' must be an object.")
-        return errors
-    current_tools = APP_CONFIG.get("conversion_tools", {})
-    for tool_id, tool in tools.items():
-        if not isinstance(tool, dict):
-            errors.append(f"'conversion_tools.{tool_id}' must be an object.")
-            continue
-        if not re.fullmatch(r"[A-Za-z0-9_]{1,64}", str(tool_id)):
-            errors.append(f"Invalid tool id '{tool_id}' (letters, digits and underscores only).")
-            continue
-        for key in sorted(set(tool) - EDITABLE_TOOL_KEYS):
-            errors.append(f"'conversion_tools.{tool_id}.{key}' cannot be changed from the web UI; edit settings.yml instead.")
-        if "timeout" in tool:
-            try:
-                valid_timeout = 0 < float(tool["timeout"]) <= 7 * 24 * 3600
-            except (TypeError, ValueError):
-                valid_timeout = False
-            if not valid_timeout:
-                errors.append(f"'conversion_tools.{tool_id}.timeout' must be a positive number of seconds.")
-        current = current_tools.get(tool_id)
-        if current is None and not ALLOW_COMMAND_EDITS:
-            errors.append(f"Adding conversion tools ('{tool_id}') from the web UI is disabled. "
-                          "Edit config/settings.yml or set ALLOW_COMMAND_EDITS=true.")
-            continue
-        if "command_template" not in tool:
-            if current is None:
-                errors.append(f"New tool '{tool_id}' needs a command_template.")
-            continue
-        template = tool["command_template"]
-        unchanged = current is not None and _collapse_whitespace(template) == _collapse_whitespace(current.get("command_template"))
-        if not isinstance(template, str) or not template.strip():
-            errors.append(f"'conversion_tools.{tool_id}.command_template' must be a non-empty string.")
-        elif unchanged:
-            continue  # the form always submits every template; only changes are checked
-        elif not ALLOW_COMMAND_EDITS:
-            errors.append(f"Changing the command of '{tool_id}' from the web UI is disabled. "
-                          "Edit config/settings.yml or set ALLOW_COMMAND_EDITS=true.")
-        else:
-            try:
-                validate_and_build_command(template, {})
-            except ValueError as e:
-                errors.append(f"Invalid command template for '{tool_id}': {e}")
-    return errors
-
-
-def _drop_blank_secrets(payload: dict) -> None:
-    for section, key in SECRET_SETTINGS:
-        section_data = payload.get(section)
-        if isinstance(section_data, dict) and key in section_data:
-            value = section_data[key]
-            if value is None or (isinstance(value, str) and not value.strip()):
-                del section_data[key]
+    return _validate_settings_payload_for(
+        payload,
+        current_tools=APP_CONFIG.get("conversion_tools", {}),
+        allow_command_edits=ALLOW_COMMAND_EDITS,
+        ocr_language_validator=resolve_ocr_language,
+        command_validator=validate_and_build_command,
+    )
 
 
 @app.get("/settings")
@@ -4099,49 +3786,6 @@ async def get_settings_page(request: Request):
     context.update({"config": current_config, "config_source": config_source, "secrets_set": secrets_set})
     return templates.TemplateResponse(request, "settings.html", context)
 
-def _preprocess_settings_for_saving(config: Dict) -> Dict:
-    """
-    Pre-processes the settings dictionary before saving it to YAML.
-    This function corrects data structures that may be misinterpreted
-    when converted from JSON from the frontend.
-    """
-    if "conversion_tools" in config and isinstance(config["conversion_tools"], dict):
-        for tool_name, tool_config in config["conversion_tools"].items():
-            if isinstance(tool_config, dict):
-                # --- Fix command_template: Convert list back to string ---
-                if "command_template" in tool_config:
-                    ct = tool_config["command_template"]
-                    if isinstance(ct, list) and len(ct) == 1 and isinstance(ct[0], str):
-                        tool_config["command_template"] = ct[0]
-                    # Also handle the case where it might be a string with incorrect newlines
-                    elif isinstance(ct, str):
-                        tool_config["command_template"] = ct.replace('\n', '\n')
-
-                # --- Fix formats: Convert list of strings back to a dictionary ---
-                if "formats" in tool_config:
-                    formats_data = tool_config["formats"]
-                    if isinstance(formats_data, list):
-                        new_formats = {}
-                        for item in formats_data:
-                            if isinstance(item, str):
-                                # Split the string into lines and then into key-value pairs
-                                for line in item.split('\n'):
-                                    line = line.strip()
-                                    if ':' in line:
-                                        key, value = line.split(':', 1)
-                                        new_formats[key.strip()] = value.strip()
-                        tool_config["formats"] = new_formats
-                    elif isinstance(formats_data, str):
-                        # Handle the case where the whole thing is a single string
-                        new_formats = {}
-                        for line in formats_data.split('\n'):
-                            line = line.strip()
-                            if ':' in line:
-                                key, value = line.split(':', 1)
-                                new_formats[key.strip()] = value.strip()
-                        tool_config["formats"] = new_formats
-
-    return config
 @app.post("/settings/save")
 async def save_settings(
     request: Request, new_config_from_ui: Dict = Body(...), admin: bool = Depends(require_admin)

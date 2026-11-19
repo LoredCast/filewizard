@@ -92,6 +92,7 @@ COPY docker/entrypoint.sh /usr/local/bin/filewizard-entrypoint
 COPY docker/supervisord.conf /etc/filewizard/supervisord.conf
 WORKDIR /app
 COPY main.py settings.default.yml ./
+COPY filewizard/ filewizard/
 COPY templates/ templates/
 COPY static/ static/
 RUN set -eux; \

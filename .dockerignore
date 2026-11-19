@@ -2,6 +2,8 @@
 # (config, uploads, databases, venvs, ...) can neither leak into nor change the image.
 *
 !main.py
+!filewizard/
+filewizard/**/__pycache__/
 !settings.default.yml
 !templates/
 !static/
