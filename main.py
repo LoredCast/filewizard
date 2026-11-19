@@ -74,6 +74,20 @@ from piper import PiperVoice
 import wave
 import io
 import mimetypes
+from filewizard.auth import (
+    _clean_oidc_url,
+    compact_session_user,
+    external_url as _external_url,
+    fit_session_id_token,
+    is_user_admin as _is_user_admin,
+    is_user_allowed as _is_user_allowed,
+    merge_oidc_user_claims,
+    normalized_email_set as _normalized_email_set,
+    oidc_config_signature,
+    oidc_pkce_enabled as _oidc_pkce_enabled,
+    register_oidc_client,
+    verified_email as _verified_email,
+)
 from filewizard.security import (
     CSP_EXEMPT_PATHS,
     MAX_UPLOAD_CHUNKS,
@@ -440,7 +454,7 @@ def load_app_config():
         },
         "conversion_tools": {},
         "ocr_settings": {"ocrmypdf": {"language": "eng"}},
-        "auth_settings": {"oidc_client_id": "", "oidc_client_secret": "", "oidc_server_metadata_url": "", "admin_users": []},
+        "auth_settings": {"oidc_client_id": "", "oidc_client_secret": "", "oidc_server_metadata_url": "", "oidc_pkce": True, "admin_users": []},
         "webhook_settings": {"enabled": False, "allow_chunked_api_uploads": False, "allowed_callback_urls": [], "callback_bearer_token": ""}
     }
 
@@ -2776,27 +2790,7 @@ async def lifespan(app: FastAPI):
     ALLOW_LOCAL_ONLY = os.environ.get('ALLOW_LOCAL_ONLY', 'false').lower() == 'true'
     if LOCAL_ONLY_MODE and ENV != 'dev' and not ALLOW_LOCAL_ONLY:
         raise RuntimeError('LOCAL_ONLY_MODE may only be enabled in dev or when ALLOW_LOCAL_ONLY=true is set.')
-    if not LOCAL_ONLY_MODE:
-        oidc_cfg = APP_CONFIG.get('auth_settings', {})
-        if not all(oidc_cfg.get(k) for k in ['oidc_client_id', 'oidc_client_secret', 'oidc_server_metadata_url']):
-            logger.warning("OIDC auth settings are incomplete. Auth will be disabled.")
-            app.state.oidc_registration_failed = True
-        else:
-            try:
-                oauth.register(
-                    name='oidc',
-                    client_id=oidc_cfg.get('oidc_client_id'),
-                    client_secret=oidc_cfg.get('oidc_client_secret'),
-                    server_metadata_url=oidc_cfg.get('oidc_server_metadata_url'),
-                    client_kwargs={'scope': 'openid email profile'},
-                    userinfo_endpoint=oidc_cfg.get('oidc_userinfo_endpoint'),
-                    end_session_endpoint=oidc_cfg.get('oidc_end_session_endpoint')
-                )
-                logger.info('OAuth registered successfully.')
-                app.state.oidc_registration_failed = False
-            except Exception as e:
-                logger.error(f"Failed to register OIDC OAuth provider: {e}. Authentication will be disabled.")
-                app.state.oidc_registration_failed = True
+    _configure_oidc()
 
     yield
 
@@ -2809,6 +2803,22 @@ async def lifespan(app: FastAPI):
             pass
 
     logger.info('Application shutting down...')
+
+_registered_oidc_config: Optional[tuple] = None
+
+
+def _configure_oidc() -> None:
+    """Registers or updates the Authlib OIDC client from APP_CONFIG."""
+    global _registered_oidc_config
+    if LOCAL_ONLY_MODE:
+        return
+    oidc_cfg = APP_CONFIG.get("auth_settings", {}) or {}
+    config_key = oidc_config_signature(oidc_cfg)
+    if config_key == _registered_oidc_config:
+        return
+    app.state.oidc_registration_failed = not register_oidc_client(oauth, oidc_cfg)
+    _registered_oidc_config = config_key
+
 
 app = FastAPI(lifespan=lifespan)
 ENV = os.environ.get('ENV', 'dev').lower()
@@ -2913,6 +2923,7 @@ class SecurityMiddleware:
             return
 
         reload_app_config_if_changed()
+        _configure_oidc()
         headers = Headers(scope=scope)
         if not _is_csrf_safe(scope["method"], headers):
             logger.warning(
@@ -3002,42 +3013,8 @@ http_bearer = HTTPBearer()
 LOCAL_USER = {'sub': 'local_user', 'email': 'local@user.com', 'name': 'Local User'}
 
 
-def _normalized_email_set(values) -> set:
-    if not isinstance(values, (list, tuple, set)):
-        return set()
-    return {v.strip().lower() for v in values if isinstance(v, str) and v.strip()}
-
-
-def _verified_email(user: dict | None) -> str | None:
-    """The user's email, unless the identity provider explicitly marked it as unverified."""
-    if not user:
-        return None
-    email = user.get('email')
-    if not isinstance(email, str) or not email.strip() or user.get('email_verified') is False:
-        return None
-    return email.strip().lower()
-
-
 def is_user_allowed(user: dict | None) -> bool:
-    """
-    Authorization for OIDC users. With auth_settings.allowed_users and allowed_domains both
-    empty, every account the identity provider authenticates may use the app.
-    """
-    if LOCAL_ONLY_MODE:
-        return True
-    if not user:
-        return False
-    auth_settings = APP_CONFIG.get("auth_settings", {})
-    allowed_users = _normalized_email_set(auth_settings.get("allowed_users"))
-    allowed_domains = {d.lstrip('@') for d in _normalized_email_set(auth_settings.get("allowed_domains"))}
-    if not allowed_users and not allowed_domains:
-        return True
-    email = _verified_email(user)
-    if not email:
-        return False
-    if email in allowed_users or email in _normalized_email_set(auth_settings.get("admin_users")):
-        return True
-    return email.rsplit('@', 1)[-1] in allowed_domains
+    return _is_user_allowed(user, APP_CONFIG.get("auth_settings", {}), LOCAL_ONLY_MODE)
 
 
 def get_current_user(request: Request):
@@ -3086,10 +3063,7 @@ async def require_user_or_api(request: Request):
 
 
 def is_admin(request: Request) -> bool:
-    if LOCAL_ONLY_MODE: return True
-    email = _verified_email(get_current_user(request))
-    if not email: return False
-    return email in _normalized_email_set(APP_CONFIG.get("auth_settings", {}).get("admin_users", []))
+    return _is_user_admin(get_current_user(request), APP_CONFIG.get("auth_settings", {}), LOCAL_ONLY_MODE)
 
 def require_user(request: Request):
     user = get_current_user(request)
@@ -3619,7 +3593,7 @@ if not LOCAL_ONLY_MODE:
         if not check_oidc_availability():
             logger.warning("OIDC not available, redirecting to home with error")
             return RedirectResponse(url='/?error=auth_not_configured')
-        redirect_uri = request.url_for('auth')
+        redirect_uri = _external_url(request, 'auth', APP_CONFIG.get("app_settings", {}).get("app_public_url"))
         return await oauth.oidc.authorize_redirect(request, redirect_uri)
 
     @app.get('/auth')
@@ -3627,10 +3601,17 @@ if not LOCAL_ONLY_MODE:
         if not check_oidc_availability():
             logger.warning("OIDC not available for authentication")
             raise HTTPException(status_code=401, detail="Authentication system is not properly configured")
-        
+
         try:
             token = await oauth.oidc.authorize_access_token(request)
-            user = dict(await oauth.oidc.userinfo(token=token))
+            id_token_claims = dict(token.get("userinfo") or {})
+            metadata = await oauth.oidc.load_server_metadata()
+            userinfo_claims = dict(await oauth.oidc.userinfo(token=token)) if metadata.get("userinfo_endpoint") else {}
+            if not userinfo_claims and not id_token_claims:
+                raise RuntimeError("OIDC provider returned neither userinfo nor id_token claims.")
+            user = compact_session_user(merge_oidc_user_claims(id_token_claims, userinfo_claims))
+            if not user.get("sub"):
+                raise RuntimeError("OIDC user claims are missing 'sub'.")
         except Exception as e:
             logger.error(f"Authentication failed: {e}")
             raise HTTPException(status_code=401, detail="Authentication failed")
@@ -3639,7 +3620,11 @@ if not LOCAL_ONLY_MODE:
             request.session.clear()
             raise HTTPException(status_code=403, detail="This account is not allowed to use this service.")
         request.session['user'] = user
-        request.session['id_token'] = token.get('id_token')
+        id_token = fit_session_id_token(user, token.get('id_token'))
+        if id_token:
+            request.session['id_token'] = id_token
+        else:
+            request.session.pop('id_token', None)
         return RedirectResponse(url='/')
 
     @app.get("/logout")
@@ -3647,12 +3632,14 @@ if not LOCAL_ONLY_MODE:
         if not check_oidc_availability():
             request.session.clear()
             return RedirectResponse(url="/", status_code=302)
-            
+
         try:
             # The metadata is fetched lazily; this worker may not have loaded it yet.
             await oauth.oidc.load_server_metadata()
-            logout_endpoint = (oauth.oidc.server_metadata.get("end_session_endpoint")
-                               or APP_CONFIG.get("auth_settings", {}).get("oidc_end_session_endpoint"))
+            logout_endpoint = (
+                oauth.oidc.server_metadata.get("end_session_endpoint")
+                or _clean_oidc_url(APP_CONFIG.get("auth_settings", {}).get("oidc_end_session_endpoint"))
+            )
             if not logout_endpoint:
                 request.session.clear()
                 logger.warning("OIDC 'end_session_endpoint' not found. Performing local-only logout.")
@@ -3660,7 +3647,8 @@ if not LOCAL_ONLY_MODE:
 
             # RP-initiated logout: providers such as Keycloak require id_token_hint (or client_id)
             # alongside post_logout_redirect_uri.
-            params = {"post_logout_redirect_uri": str(request.url_for("get_index"))}
+            post_logout_uri = _external_url(request, "get_index", APP_CONFIG.get("app_settings", {}).get("app_public_url"))
+            params = {"post_logout_redirect_uri": post_logout_uri}
             id_token = request.session.get("id_token")
             if id_token:
                 params["id_token_hint"] = id_token
@@ -3673,7 +3661,7 @@ if not LOCAL_ONLY_MODE:
             logger.warning(f"Could not determine OIDC logout endpoint: {e}. Performing local-only logout.")
             request.session.clear()
             return RedirectResponse(url="/", status_code=302)
-        
+
         request.session.clear()
         return RedirectResponse(url=logout_url, status_code=302)
 
@@ -3685,7 +3673,7 @@ async def forward_auth(request: Request):
         raise HTTPException(status_code=404, detail="Not available in LOCAL_ONLY mode.")
     if not check_oidc_availability():
         raise HTTPException(status_code=401, detail="Authentication system is not properly configured")
-    redirect_uri = request.url_for('auth')
+    redirect_uri = _external_url(request, 'auth', APP_CONFIG.get("app_settings", {}).get("app_public_url"))
     return await oauth.oidc.authorize_redirect(request, redirect_uri)
 
 @app.get("/")
@@ -3752,6 +3740,8 @@ async def get_settings_page(request: Request):
 
     # Ensure all required nested dictionaries exist
     current_config.setdefault("app_settings", {})
+    current_config.setdefault("auth_settings", {})
+    current_config["auth_settings"]["oidc_pkce"] = _oidc_pkce_enabled(current_config["auth_settings"])
     current_config.setdefault("transcription_settings", {}).setdefault("whisper", {})
     current_config.setdefault("tts_settings", {}).setdefault("piper", {}).setdefault("synthesis_config", {})
     current_config.setdefault("conversion_tools", {})
@@ -3799,6 +3789,7 @@ async def save_settings(
                 PATHS.SETTINGS_FILE.unlink()
                 logger.info(f"Admin '{user.get('email')}' reverted to default settings.")
             load_app_config()
+            _configure_oidc()
             return JSONResponse({"message": "Settings reverted to default."})
 
         # Pre-process the incoming config to fix formatting issues
@@ -3823,6 +3814,7 @@ async def save_settings(
         tmp_path.replace(PATHS.SETTINGS_FILE)
         logger.info(f"Admin '{user.get('email')}' updated settings.yml.")
         load_app_config()
+        _configure_oidc()
         return JSONResponse({"message": "Settings saved successfully."})
 
     except HTTPException:

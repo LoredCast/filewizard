@@ -1,9 +1,16 @@
 auth_settings:
-  oidc_client_id: filewiz
-  oidc_client_secret:
-  oidc_server_metadata_url: https://accounts.example.com/oidc/.well-known/openid-configuration
-  oidc_userinfo_endpoint: https://accounts.example.com/oidc/me
-  oidc_end_session_endpoint: https://accounts.example.com/oidc/session/end
+  # Example: oidc_client_id: filewiz
+  oidc_client_id: ""
+  # Optional when oidc_pkce is True (public OIDC client); required when oidc_pkce is False.
+  oidc_client_secret: ""
+  # Example: https://accounts.example.com/oidc/.well-known/openid-configuration
+  oidc_server_metadata_url: ""
+  # Optional overrides if your identity provider's discovery document omits them:
+  oidc_userinfo_endpoint: ""
+  oidc_end_session_endpoint: ""
+  # Send PKCE (S256) in the OIDC authorization flow (recommended by OAuth 2.1).
+  # Set to False only if your identity provider rejects PKCE parameters.
+  oidc_pkce: True
   admin_users:
     - user@example.com
   # Who may log in. Leave both empty to allow every account your identity provider accepts.

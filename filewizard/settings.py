@@ -23,7 +23,7 @@ EDITABLE_SETTINGS = {
     "transcription_settings": {"whisper": _leaves("compute_type")},
     "auth_settings": _leaves(
         "oidc_client_id", "oidc_client_secret", "oidc_server_metadata_url",
-        "admin_users", "allowed_users", "allowed_domains",
+        "oidc_pkce", "admin_users", "allowed_users", "allowed_domains",
     ),
     "webhook_settings": _leaves("enabled", "allow_chunked_api_uploads", "allowed_callback_urls", "callback_bearer_token"),
     "tts_settings": {"piper": {"use_cuda": None, "synthesis_config": _leaves("length_scale", "noise_scale", "noise_w")}},
@@ -143,6 +143,11 @@ def validate_settings_payload(
             valid = False
         if not valid:
             errors.append("'app_settings.retention_days' must be 0 (keep forever) or a positive number.")
+
+    auth_section = payload.get("auth_settings")
+    if isinstance(auth_section, dict) and "oidc_pkce" in auth_section:
+        if not isinstance(auth_section["oidc_pkce"], bool):
+            errors.append("'auth_settings.oidc_pkce' must be true or false.")
 
     ocr_language = (payload.get("ocr_settings") or {}).get("ocrmypdf", {}) if isinstance(payload.get("ocr_settings"), dict) else {}
     if isinstance(ocr_language, dict) and "language" in ocr_language:

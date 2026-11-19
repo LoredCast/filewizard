@@ -25,7 +25,7 @@
                         <legend><h2>General Settings</h2></legend>
                         <div class="form-control">
                             <label for="app-public-url">App Public URL</label>
-                            <p class="field-description">The public-facing base URL of the application (e.g., https://files.example.com). Used for generating absolute URLs in webhooks.</p>
+                            <p class="field-description">The public-facing base URL of the application (e.g., https://files.example.com). Used for webhook download links and OIDC redirect/logout URLs behind reverse proxies.</p>
                             <input type="text" id="app-public-url" name="app_settings.app_public_url" value="{{ config.app_settings.get('app_public_url', '') }}" class="form-input" placeholder="https://... ">
                         </div>
                         <div class="form-control">
@@ -107,12 +107,18 @@
                     </div>
                     <div class="form-control">
                         <label for="auth-client-secret">Client Secret</label>
-                        <input type="password" id="auth-client-secret" name="auth_settings.oidc_client_secret" value="" autocomplete="new-password" placeholder="{{ 'Stored – leave empty to keep the current secret' if secrets_set.get('oidc_client_secret') else 'Not set' }}" class="form-input">
+                        <p class="field-description">Optional when PKCE is enabled (public OIDC client); required when PKCE is disabled.</p>
+                        <input type="password" id="auth-client-secret" name="auth_settings.oidc_client_secret" value="" autocomplete="new-password" placeholder="{{ 'Stored – leave empty to keep the current secret' if secrets_set.get('oidc_client_secret') else 'Not set (optional with PKCE)' }}" class="form-input">
                     </div>
                     <div class="form-control">
                         <label for="auth-metadata-url">Server Metadata URL</label>
                         <input type="text" id="auth-metadata-url" name="auth_settings.oidc_server_metadata_url" value="{{ config.auth_settings.get('oidc_server_metadata_url', '') }}" class="form-input" placeholder="https://your-auth-server/.well-known/openid-configuration">
                     </div>
+                    <div class="form-control checkbox-group">
+                        <input type="checkbox" id="auth-oidc-pkce" name="auth_settings.oidc_pkce" {% if config.auth_settings.get('oidc_pkce', True) %}checked{% endif %}>
+                        <label for="auth-oidc-pkce">Use PKCE (S256)</label>
+                    </div>
+                    <p class="field-description">Sends an S256 PKCE code challenge during OIDC login (recommended by OAuth 2.1). Disable only if your identity provider rejects PKCE.</p>
                     <div class="form-control">
                         <label for="auth-admin-users">Admin User Emails</label>
                         <p class="field-description">Comma-separated list of email addresses for users who should have admin rights.</p>
