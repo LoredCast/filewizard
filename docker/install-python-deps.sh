@@ -21,10 +21,9 @@ fi
 /opt/venv/bin/pip check
 
 # Remove pip and compile/cache artifacts not needed at runtime (PYTHONDONTWRITEBYTECODE=1 is set).
-# Keep setuptools: torch imports it at runtime.
+# Keep setuptools (torch imports it) and torch/bin (PyTorch requires torch_shm_manager on import).
 /opt/venv/bin/pip uninstall -y pip
 find /opt/venv -type d -name '__pycache__' -exec rm -rf {} +
 find /opt/venv -type f \( -name '*.pyc' -o -name '*.pyo' -o -name '*.a' \) -delete
 rm -rf /opt/venv/lib/python*/site-packages/torch/include \
-       /opt/venv/lib/python*/site-packages/torch/share \
-       /opt/venv/lib/python*/site-packages/torch/bin
+       /opt/venv/lib/python*/site-packages/torch/share
