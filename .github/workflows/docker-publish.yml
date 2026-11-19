@@ -1,15 +1,15 @@
 # Builds the FileWizard images and publishes them to Docker Hub.
 #
-# - Pushing a version tag (git tag 0.5.0 && git push origin 0.5.0; "v0.5.0" and "0.5" work too)
-#   publishes
-#     full:  0.5.0  0.5  0.5-latest  latest
-#     small: 0.5.0-small  0.5-small  small
-#     cuda:  0.5.0-cuda   0.5-cuda   cuda  latest-cuda
-#   Pre-release tags (0.5.0-rc1) only get their version tags. scripts/docker-release.sh
+# - Pushing a version tag (git tag 0.5.4 && git push origin 0.5.4; "v0.5.4" and "0.5" work too)
+#   runs tests, builds and smoke-tests all variants natively (amd64 + arm64), and publishes:
+#     full:  0.5.4  0.5  0.5-latest  latest
+#     small: 0.5.4-small  0.5-small  small
+#     cuda:  0.5.4-cuda   0.5-cuda   cuda  latest-cuda
+#   Pre-release tags (0.5.4-rc1) only get their version tags. scripts/docker-release.sh
 #   computes the tags and does the same from your own machine.
-# - Pull requests that touch the image build the small image without pushing.
-# - "Run workflow" builds all images; with "push" checked they are published as
-#   edge, edge-small and edge-cuda.
+# - Pull requests that touch the app or image build and smoke-test the small amd64 image without pushing.
+# - "Run workflow" builds selected (or all) variants; with "push" checked they are published under
+#   the chosen tag prefix (default: edge, edge-small and edge-cuda).
 #
 # Publishing needs the repository secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (a Docker Hub
 # access token with read/write scope); without them the images are only built and tested.
@@ -25,16 +25,40 @@ on:
       - .dockerignore
       - docker/**
       - locks/**
+      - main.py
+      - filewizard/**
+      - settings.default.yml
+      - templates/**
+      - static/**
+      - requirements-test.txt
+      - tests/**
       - .github/workflows/docker-publish.yml
   workflow_dispatch:
     inputs:
       push:
-        description: Publish the images as edge, edge-small and edge-cuda
+        description: Publish the built images to Docker Hub
         type: boolean
         default: false
+      tag:
+        description: Tag prefix when publishing via Run workflow (e.g. edge, test, pr-33)
+        type: string
+        default: edge
+      variants:
+        description: Which variants to build
+        type: choice
+        default: all
+        options:
+          - all
+          - small
+          - full
+          - cuda
 
 permissions:
   contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 env:
   IMAGE: ${{ vars.DOCKERHUB_IMAGE || 'loredcast/filewizard' }}
@@ -42,8 +66,28 @@ env:
   PUSH: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push)) && secrets.DOCKERHUB_TOKEN != '' }}
 
 jobs:
+  test:
+    name: Tests (gate before Docker build)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies (constrained to locks/small.txt)
+        run: |
+          grep -E '^[A-Za-z0-9._-]+==' locks/small.txt | sed 's/ \\$//' > /tmp/constraints.txt
+          python -m pip install --upgrade pip
+          pip install -c /tmp/constraints.txt -r requirements-test.txt
+
+      - name: Run pytest
+        run: pytest -v
+
   build:
     name: build (${{ matrix.variant }}, ${{ matrix.platform }})
+    needs: test
     runs-on: ${{ matrix.runner }}
     outputs:
       push: ${{ env.PUSH }}
@@ -61,10 +105,17 @@ jobs:
         if: env.PUBLISH == 'true' && env.PUSH != 'true' && matrix.variant == 'small' && matrix.platform == 'linux/amd64'
         run: echo "::warning::DOCKERHUB_USERNAME/DOCKERHUB_TOKEN are not set, so the images are built and tested but not published."
 
-      - name: Skip all but the small amd64 image on pull requests
+      - name: Determine whether to skip this matrix entry
         id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          VARIANT: ${{ matrix.variant }}
+          PLATFORM: ${{ matrix.platform }}
+          REQUESTED_VARIANTS: ${{ inputs.variants || 'all' }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ] && { [ "${{ matrix.variant }}" != small ] || [ "${{ matrix.platform }}" != linux/amd64 ]; }; then
+          if [ "${EVENT_NAME}" = "pull_request" ] && { [ "${VARIANT}" != "small" ] || [ "${PLATFORM}" != "linux/amd64" ]; }; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ "${EVENT_NAME}" = "workflow_dispatch" ] && [ "${REQUESTED_VARIANTS}" != "all" ] && [ "${REQUESTED_VARIANTS}" != "${VARIANT}" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -80,10 +131,20 @@ jobs:
 
       - name: Prepare build metadata
         if: steps.scope.outputs.skip != 'true'
+        env:
+          DISPATCH_TAG: ${{ inputs.tag || 'edge' }}
         run: |
           # Timestamps inside the image come from the commit, so rebuilding a commit gives the same image.
           echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
-          if [ "${{ github.ref_type }}" = "tag" ]; then echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"; else echo "VERSION=edge-${GITHUB_SHA::7}" >> "$GITHUB_ENV"; fi
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            if ! printf '%s' "${DISPATCH_TAG}" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'; then
+              echo "Invalid tag input: '${DISPATCH_TAG}'" >&2
+              exit 1
+            fi
+            echo "VERSION=${DISPATCH_TAG}-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          fi
           platform="${{ matrix.platform }}"
           echo "PLATFORM_PAIR=${{ matrix.variant }}-${platform//\//-}" >> "$GITHUB_ENV"
 
@@ -158,28 +219,50 @@ jobs:
           - { variant: small, suffix: "-small" }
           - { variant: cuda,  suffix: "-cuda" }
     steps:
+      - name: Determine whether to skip this variant
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          VARIANT: ${{ matrix.variant }}
+          REQUESTED_VARIANTS: ${{ inputs.variants || 'all' }}
+        run: |
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ] && [ "${REQUESTED_VARIANTS}" != "all" ] && [ "${REQUESTED_VARIANTS}" != "${VARIANT}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.scope.outputs.skip != 'true'
 
       - uses: actions/download-artifact@v4
+        if: steps.scope.outputs.skip != 'true'
         with:
           path: ${{ runner.temp }}/digests
           pattern: digests-${{ matrix.variant }}-*
           merge-multiple: true
 
       - uses: docker/login-action@v3
+        if: steps.scope.outputs.skip != 'true'
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - uses: docker/setup-buildx-action@v3
+        if: steps.scope.outputs.skip != 'true'
 
       - name: Compute tags
         id: tags
+        if: steps.scope.outputs.skip != 'true'
+        env:
+          DISPATCH_TAG: ${{ inputs.tag || 'edge' }}
         run: |
           if [ "${{ github.ref_type }}" = "tag" ]; then
             names="$(scripts/docker-release.sh tags "${GITHUB_REF_NAME}" "${{ matrix.variant }}")"
           else
-            names="edge${{ matrix.suffix }}"
+            if ! printf '%s' "${DISPATCH_TAG}" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'; then
+              echo "Invalid tag input: '${DISPATCH_TAG}'" >&2
+              exit 1
+            fi
+            names="${DISPATCH_TAG}${{ matrix.suffix }}"
           fi
           tags=""
           for name in ${names}; do tags="${tags} ${IMAGE}:${name}"; done
@@ -188,6 +271,7 @@ jobs:
           echo "Publishing: ${tags}"
 
       - name: Create multi-arch manifests
+        if: steps.scope.outputs.skip != 'true'
         working-directory: ${{ runner.temp }}/digests
         run: |
           args=()
@@ -197,5 +281,6 @@ jobs:
           docker buildx imagetools create "${args[@]}" "${sources[@]}"
 
       - name: Inspect
+        if: steps.scope.outputs.skip != 'true'
         run: |
           for tag in ${{ steps.tags.outputs.tags }}; do docker buildx imagetools inspect "${tag}"; done

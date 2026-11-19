@@ -1,0 +1,77 @@
+# Continuous integration: unit/integration tests, syntax/script lint, and weekly dependency audit.
+name: CI
+
+on:
+  push:
+    branches: ["main", "release/**"]
+  pull_request:
+  schedule:
+    # Weekly dependency vulnerability check against locks/*.txt (Mondays 06:00 UTC).
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: Tests (Python 3.12)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies (constrained to locks/small.txt)
+        run: |
+          grep -E '^[A-Za-z0-9._-]+==' locks/small.txt | sed 's/ \\$//' > /tmp/constraints.txt
+          python -m pip install --upgrade pip
+          pip install -c /tmp/constraints.txt -r requirements-test.txt
+
+      - name: Compile Python modules
+        run: python -m py_compile main.py filewizard/*.py tests/*.py
+
+      - name: Run pytest
+        run: pytest -v
+
+  lint:
+    name: Lint & config checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax & shellcheck
+        run: |
+          sh -n docker/entrypoint.sh docker/install-system-packages.sh docker/smoke-test.sh \
+            scripts/docker-release.sh scripts/lock-requirements.sh
+          bash -n scripts/update-deps.sh run.sh
+          shellcheck -S error docker/*.sh scripts/*.sh
+
+      - name: Verify Dockerfile license label matches LICENSE
+        run: |
+          grep -q 'GNU GENERAL PUBLIC LICENSE' LICENSE
+          grep -q 'org.opencontainers.image.licenses="GPL-3.0' Dockerfile
+
+  audit:
+    name: Dependency vulnerability audit
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Audit Python lock files
+        run: |
+          output="$(scripts/update-deps.sh audit)"
+          printf '%s\n' "$output"
+          if ! printf '%s\n' "$output" | grep -q 'No known vulnerabilities'; then
+            echo "::warning::Known vulnerabilities found in locks/*.txt — run scripts/update-deps.sh security"
+            exit 1
+          fi

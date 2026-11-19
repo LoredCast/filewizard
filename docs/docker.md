@@ -151,7 +151,7 @@ git tag 0.5.0
 git push origin 0.5.0
 ```
 
-`v0.5.0` and `0.5` work as tag names too. The workflow publishes the same tags as `scripts/docker-release.sh promote`; a pre-release tag such as `0.5.0-rc1` only gets its version tags. Progress is visible in the *Actions* tab; afterwards check the result with `docker buildx imagetools inspect loredcast/filewizard:0.5.0`. *Run workflow* on the Actions page builds (and optionally publishes as `edge`, `edge-small` and `edge-cuda`, for testing) without a tag. Pull requests that change the image build and smoke-test the small image.
+`v0.5.0` and `0.5` work as tag names too. The workflow runs the `pytest` suite first, then builds and smoke-tests each image and publishes the same tags as `scripts/docker-release.sh promote`; a pre-release tag such as `0.5.4-rc1` only gets its version tags. Progress is visible in the *Actions* tab; afterwards check the result with `docker buildx imagetools inspect loredcast/filewizard:0.5.4`. *Run workflow* on the Actions page builds selected (or all) variants and optionally publishes them under a chosen tag prefix (default `edge`, giving `edge`, `edge-small` and `edge-cuda`) for testing without a tag. Pull requests that change the app or image run `pytest` and smoke-test the small image.
 
 ## Reproducible builds
 
