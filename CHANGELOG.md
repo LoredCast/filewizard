@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.4
+
+### OIDC & Authentication
+
+- **PKCE (`S256`) enabled by default** on OIDC login and forward-auth ([#33](https://github.com/LoredCast/filewizard/issues/33)), configurable via `auth_settings.oidc_pkce` (and the *Use PKCE (S256)* toggle on `/settings`). Changing OIDC settings now takes effect across workers without restarting.
+- **Public OIDC clients supported:** `oidc_client_secret` is optional when PKCE is enabled (and placeholder example URLs in `settings.default.yml` are now blank by default).
+- **Smaller session cookies:** only the user claims FileWizard uses (`sub`, `name`, `email`, `email_verified`) are stored in the session cookie and page config, and oversized `id_token` values are omitted instead of pushing the cookie past browser 4 KB limits. Login also falls back to `id_token` claims if a provider omits `userinfo_endpoint`.
+- **`app_public_url` for OIDC callbacks:** `/login`, `/api/authz/forward-auth`, and `/logout` now use `app_settings.app_public_url` when set, fixing redirect/logout URI mismatches behind reverse proxies.
+- **API bearer tokens:** `/download/batch`, `/download/zip-batch/{job_id}`, and `/api/v1/supported-formats/{file_extension}` now accept OIDC bearer tokens like the other job/download endpoints.
+
+### Maintenance & CI/CD
+
+- **Automated test suite & CI:** added `pytest` tests in `tests/` (`requirements-test.txt`) covering OIDC/PKCE, CSRF/security headers, path/ZIP/command validation, and settings, run automatically on every push and PR via `.github/workflows/ci.yml` (plus weekly lockfile vulnerability audits).
+- **Release workflow improvements:** `.github/workflows/docker-publish.yml` now gates Docker builds on `pytest`, runs the `small` image smoke test on app PRs too, and lets *Run workflow* choose a custom test tag and variant subset for native amd64 + arm64 builds.
+- **Minimal code organization:** extracted pure security, OIDC auth, and settings validation helpers out of `main.py` into `filewizard/` (`security.py`, `auth.py`, `settings.py`).
+- **Housekeeping:** updated the Dockerfile OCI license label to `GPL-3.0-only` (matching `LICENSE`), added `SECURITY.md`, and removed unused legacy `.old` / screenshot files.
+
 ## 0.5.2
 
 A security update; upgrading is recommended for everyone. `docker compose pull && docker compose up -d` is all it takes.
