@@ -4051,7 +4051,7 @@ def _zip_files_response(entries: List[tuple], download_name: str) -> StreamingRe
 
 
 @app.post("/download/batch", response_class=StreamingResponse)
-async def download_batch(request: Request, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+async def download_batch(request: Request, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
     """
     ZIP of the selected jobs' results. Takes JSON ({"job_ids": [...]}) or a form with repeated
     job_ids fields; the web UI submits a form so the browser streams the download to disk.
@@ -4077,7 +4077,7 @@ async def download_batch(request: Request, db: Session = Depends(get_db), user: 
     return await run_in_threadpool(_zip_files_response, entries, f"file-wizard-batch-{uuid.uuid4().hex[:8]}.zip")
 
 @app.get("/download/zip-batch/{job_id}", response_class=StreamingResponse)
-async def download_zip_batch(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+async def download_zip_batch(job_id: str, db: Session = Depends(get_db), user: dict = Depends(require_user_or_api)):
     """Downloads all processed files from a ZIP upload batch as a new ZIP file."""
     parent_job = get_job(db, job_id)
     if not parent_job or parent_job.user_id != user['sub']:
@@ -4104,7 +4104,7 @@ async def download_zip_batch(job_id: str, db: Session = Depends(get_db), user: d
     return await run_in_threadpool(_zip_files_response, entries, batch_filename)
 
 @app.get("/api/v1/supported-formats/{file_extension}")
-async def get_supported_formats_for_file_type(file_extension: str, user: dict = Depends(require_user)):
+async def get_supported_formats_for_file_type(file_extension: str, user: dict = Depends(require_user_or_api)):
     """
     Get supported output formats for a given file extension.
     The file_extension should include the dot (e.g., '.pdf', '.docx').
