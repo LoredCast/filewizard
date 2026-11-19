@@ -1,0 +1,13 @@
+# Minimal dependencies to run the test suite without ML/OCR/converter packages.
+pytest
+fastapi
+authlib
+httpx
+itsdangerous
+Jinja2
+PyYAML
+werkzeug
+python-dotenv
+huey
+SQLAlchemy
+python-multipart
